@@ -123,7 +123,7 @@ function reviewerToolGuard(exec) {
 /** 创建可单测的 waterfall 监听器。 */
 export function createAutoApprovalHandler(ctx, config, denialState = new WeakMap()) {
   return async (request, next) => {
-    if (selectedPermissionPreset(request.agent.session.events) !== 'auto-approve') {
+    if (selectedPermissionPreset(request.agent.session) !== 'auto-approve') {
       return next()
     }
     if (request.signal?.aborted) return 'cancelled'
@@ -299,9 +299,9 @@ function rejectWithoutReview(ctx, request, reason, config, denialState, turn = a
 export function exactAction(request) {
   if (request.callId === undefined) return undefined
   let toolCall
-  const events = request.agent.session.events
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]
+  const session = request.agent.session
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(seq)
     if (event.type === 'tool/call' && event.data.callId === request.callId) {
       toolCall = event.data
       break
@@ -339,7 +339,7 @@ export function buildReviewEvidence(ctx, request, action, config) {
   const workspaceInstructionEntries = []
   const toolNames = new Map()
 
-  for (const event of request.agent.session.events) {
+  for (const event of request.agent.session.snapshotEvents()) {
     if (event.type === 'user/message') {
       const record = {
         seq: event.seq,
@@ -441,16 +441,17 @@ function currentPolicies(ctx, request) {
   const sandboxPolicy = ctx.get?.('sandboxPolicy')
   const approval = ctx.get?.('approval')
   return {
-    permission_preset: selectedPermissionPreset(session.events),
-    sandbox_mode: sandboxPolicy?.resolve?.({ session })?.mode ?? lastEventValue(session.events, 'sandbox/mode', 'mode'),
+    permission_preset: selectedPermissionPreset(session),
+    sandbox_mode: sandboxPolicy?.resolve?.({ session })?.mode ?? lastEventValue(session, 'sandbox/mode', 'mode'),
     approval_policy: approval?.overrideOf?.(session) ?? approval?.config?.policy
-      ?? lastEventValue(session.events, 'approval/policy', 'policy'),
+      ?? lastEventValue(session, 'approval/policy', 'policy'),
   }
 }
 
-function lastEventValue(events, type, key) {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    if (events[index].type === type) return events[index].data[key]
+function lastEventValue(session, type, key) {
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(seq)
+    if (event.type === type) return event.data[key]
   }
   return undefined
 }
@@ -601,13 +602,14 @@ function recordAssessment(states, agent, turn, outcome, threshold) {
 }
 
 function approvalTurn(request) {
-  const events = request.agent.session.events
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]
+  const session = request.agent.session
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(seq)
     if (event.type === 'tool/call' && event.data.callId === request.callId) return event.data.turn
   }
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    if (events[index].data?.turn !== undefined) return events[index].data.turn
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(seq)
+    if (event.data?.turn !== undefined) return event.data.turn
   }
   return '<unknown-turn>'
 }
@@ -623,7 +625,7 @@ function queueTurnInterrupt(agent, count) {
 
 function countReviewerSteps(agent) {
   if (agent === undefined) return 0
-  return agent.session.events.filter(event => event.type === 'step/start').length
+  return agent.session.snapshotEvents().filter(event => event.type === 'step/start').length
 }
 
 /** 把安全摘要加入父 Agent；完整调查过程保留在 Reviewer 子 session。 */
@@ -663,9 +665,9 @@ function injectReviewNotice(ctx, request, review) {
 }
 
 /** 读取最后一次权限预设选择。 */
-function selectedPermissionPreset(events) {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]
+function selectedPermissionPreset(session) {
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(seq)
     if (event.type === 'permission/preset') return event.data.preset
   }
   return undefined
