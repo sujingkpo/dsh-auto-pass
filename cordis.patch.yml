@@ -23,6 +23,7 @@
     - id: dsh-auto-approve
       name: dsh-auto
       config:
+        language: auto
         reviewerProvider: deepseek-official
         reviewerModel: deepseek-v4-flash
         reviewerReasoningEffort: high

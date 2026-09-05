@@ -50,6 +50,7 @@ dsh plugin --profile web add github:simon300000/dsh-auto
 - id: dsh-auto-approve
   name: dsh-auto
   config:
+    language: auto
     reviewerProvider: deepseek-official
     reviewerModel: deepseek-v4-flash
     reviewerReasoningEffort: high
@@ -66,6 +67,8 @@ dsh plugin --profile web add github:simon300000/dsh-auto
     maxActionChars: 16000
     maxOutputTokens: 8192
 ```
+
+`language` 可设为 `auto`（默认）、`zh` 或 `en`；非法值会发出警告并回退为 `auto`。自动模式会累计当前 session 中由用户直接发送的消息所含汉字：达到 4 个时选择中文，否则选择英文；Agent 指令、助手消息和工具结果不参与判断。Reviewer 会被明确要求使用直接用户 prompt 的语言书写理由。为避免翻译改变审查语义，两种模式下安全策略正文都保持中文。
 
 `reviewerProvider` 和 `reviewerModel` 必须同时设置。两者都省略时，Reviewer 使用父 session 当前的 provider/model。profile 覆盖会替换同一 bundle 行的完整 `config`，因此应重复写出所有需要保留的值。
 

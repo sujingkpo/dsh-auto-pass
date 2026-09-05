@@ -9,6 +9,7 @@ import {
   exactAction,
   parseAssessment,
   resolveConfig,
+  resolveReviewLanguage,
 } from '../src/index.js'
 
 function event(type, data, seq) {
@@ -16,13 +17,14 @@ function event(type, data, seq) {
 }
 
 function sessionWith(preset = 'auto-approve', overrides = {}) {
+  const { directUserText = '请运行测试', ...sessionOverrides } = overrides
   const events = [
     event('permission/preset', { preset }, 0),
     event('user/message', {
       id: 'user-1',
       role: 'user',
       source: { kind: 'user' },
-      content: [{ type: 'text', text: '请运行测试' }],
+      content: [{ type: 'text', text: directUserText }],
     }, 1),
     event('user/message', {
       id: 'instructions-1',
@@ -74,13 +76,14 @@ function sessionWith(preset = 'auto-approve', overrides = {}) {
       config: { provider: 'reviewer', model: 'safe-model' },
       system: 'MAIN SYSTEM INSTRUCTIONS',
     }),
-    ...overrides,
+    ...sessionOverrides,
   }
 }
 
 function requestWith(preset = 'auto-approve', overrides = {}) {
+  const { sessionOverrides, ...requestOverrides } = overrides
   const agent = {
-    session: sessionWith(preset),
+    session: sessionWith(preset, sessionOverrides),
     options: {},
     inject: vi.fn(),
     cancel: vi.fn(),
@@ -90,7 +93,31 @@ function requestWith(preset = 'auto-approve', overrides = {}) {
     toolName: 'bash',
     callId: 'call-1',
     reason: 'escalate sandbox to danger-full-access: 运行项目测试',
-    ...overrides,
+    ...requestOverrides,
+  }
+}
+
+function languageSession(messages, extraEvents = []) {
+  const events = [
+    ...messages.map((text, index) => event('user/message', {
+      id: `user-${index}`,
+      role: 'user',
+      source: { kind: 'user' },
+      content: [{ type: 'text', text }],
+    }, index)),
+    ...extraEvents,
+  ]
+  return {
+    get seq() { return events.length },
+    snapshotEvents: (from = 0, to = events.length) => events.slice(from, to),
+    appendDirectUserMessage(text) {
+      events.push(event('user/message', {
+        id: `user-${events.length}`,
+        role: 'user',
+        source: { kind: 'user' },
+        content: [{ type: 'text', text }],
+      }, events.length))
+    },
   }
 }
 
@@ -139,6 +166,13 @@ const deny = Object.freeze({
   user_authorization: 'low',
   outcome: 'deny',
   rationale: '提权范围超过运行测试所需。',
+})
+
+const allowEnglish = Object.freeze({
+  risk_level: 'low',
+  user_authorization: 'high',
+  outcome: 'allow',
+  rationale: 'The user explicitly requested this test within scope.',
 })
 
 describe('结构化审查协议', () => {
@@ -224,6 +258,7 @@ describe('Auto Approve Reviewer 子 Agent', () => {
       .toBeLessThan(start.prompt[0].text.indexOf('本次审批'))
     expect(start.prompt[0].text.indexOf('MAIN SYSTEM INSTRUCTIONS'))
       .toBeLessThan(start.prompt[0].text.indexOf('session-1'))
+    expect(start.persona).toContain('使用直接用户 prompt 的语言书写简短理由')
     expect(run.dispose).toHaveBeenCalledOnce()
     expect(request.agent.inject).toHaveBeenCalledWith(expect.objectContaining({
       content: [{ type: 'text', text: expect.stringContaining('Reviewer 会话：reviewer-session-1') }],
@@ -332,6 +367,7 @@ describe('Reviewer 创建期隔离', () => {
 describe('输入装配与配置', () => {
   it('默认总时限为 90 秒并校验正整数', () => {
     expect(resolveConfig()).toMatchObject({
+      language: 'auto',
       timeoutMs: 90_000,
       maxInvestigationSteps: 4,
       maxMessageTranscriptTokens: 4_000,
@@ -344,6 +380,13 @@ describe('输入装配与配置', () => {
     })
     expect(() => resolveConfig({ maxConsecutiveDenials: 0 })).toThrow(/正整数/)
     expect(() => resolveConfig({ reviewerReasoningEffort: ' ' })).toThrow(/reviewerReasoningEffort/)
+    const warn = vi.fn()
+    expect(resolveConfig({ language: 'ja' }, warn).language).toBe('auto')
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/language=ja.*auto/))
+
+    const ctx = { logger: { warn: vi.fn() }, on: vi.fn(() => vi.fn()) }
+    apply(ctx, { language: 'invalid' })
+    expect(ctx.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/language=invalid.*auto/))
   })
 
   it('精确动作保留 turn、step、原始参数、审批原因和 cwd', () => {
@@ -406,5 +449,82 @@ describe('输入装配与配置', () => {
     expect(prompt.indexOf('MAIN SYSTEM INSTRUCTIONS')).toBeLessThan(approvalIndex)
     expect(prompt.indexOf('session-1')).toBeGreaterThan(approvalIndex)
     expect(prompt.indexOf('call-1')).toBeGreaterThan(approvalIndex)
+  })
+})
+
+describe('审查语言自动选择', () => {
+  it('自动模式累计直接用户消息中的汉字，超过三个才选择中文', () => {
+    expect(resolveReviewLanguage(languageSession(['中文测']))).toBe('en')
+    expect(resolveReviewLanguage(languageSession(['中文', '测试']))).toBe('zh')
+    expect(resolveReviewLanguage(languageSession(['𠀀一二三']))).toBe('zh')
+  })
+
+  it('在追加式 session 上增量累计新消息', () => {
+    const session = languageSession(['中文测'])
+    expect(resolveReviewLanguage(session)).toBe('en')
+    session.appendDirectUserMessage('试')
+    expect(resolveReviewLanguage(session)).toBe('zh')
+  })
+
+  it('忽略 Agent 指令、助手消息和工具结果中的中文', () => {
+    const ignored = [
+      event('user/message', {
+        source: { kind: 'agent-instructions' },
+        content: [{ type: 'text', text: '这里有很多中文字符' }],
+      }, 1),
+      event('assistant/message', {
+        message: { content: [{ type: 'text', text: '这里也有很多中文字符' }] },
+      }, 2),
+      event('tool/result', {
+        message: { content: [{ type: 'text', text: '工具返回中文字符' }] },
+      }, 3),
+    ]
+    expect(resolveReviewLanguage(languageSession(['Please run tests'], ignored))).toBe('en')
+  })
+
+  it('zh 和 en 配置会覆盖自动判断', () => {
+    expect(resolveReviewLanguage(languageSession(['Please run tests']), 'zh')).toBe('zh')
+    expect(resolveReviewLanguage(languageSession(['请帮我运行全部测试']), 'en')).toBe('en')
+  })
+
+  it('英文会话使用英文任务提示、通知、guard 和宿主失败理由', async () => {
+    const listeners = new Map()
+    apply({ on: vi.fn((name, listener) => { listeners.set(name, listener); return vi.fn() }) }, {})
+
+    const ctx = contextWith(reviewerRun(allowEnglish))
+    const request = requestWith('auto-approve', {
+      sessionOverrides: { directUserText: 'Please run the tests' },
+    })
+    expect(await createAutoApprovalHandler(ctx, resolveConfig())(request, vi.fn())).toBe('allowed-once')
+
+    const start = ctx.subagents.start.mock.calls[0][1]
+    expect(start.persona).toContain('Write a concise rationale in the language used by the direct user prompt')
+    expect(start.persona).toContain('独立安全审批 Reviewer')
+    expect(start.prompt[0].text).toContain('Review context')
+    expect(start.prompt[0].text).not.toContain('审查上下文')
+    const notice = request.agent.inject.mock.calls.at(-1)[0]
+    expect(notice.content[0].text).toContain('Auto Approve automatically allowed this bash action.')
+    expect(notice.content[0].text).toContain('Reviewer session: reviewer-session-1')
+    expect(notice.content[0].text).toContain('Rationale: The user explicitly requested')
+    expect(notice.source.summary).toBe('Auto Approve: allowed')
+
+    let guard
+    listeners.get('agent/created')({
+      agent: {
+        options: start.agentOptions,
+        session: { append: vi.fn() },
+        ctx: { tools: { guard: vi.fn(candidate => { guard = candidate }) }, on: vi.fn(() => vi.fn()) },
+      },
+    })
+    expect(guard({ name: 'write' })).toMatch(/read-only investigation tools/)
+
+    const failed = requestWith('auto-approve', {
+      callId: undefined,
+      sessionOverrides: { directUserText: 'Please run the tests' },
+    })
+    expect(await createAutoApprovalHandler(contextWith(reviewerRun(allowEnglish)), resolveConfig())(failed, vi.fn()))
+      .toBe('rejected')
+    expect(failed.agent.inject.mock.calls.at(-1)[0].content[0].text)
+      .toContain('Rationale: The exact tool call awaiting approval could not be found.')
   })
 })
