@@ -66,7 +66,9 @@ function sessionWith(preset = 'auto-approve', overrides = {}) {
   ]
   return {
     id: 'session-1',
-    events,
+    seq: events.length,
+    eventAt: seq => events[seq],
+    snapshotEvents: (from = 0, to = events.length) => Object.freeze(events.slice(from, to)),
     header: { cwd: '/workspace' },
     requestHeader: () => ({
       config: { provider: 'reviewer', model: 'safe-model' },
@@ -97,7 +99,7 @@ function reviewerRun(structured, overrides = {}) {
     id: 'reviewer-session-1',
     localAgent: {
       session: {
-        events: [
+        snapshotEvents: () => [
           event('step/start', { turn: 1, step: 1 }, 0),
           event('tool/call', { turn: 1, step: 1, callId: 'r1', name: 'read', arguments: '{}' }, 1),
           event('step/start', { turn: 1, step: 2 }, 2),
