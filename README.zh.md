@@ -8,9 +8,9 @@
 
 ## 截图
 
-选择 `Auto Approve` 权限档位：
+选择 `🧐 Auto Approve` 权限档位（DSH 0.1.5-rc.1，中文界面）：
 
-![Auto Approve 权限档位](docs/images/auto-approve-permission.png)
+![中文界面的 Auto Approve 权限档位](docs/images/auto-approve-permission.zh.jpg)
 
 Reviewer 允许有限的只读操作：
 
@@ -21,6 +21,17 @@ Reviewer 拒绝缺少充分用户授权的高风险操作：
 ![Auto Approve 拒绝高风险操作](docs/images/auto-approve-denied.png)
 
 ## 工作方式
+
+```mermaid
+flowchart TD
+    action["动作"] --> sandbox{"在 workspace-write<br/>允许范围内？"}
+    sandbox -- 是 --> execute["直接执行"]
+    sandbox -- "否：申请提权" --> review["🧐 Auto Approve"]
+    review -- 允许 --> approved["仅放行本次动作"]
+    review -- 拒绝 --> rejected["拒绝执行"]
+```
+
+选择 `Auto Approve` 后，`workspace-write` 允许范围内的普通操作直接执行，不调用 Reviewer。图中展示的是沙箱提权流程；其他工具审批规则也可能触发 Auto Approve。
 
 - 只有会话选择 `Auto Approve` 时，插件才接管 `approval/request`；其他权限档位继续使用 DSH 原有审批链。
 - 每次审批只启动一个 `spawn` Reviewer 会话。有限的 `read`、`glob`、`grep` 调查和最终结构化结果都由 DSH 自己的 agent loop 处理，插件不再实现另一套模型/工具循环。

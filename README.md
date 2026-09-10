@@ -8,9 +8,9 @@ The current release supports the Web UI only.
 
 ## Screenshots
 
-Select the `Auto Approve` permission preset:
+Select the `🧐 Auto Approve` permission preset (DSH 0.1.5-rc.1, English UI):
 
-![Auto Approve permission preset](docs/images/auto-approve-permission.png)
+![Auto Approve permission preset in the English UI](docs/images/auto-approve-permission.en.jpg)
 
 The Reviewer allows a bounded read-only action:
 
@@ -21,6 +21,17 @@ The Reviewer denies a high-risk action without sufficient user authorization:
 ![Auto Approve denies a high-risk action](docs/images/auto-approve-denied.png)
 
 ## How it works
+
+```mermaid
+flowchart TD
+    action["Action"] --> sandbox{"Allowed by<br/>workspace-write?"}
+    sandbox -- Yes --> execute["Execute directly"]
+    sandbox -- "No: request escalation" --> review["🧐 Auto Approve"]
+    review -- Allow --> approved["Execute this action once"]
+    review -- Deny --> rejected["Reject the action"]
+```
+
+With `Auto Approve` selected, ordinary actions permitted by `workspace-write` run without a Reviewer call. The diagram shows the sandbox-escalation path; other tool approval rules can also trigger Auto Approve.
 
 - The plugin handles `approval/request` only when the session selects `Auto Approve`. Other permission presets continue through DSH's existing approval chain.
 - Each approval starts one `spawn` Reviewer session. DSH's own agent loop handles any bounded `read`, `glob`, or `grep` investigation and captures the final structured result; the plugin does not implement a separate model/tool loop.
