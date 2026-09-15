@@ -19,6 +19,8 @@ window.__ModuleLoader__.load({
     /** 审批记录接口。 */
     const API_CONFIG = '/api/dsh-auto-pass/config'
     const API_LOG = '/api/dsh-auto-pass/log'
+    /** 启动信标：把客户端半走到哪一步写进宿主日志（排查「看不到面板」用）。 */
+    const API_BEACON = '/api/dsh-auto-pass/beacon'
     /** 时间轴轮询间隔（毫秒）。 */
     const POLL_MS = 3_000
     /** 右侧栏 tab 类型标识，同时是正文/标题席位的 key。 */
@@ -27,6 +29,18 @@ window.__ModuleLoader__.load({
     /** 对话区标签页的席位 id（conversation.view 内必须唯一）。 */
     const VIEW_ID = 'dsh-auto-pass'
     const PLACEMENTS = ['auto', 'tab', 'sidebar', 'all']
+
+    /** 上报一次启动阶段；失败静默（信标绝不影响插件本体）。 */
+    function beacon(stage, detail = '') {
+      try {
+        void fetch(API_BEACON + '?stage=' + encodeURIComponent(stage) + '&detail=' + encodeURIComponent(detail), {
+          headers: { accept: 'application/json' },
+        }).catch(() => {})
+      } catch (error) {
+        // fetch 本身不可用时忽略
+      }
+    }
+    beacon('factory')
 
     /** 界面语言：跟随浏览器语言，简体/繁体中文都用中文文案。 */
     const ZH = /^zh/i.test(typeof navigator === 'object' && navigator !== null ? String(navigator.language ?? '') : '')
@@ -347,8 +361,21 @@ window.__ModuleLoader__.load({
 
     /** 客户端插件入口：按 placement 决定挂载对话标签页、右侧栏 tab 或两者。 */
     function apply(ctx) {
+      try {
+        applyInner(ctx)
+      } catch (error) {
+        beacon('error', String(error?.message ?? error))
+        console.warn(LOG, '客户端半 apply 失败', error)
+        throw error
+      }
+    }
+
+    /** 真正的挂载逻辑；外层包一层 try/catch 只为把失败上报成信标。 */
+    function applyInner(ctx) {
+      beacon('apply')
       const slots = ctx.get('slots')
       if (slots === undefined) {
+        beacon('no-slots')
         console.warn(LOG, '没有 slots 服务，审批记录面板未注册')
         return
       }
@@ -357,12 +384,16 @@ window.__ModuleLoader__.load({
 
       const mountTab = () => {
         if (mounted.tab !== undefined) return
-        mounted.tab = slots.inject('conversation.view', () => slots.register({
-          name: 'conversation.view',
-          id: VIEW_ID,
-          order: 30,
-          label: () => t.tabLabel,
-        }, props => react.createElement(ApprovalLogPanel, props)))
+        mounted.tab = slots.inject('conversation.view', () => {
+          const dispose = slots.register({
+            name: 'conversation.view',
+            id: VIEW_ID,
+            order: 30,
+            label: () => t.tabLabel,
+          }, props => react.createElement(ApprovalLogPanel, props))
+          beacon('view-registered')
+          return dispose
+        })
       }
       const mountSidebar = () => {
         if (mounted.sidebar !== undefined) return
@@ -390,7 +421,9 @@ window.__ModuleLoader__.load({
               name: 'sidebar.right.pane.tab',
               key: SIDEBAR_ID,
             }, props => react.createElement(ApprovalLogPanel, props))))
+            beacon('sidebar-registered')
           } catch (error) {
+            beacon('sidebar-error', String(error?.message ?? error))
             console.warn(LOG, '右侧栏 tab 注册失败', error)
             for (const dispose of disposers) dispose()
             return undefined
@@ -425,6 +458,9 @@ window.__ModuleLoader__.load({
 
       const unsubscribe = placementStore.subscribe(remount)
       remount()
+      beacon('mounted', 'placement=' + placementStore.value + ' view=' + String(mounted.tab !== undefined)
+        + ' sidebar=' + String(mounted.sidebar !== undefined)
+        + ' hasSidebarSeat=' + String(ctx.get('sidebarRightTabs') !== undefined))
       void placementStore.load().then(remount)
 
       ctx.effect(() => slots.inject('settings.plugin.item', () => slots.register({

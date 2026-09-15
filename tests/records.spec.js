@@ -209,6 +209,16 @@ describe('审批记录路由', () => {
     expect(refused.state.code).toBe(503)
   })
 
+  it('客户端信标写进宿主日志', async () => {
+    const { ctx, routes } = fakeContext()
+    apply(ctx, { logFile: tempFile() })
+    const beacon = fakeHttp('GET', '/api/dsh-auto-pass/beacon?stage=mounted&detail=placement%3Dall')
+    await routes[0].handler(beacon.req, beacon.res)
+    expect(beacon.state.code).toBe(200)
+    expect(JSON.parse(beacon.state.body)).toEqual({ ok: true })
+    expect(ctx.logger.info).toHaveBeenCalledWith(expect.stringContaining('client beacon stage=mounted detail=placement=all'))
+  })
+
   it('未知路径 404、非 GET 405', () => {
     const { ctx, routes } = fakeContext()
     apply(ctx, { logFile: tempFile() })

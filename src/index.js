@@ -51,6 +51,8 @@ const DEFAULTS = Object.freeze({
 /** 审批记录路由前缀（webServer kind: prefix）与两条查询路径。 */
 export const RECORD_ROUTE = '/api/dsh-auto-pass'
 export const RECORD_LOG_PATH = '/api/dsh-auto-pass/log'
+/** 客户端半启动信标：把「走到哪一步」写进宿主日志，用于定位「看不到面板」类问题。 */
+export const RECORD_BEACON_PATH = '/api/dsh-auto-pass/beacon'
 export const RECORD_CONFIG_PATH = '/api/dsh-auto-pass/config'
 /** 时间轴可选的放置位置；auto 表示优先右侧栏座位、没有座位时退回对话标签页。 */
 export const PLACEMENTS = Object.freeze(['auto', 'tab', 'sidebar', 'all'])
@@ -178,8 +180,19 @@ async function serveRecordRequest(req, res, records, config, ctx) {
   try {
     const url = new URL(req.url ?? '/', 'http://dsh.local')
     const pathname = url.pathname.replace(/\/+$/, '')
-    if (pathname !== RECORD_LOG_PATH && pathname !== RECORD_CONFIG_PATH) {
+    if (pathname !== RECORD_LOG_PATH && pathname !== RECORD_CONFIG_PATH && pathname !== RECORD_BEACON_PATH) {
       writeJson(404, { ok: false, error: 'not found' })
+      return
+    }
+    if (pathname === RECORD_BEACON_PATH) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        writeJson(405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      const stage = safeLogValue(url.searchParams.get('stage') ?? '?', 60)
+      const detail = safeLogValue(url.searchParams.get('detail') ?? '', 300)
+      ctx.logger.info('dsh-auto-pass: client beacon stage=' + stage + ' detail=' + detail)
+      writeJson(200, { ok: true })
       return
     }
     if (pathname === RECORD_CONFIG_PATH) {
