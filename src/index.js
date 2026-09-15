@@ -315,7 +315,7 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
       return
     }
     if (pathname === RULE_PATH) {
-      await serveRuleRequest(req, writeJson, policies, records)
+      await serveRuleRequest(ctx, req, writeJson, policies, records, config)
       return
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -425,11 +425,78 @@ async function servePolicyRequest(req, url, writeJson, policies) {
 }
 
 /**
- * 时间线上的「升级/降级」：把一条审批记录变成白名单/黑名单规则。
- * 优先使用 Reviewer 在本次审查里给出的建议规则（模型产出，可覆盖同类动作）；
- * 没有建议（例如审查失败转人工）时精确回落到本次签名——宁可窄，不要宽。
+ * 选一条规则文本：有模型建议就直接用（本身是模型产出），否则现场起一次规则优化调用；
+ * 都拿不到时返回 undefined，让调用方回落到精确签名。
  */
-async function serveRuleRequest(req, writeJson, policies, records) {
+async function chooseRecordRule(ctx, record, body, config, records) {
+  // 两条路都是模型产出，source 一律标 model（规则列表里能看出它不是用户手搓的）
+  if (record.suggestedRule !== undefined) return { rule: { ...record.suggestedRule, source: 'model' }, optimizedBy: 'record' }
+  const signature = signatureFromRecord(record)
+  const parent = liveAgentFor(ctx, body.sessionId ?? record.sessionId)
+  if (signature === undefined || parent === undefined) return undefined
+  let language = 'zh'
+  try {
+    language = resolveReviewLanguage(parent.session, config.language)
+  } catch (error) {
+    // 会话状态读不出来（例如重启后点开旧会话的记录）只影响措辞，不影响匹配条件
+    void error
+  }
+  const optimized = await optimizeRule(ctx, {
+    parent,
+    request: { agent: parent, callId: 'manual:' + String(record.id ?? '') },
+    config,
+    language,
+    signature,
+    list: body.list,
+    records,
+  })
+  return optimized === undefined ? undefined : { rule: { ...optimized, source: 'model' }, optimizedBy: 'model' }
+}
+
+/** 从审批记录里重建签名；老记录只有 toolName/key/text，缺 command/paths 时模型只能靠标签判断。 */
+function signatureFromRecord(record) {
+  const signature = record?.signature
+  if (signature === undefined || typeof signature.key !== 'string' || signature.key === '') return undefined
+  return {
+    toolName: signature.toolName ?? record.toolName,
+    key: signature.key,
+    memoryKey: signature.memoryKey ?? signature.key,
+    text: signature.text ?? String(record.toolName ?? ''),
+    ...(signature.command === undefined ? {} : { command: signature.command }),
+    paths: Array.isArray(signature.paths) ? signature.paths : [],
+  }
+}
+
+/**
+ * 取一个在册的 Agent 作为规则优化调用的父 Agent：客户端给的会话 → 记录所在会话 → 任一在册 root。
+ * 都取不到就返回 undefined，调用方回落到精确签名：宁可不优化，也不硬起一个没有归属的子 Agent。
+ */
+function liveAgentFor(ctx, sessionId) {
+  if (typeof ctx.get !== 'function') return undefined
+  const agents = ctx.get('agents')
+  if (agents === undefined) return undefined
+  try {
+    if (typeof agents.get === 'function' && typeof sessionId === 'string' && sessionId !== '') {
+      const exact = agents.get(sessionId)
+      if (exact !== undefined && exact !== null) return exact
+    }
+    if (typeof agents.roots === 'function') {
+      const roots = agents.roots()
+      return Array.isArray(roots) && roots.length > 0 ? roots[0] : undefined
+    }
+  } catch (error) {
+    ctx.logger.warn('dsh-auto-pass: 查找在册 Agent 失败：' + errorMessage(error))
+  }
+  return undefined
+}
+
+/**
+ * 时间线上的「升级/降级」：把一条审批记录变成白名单/黑名单规则。
+ * 规则文本一律**经过 DSH 模型**：优先用 Reviewer 在这次审查里给出的建议（本身就是模型产出），
+ * 没有建议（审查失败 / 无审查路由 / 命中名单）就现场起一次只读的规则优化调用；两者都拿不到
+ * 时才精确回落到本次签名——宁可窄、不要宽，并在响应里如实说明走的是哪条路。
+ */
+async function serveRuleRequest(ctx, req, writeJson, policies, records, config) {
   if (req.method !== 'POST' && req.method !== 'PUT') {
     writeJson(405, { ok: false, error: 'method not allowed' })
     return
@@ -444,7 +511,8 @@ async function serveRuleRequest(req, writeJson, policies, records) {
     writeJson(404, { ok: false, error: 'approval record not found' })
     return
   }
-  const rule = ruleFromRecord(record)
+  const chosen = await chooseRecordRule(ctx, record, body, config, records)
+  const rule = chosen?.rule ?? ruleFromRecord(record)
   if (rule === undefined) {
     writeJson(400, { ok: false, error: 'approval record has no usable rule signature' })
     return
@@ -459,7 +527,14 @@ async function serveRuleRequest(req, writeJson, policies, records) {
       ruleApplied: { scope: added.scope, list: body.list, ruleId: added.rule.id, label: added.rule.label },
     })
   }
-  writeJson(200, { ok: true, rule: added.rule, scope: added.scope, file: added.file })
+  writeJson(200, {
+    ok: true,
+    rule: added.rule,
+    scope: added.scope,
+    file: added.file,
+    // 客户端据此说明这条规则是「审查时的模型建议」「现场模型优化」还是「精确签名兜底」
+    optimizedBy: chosen?.optimizedBy ?? 'signature',
+  })
 }
 
 /** 由记录构造规则字段；模型建议优先，否则精确签名。 */
@@ -991,8 +1066,10 @@ function buildRulePrompt({ signature, list, records }) {
  * 复用 Reviewer 的隔离配置（read-only + approval=never + 只读工具），失败一律返回 undefined：
  * 拿不到模型优化结果时宁可不写规则，也不写一条没经过优化的规则。
  */
-async function optimizeRule(ctx, request, options) {
-  const { config, language, signature, list, records } = options
+async function optimizeRule(ctx, options) {
+  const { parent, request, config, language, signature, list, records } = options
+  // 没有父 Agent（会话已不在册）或没有可用的模型路由时不猜：宁可让调用方回落到精确签名
+  if (parent === undefined || ctx.subagents === undefined) return undefined
   const route = resolveRoute(request, config)
   if (route === undefined) return undefined
   const signal = AbortSignal.timeout(config.timeoutMs)
@@ -1000,7 +1077,7 @@ async function optimizeRule(ctx, request, options) {
   try {
     run = await ctx.subagents.start('spawn', {
       label: '_auto-approve-rule:' + String(request.callId ?? 'call'),
-      parent: request.agent,
+      parent,
       signal,
       prompt: [{ type: 'text', text: buildRulePrompt({ signature, list, records }) }],
       agentOptions: {
@@ -1060,8 +1137,8 @@ async function proposeRule(ctx, policies, records, request, options) {
     return
   }
   // 模型优化：本次审查已经给出结构化建议时直接沿用（同样是模型产出），否则单独起一次优化调用。
-  const rule = decision?.suggestedRule ?? await optimizeRule(ctx, request, {
-    config, language, signature, list: suggestion.list, records,
+  const rule = decision?.suggestedRule ?? await optimizeRule(ctx, {
+    parent: request.agent, request, config, language, signature, list: suggestion.list, records,
   })
   if (rule === undefined) {
     ctx.logger.warn('dsh-auto-pass: 模型没有给出可用的匹配条件，跳过规则确认 signature=' + safeLogValue(signature.text))
@@ -1161,7 +1238,15 @@ function buildRecord(request, action, outcome, decision, latencyMs, signature, o
     outcome: typeof outcome === 'string' ? outcome : String(outcome),
     latencyMs,
     ...(actionText === undefined ? {} : { action: truncateText(actionText, MAX_RECORD_ACTION_CHARS) }),
-    ...(signature === undefined ? {} : { signature: { toolName: signature.toolName, key: signature.key, text: signature.text } }),
+    // command / paths 也存下来：时间线上的手动升级要现场起一次规则优化调用，需要这些字段
+    ...(signature === undefined ? {} : { signature: {
+      toolName: signature.toolName,
+      key: signature.key,
+      memoryKey: signature.memoryKey,
+      text: signature.text,
+      ...(signature.command === undefined ? {} : { command: signature.command }),
+      ...(signature.paths === undefined || signature.paths.length === 0 ? {} : { paths: [...signature.paths] }),
+    } }),
     ...(decision.suggestedRule === undefined ? {} : { suggestedRule: decision.suggestedRule }),
     ...(decision.policyHit === undefined ? {} : { policy: decision.policyHit }),
     ...(observed?.promoted === null || observed?.promoted === undefined

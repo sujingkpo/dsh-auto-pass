@@ -493,7 +493,7 @@ describe('升级/降级规则', () => {
 
 describe('策略 HTTP 入口', () => {
   /** 造一个只实现 webServer 路由注册所需面的假宿主。 */
-  function fakeContext() {
+  function fakeContext(options = {}) {
     const routes = []
     return {
       routes,
@@ -501,13 +501,30 @@ describe('策略 HTTP 入口', () => {
         logger: { info: vi.fn(), warn: vi.fn() },
         on: () => () => {},
         effect: fn => fn(),
-        get: () => undefined,
+        // 手动升级要现场起一次规则优化调用：这两个服务缺一就回落到精确签名
+        ...(options.subagents === undefined ? {} : { subagents: options.subagents }),
+        get: name => (name === 'agents' ? options.agents : undefined),
         inject: (names, callback) => {
           if (names.includes('webServer')) {
             callback({ effect: fn => fn(), webServer: { register: registration => { routes.push(registration); return () => {} } } })
           }
           return { dispose: () => {} }
         },
+      },
+    }
+  }
+
+  /** 假在册 Agent：规则优化调用只需要 session（判语言）与 options。 */
+  function fakeAgent() {
+    return {
+      id: 'session-1',
+      options: {},
+      session: {
+        id: 'session-1',
+        seq: 0,
+        snapshotEvents: () => [],
+        header: { cwd: '/p' },
+        requestHeader: () => ({ config: { provider: 'p', model: 'm' } }),
       },
     }
   }
@@ -601,6 +618,8 @@ describe('策略 HTTP 入口', () => {
     expect(result.ok).toBe(true)
     expect(result.rule.source).toBe('model')
     expect(result.rule.match).toEqual({ kind: 'command_prefix', value: 'npm test' })
+    // 审查时模型已经给过建议：不额外烧一次优化调用，但如实标注来源
+    expect(result.optimizedBy).toBe('record')
 
     // 记录被回写：时间线上能看到这条已经应用过的规则
     const persisted = JSON.parse(readFileSync(logFile, 'utf8'))
@@ -614,6 +633,67 @@ describe('策略 HTTP 入口', () => {
       cwd: undefined,
     })
     expect(hit.list).toBe('allow')
+  })
+
+  it('没有模型建议时现场跑一次模型优化，规则仍然经过模型', async () => {
+    const root = tempDir()
+    const logFile = join(root, 'approvals.json')
+    writeFileSync(logFile, JSON.stringify({
+      version: 1,
+      records: [{
+        id: 'rec-2',
+        sessionId: 'session-1',
+        cwd: join(root, 'project'),
+        toolName: 'pwsh',
+        signature: { toolName: 'pwsh', key: 'sig-2', memoryKey: 'sig-2', text: 'pwsh: pnpm test', command: 'pnpm test' },
+      }],
+    }), 'utf8')
+
+    const subagents = { start: vi.fn().mockResolvedValue(ruleRun('pnpm test')) }
+    const { ctx, routes } = fakeContext({
+      agents: { get: () => fakeAgent(), roots: () => [fakeAgent()] },
+      subagents,
+    })
+    apply(ctx, {
+      logFile,
+      policyFile: join(root, 'home', 'policy.json'),
+      language: 'zh',
+      reviewerProvider: 'p',
+      reviewerModel: 'm',
+    })
+
+    const promote = fakeHttp('POST', RULE_PATH, JSON.stringify({
+      recordId: 'rec-2', scope: 'project', list: 'allow', sessionId: 'session-1',
+    }))
+    await routes[0].handler(promote.req, promote.res)
+    const result = JSON.parse(promote.state.body)
+    expect(subagents.start).toHaveBeenCalledOnce()
+    expect(result.optimizedBy).toBe('model')
+    expect(result.rule.match).toEqual({ kind: 'command_prefix', value: 'pnpm test' })
+    expect(result.rule.source).toBe('model')
+  })
+
+  it('取不到在册 Agent 时如实回落到精确签名', async () => {
+    const root = tempDir()
+    const logFile = join(root, 'approvals.json')
+    writeFileSync(logFile, JSON.stringify({
+      version: 1,
+      records: [{
+        id: 'rec-3',
+        sessionId: 'session-gone',
+        cwd: join(root, 'project'),
+        toolName: 'pwsh',
+        signature: { toolName: 'pwsh', key: 'sig-3', text: 'pwsh: pnpm test' },
+      }],
+    }), 'utf8')
+
+    const { ctx, routes } = fakeContext()
+    apply(ctx, { logFile, policyFile: join(root, 'home', 'policy.json'), language: 'zh' })
+    const promote = fakeHttp('POST', RULE_PATH, JSON.stringify({ recordId: 'rec-3', scope: 'project', list: 'deny' }))
+    await routes[0].handler(promote.req, promote.res)
+    const result = JSON.parse(promote.state.body)
+    expect(result.optimizedBy).toBe('signature')
+    expect(result.rule.match).toEqual({ kind: 'signature', value: 'sig-3' })
   })
 
   it('记录不存在时返回 404', async () => {

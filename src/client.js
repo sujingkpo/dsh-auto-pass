@@ -112,6 +112,9 @@ window.__ModuleLoader__.load({
         scopeProject: '本项目',
         scopeGlobal: '全局',
         working: '处理中…',
+        appliedModel: '已加入（模型优化）',
+        appliedRecord: '已加入（采用审查时的模型建议）',
+        appliedFallback: '已加入（模型优化不可用，已回落到精确签名）',
         sourceUser: '手动',
         sourceModel: '模型',
         sourceMemory: '记忆',
@@ -185,6 +188,9 @@ window.__ModuleLoader__.load({
         scopeProject: 'This project',
         scopeGlobal: 'Global',
         working: 'Working…',
+        appliedModel: 'Added (model-optimized)',
+        appliedRecord: 'Added (rule suggested by the review model)',
+        appliedFallback: 'Added (model optimization unavailable; fell back to the exact signature)',
         sourceUser: 'manual',
         sourceModel: 'model',
         sourceMemory: 'memory',
@@ -269,6 +275,7 @@ window.__ModuleLoader__.load({
         '.ap-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding-top:4px}',
         '.ap-actionsLabel{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;min-width:5.5em}',
         '.ap-note{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}',
+        '.ap-warn{color:var(--dsw-alias-state-warn-primary)}',
         '.ap-rowMain{flex:auto;min-width:0;display:flex;flex-direction:column;gap:2px}',
         '.ap-rowTop{display:flex;align-items:center;gap:8px;min-width:0}',
         '.ap-opinion{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;text-align:left;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}',
@@ -412,11 +419,17 @@ window.__ModuleLoader__.load({
      * 把一条审批记录升级/降级成规则。规则文本由宿主依据记录里的模型建议产出，
      * 没有建议时精确回落到该次动作签名——客户端只负责发起与刷新。
      */
-    async function promoteRecord(recordId, scope, list) {
+    async function promoteRecord(recordId, scope, list, sessionId) {
       const response = await fetch(API_RULE, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ recordId, scope, list }),
+        body: JSON.stringify({
+          recordId,
+          scope,
+          list,
+          // 会话 id 让宿主把「现场模型优化」挂在对应会话的 Agent 下
+          ...(typeof sessionId === 'string' && sessionId !== '' ? { sessionId } : {}),
+        }),
       })
       const data = await response.json()
       if (data === null || typeof data !== 'object' || data.ok !== true) {
@@ -491,14 +504,26 @@ window.__ModuleLoader__.load({
     function RuleActions({ record, onDone }) {
       const [busy, setBusy] = react.useState(false)
       const [error, setError] = react.useState('')
+      const [done, setDone] = react.useState(undefined)
       const run = (list, scope) => {
         setBusy(true)
         setError('')
-        promoteRecord(record.id, scope, list)
-          .then(() => { if (typeof onDone === 'function') onDone() })
+        setDone(undefined)
+        promoteRecord(record.id, scope, list, record.sessionId)
+          .then(data => {
+            setDone(data)
+            if (typeof onDone === 'function') onDone()
+          })
           .catch(cause => setError(String(cause?.message ?? cause)))
           .finally(() => setBusy(false))
       }
+      // 规则文本一定经过模型，但可能走的是「审查时的建议」或「精确签名兜底」，如实写出来
+      const doneText = done === undefined
+        ? undefined
+        : (done.optimizedBy === 'signature'
+          ? t.appliedFallback
+          : done.optimizedBy === 'record' ? t.appliedRecord : t.appliedModel)
+          + '：' + String(done.rule?.label ?? '')
       const scopeButtons = (list, className) => ['project', 'global'].map(scope => react.createElement('button', {
         key: list + ':' + scope,
         type: 'button',
@@ -512,7 +537,10 @@ window.__ModuleLoader__.load({
         react.createElement('span', { className: 'ap-actionsLabel' }, t.demote),
         ...scopeButtons('deny', 'ap-btnDanger'),
         busy && react.createElement('span', { className: 'ap-note' }, t.working),
-        error !== '' && react.createElement('span', { className: 'ap-note' }, error))
+        error !== '' && react.createElement('span', { className: 'ap-note' }, error),
+        doneText !== undefined && react.createElement('span', {
+          className: done.optimizedBy === 'signature' ? 'ap-note ap-warn' : 'ap-note',
+        }, doneText))
     }
 
     /** 单条记录：折叠只显示概要，展开显示风险/授权/理由/动作，以及升级/降级操作。 */

@@ -12,7 +12,7 @@
 ## 命令（已验证）
 
 - 安装依赖：`pnpm install`（Node ≥ 22.19；`~/.npmrc` 的 registry 为 npmmirror，装 vitest 约 2 秒）。
-- 跑测试：`pnpm test`（= `vitest run`，当前 89 个用例全绿：`auto-approve` 23 + `records` 10 + `package` 4 + `policy` 28 + `policy-gate` 21 + `client` 3）。
+- 跑测试：`pnpm test`（= `vitest run`，当前 91 个用例全绿：`auto-approve` 23 + `records` 10 + `package` 4 + `policy` 28 + `policy-gate` 23 + `client` 3）。
 - **客户端半只有 `tests/client.spec.js` 覆盖**：它不进构建流水线。测试用假 `window.__ModuleLoader__` + 带「渲染帧」的假 react 加载 bundle，把组件**渲染到稳定状态**（反复求值 + 跑副作用 + 等微任务，直到没有新的 `setState`）——漏定义变量、漏闭合花括号、以及「异步拉到记录之后」那一轮渲染里的问题就靠它兜住（都真的漏过）。
 - `tests/auto-approve.spec.js` 文件名沿用权限档位名 `auto-approve`，与包名 `dsh-auto-pass` 不同，改名时不要误删。
 - **受限沙箱下 `pnpm test` 会 `spawn EPERM`**（vite 会 `exec("net use")`、vitest 默认 forks 池也要 spawn 子进程）；需要以更宽权限运行，否则测试跑不起来。
@@ -35,7 +35,9 @@
 - **签名的三条安全性质（防过的坑）**：① `action` 拿不到时不建签名——否则所有解析不出参数的请求塌缩成同一个空签名，会被一起计数、一起触发询问；② 命中名单的那一次不计数（`decision.policyHit !== undefined`）：用户刚把这类动作写成规则，这一次的放行/拒绝是**单次**决定，不该继续滚成记忆；③ 达到阈值只产生**建议**：规则一律经「模型优化 → 用户确认」才落盘，选过「不加入」的动作记进 `dismissed` 不再询问。黑名单永远压过白名单。
 - `signatureOf` 会把字符串形态的 `arguments` 解析一层：`tool/call` 事件里 `arguments` 时而对象时而 JSON 字符串，字符串若不解析会退化成空参数签名，等于把一条规则放大到整个工具。
 - 策略文件：全局 `$DSH_HOME/dsh-auto-pass/policy.json`（阈值 + 全局名单 + 计数），项目 `<cwd>/.dsh-auto-pass/policy.json`（项目名单）。计数统一放全局文件、键带 `cwd` 前缀，所以项目目录只在真的写了项目规则时才多出 `.dsh-auto-pass/`。项目写盘失败自动降级写全局；策略 IO 失败只告警，绝不影响审批结论。
-- HTTP：`GET/POST /api/dsh-auto-pass/policy`（快照 / `op=threshold|add|remove`）、`POST /api/dsh-auto-pass/rule {recordId, scope, list}`（由记录一键升级/降级，并回写记录的 `ruleApplied`）。
+- HTTP：`GET/POST /api/dsh-auto-pass/policy`（快照 / `op=threshold|add|remove`）、`POST /api/dsh-auto-pass/rule {recordId, scope, list, sessionId?}`（时间线一键升级/降级，回写记录的 `ruleApplied`）。
+- **手动升级也必须经过模型（2026-09-15 用户指出后修正）**：`/rule` 的规则文本一律来自模型——① 记录里已有审查时的 `suggestedRule` → 直接用（`optimizedBy: 'record'`）；② 没有就现场起一次只读的 `optimizeRule`（`optimizedBy: 'model'`），父 Agent 按「客户端给的 sessionId → 记录所在 sessionId → 任一在册 root」逐级兜底（`ctx.get('agents').get(sessionId)` 取的就是在册 Agent，见 dsh-subagent 的 `catalogView`）；③ 服务或模型不可用才精确回落到签名（`optimizedBy: 'signature'`，客户端用警告色如实说明）。两条模型路径写下的规则 `source` 都是 `model`。历史教训：早期版本查不到建议就直接写精确签名，用户点「升级」时完全没经过模型。
+- 记录里的 `signature` 除了 `toolName/key/memoryKey/text` 还存 `command` 与 `paths`：手动升级时现场那次优化调用需要它们，才能判断前缀该窄到什么程度（老记录没有这两个字段，模型只能靠标签判断）。
 
 ## 客户端半与审批记录（读源码确认）
 
