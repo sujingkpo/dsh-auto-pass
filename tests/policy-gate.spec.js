@@ -649,7 +649,13 @@ describe('策略 HTTP 入口', () => {
       }],
     }), 'utf8')
 
-    const subagents = { start: vi.fn().mockResolvedValue(ruleRun('pnpm test')) }
+    const started = []
+    const subagents = {
+      start: vi.fn().mockImplementation((provider, options) => {
+        started.push(options)
+        return Promise.resolve(ruleRun('pnpm test'))
+      }),
+    }
     const { ctx, routes } = fakeContext({
       agents: { get: () => fakeAgent(), roots: () => [fakeAgent()] },
       subagents,
@@ -668,6 +674,9 @@ describe('策略 HTTP 入口', () => {
     await routes[0].handler(promote.req, promote.res)
     const result = JSON.parse(promote.state.body)
     expect(subagents.start).toHaveBeenCalledOnce()
+    // 两种档位都要能交结论：persona 与任务提示都必须写明 ptc 下经 run_code 提交 structured_output
+    expect(started[0].persona).toContain('run_code')
+    expect(started[0].prompt[0].text).toContain('structured_output')
     expect(result.optimizedBy).toBe('model')
     expect(result.rule.match).toEqual({ kind: 'command_prefix', value: 'pnpm test' })
     expect(result.rule.source).toBe('model')

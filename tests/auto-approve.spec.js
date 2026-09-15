@@ -596,6 +596,42 @@ describe('输入装配与配置', () => {
     expect(evidence.approval_request.exact_action.callId).toBe('call-1')
   })
 
+  it('ptc 档位的内层调用同样进证据，内层 ask_user_question 仍算可信授权', () => {
+    const events = [
+      event('user/message', { id: 'user-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '帮我跑测试' }] }, 0),
+      event('tool/call', { turn: 1, step: 1, callId: 'call-parent', name: 'run_code', arguments: '{"code":"..."}' }, 1),
+      event('tool/ptc-dispatch-start', {
+        rootCallId: 'call-parent', parentCallId: 'call-parent', subCallId: 'call-parent:ptc:1',
+        name: 'pwsh', arguments: { command: 'npm test' },
+      }, 2),
+      event('tool/ptc-dispatch', {
+        rootCallId: 'call-parent', parentCallId: 'call-parent', subCallId: 'call-parent:ptc:1',
+        name: 'pwsh', arguments: { command: 'npm test' }, isError: false, content: [{ type: 'text', text: 'ok' }],
+      }, 3),
+      event('tool/ptc-dispatch', {
+        rootCallId: 'call-parent', parentCallId: 'call-parent', subCallId: 'call-parent:ptc:2',
+        name: 'ask_user_question', arguments: { questions: [] }, isError: false, content: [{ type: 'text', text: '{"answers":[]}' }],
+      }, 4),
+    ]
+    const session = {
+      id: 'session-ptc',
+      seq: events.length,
+      eventAt: seq => events[seq],
+      snapshotEvents: () => events,
+      header: { cwd: '/workspace' },
+      requestHeader: () => ({ system: 'MAIN SYSTEM INSTRUCTIONS' }),
+    }
+    const request = { agent: { session }, toolName: 'pwsh', callId: 'call-parent:ptc:1', reason: 'escalate' }
+    const evidence = buildReviewEvidence(contextWith(reviewerRun(allow)), request, exactAction(request), resolveConfig())
+    const records = evidence.approval_request.transcript.tools.records
+    // 内层调用要作为真正的工具调用出现（否则 Reviewer 只看到一段 run_code 脚本）
+    expect(records.some(record => record.includes('call-parent:ptc:1') && record.includes('"via_ptc":true'))).toBe(true)
+    // 内层 ask_user_question 的回答是可信授权来源，ptc 档位下不能丢这个标记
+    const answer = records.find(record => record.includes('call-parent:ptc:2'))
+    expect(answer).toBeDefined()
+    expect(answer).toContain('"trusted_for_authorization":true')
+  })
+
   it('把稳定指令放在动态审批数据之前，并使用两个独立 JSON 区段', () => {
     const request = requestWith()
     const evidence = buildReviewEvidence(

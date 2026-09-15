@@ -1057,7 +1057,8 @@ function buildRulePrompt({ signature, list, records }) {
       target_list: list,
       recent_same_tool: recent,
     }, null, 2),
-    '请提交优化后的匹配条件。',
+    // 两种档位都要能交结论：标准档位直接调 structured_output，ptc 档位必须写在 run_code 里
+    '提交方式：调用 structured_output。若当前档位只允许 run_code（ptc 预设），则把只读调查与 structured_output 都写在 run_code 里调用。',
   ].join('\n\n')
 }
 
@@ -1373,6 +1374,35 @@ export function buildReviewEvidence(ctx, request, action, config) {
         callId: event.data.callId,
         name: event.data.name,
         arguments: event.data.arguments,
+      })
+      continue
+    }
+    // ptc 档位：模型内联在 run_code 里调用别的工具，会话里只有派生的子调用事件
+    if (event.type === 'tool/ptc-dispatch-start') {
+      toolNames.set(event.data.subCallId, event.data.name)
+      toolEntries.push({
+        seq: event.seq,
+        kind: 'tool_call',
+        trusted_for_authorization: false,
+        callId: event.data.subCallId,
+        parentCallId: event.data.parentCallId,
+        name: event.data.name,
+        arguments: event.data.arguments,
+        via_ptc: true,
+      })
+      continue
+    }
+    if (event.type === 'tool/ptc-dispatch') {
+      toolEntries.push({
+        seq: event.seq,
+        kind: 'tool_result',
+        trusted_for_authorization: event.data.name === 'ask_user_question',
+        callId: event.data.subCallId,
+        parentCallId: event.data.parentCallId,
+        name: event.data.name,
+        content: event.data.content,
+        ...(event.data.isError === true ? { error: true } : {}),
+        via_ptc: true,
       })
       continue
     }

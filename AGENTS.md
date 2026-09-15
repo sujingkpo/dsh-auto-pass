@@ -12,7 +12,7 @@
 ## 命令（已验证）
 
 - 安装依赖：`pnpm install`（Node ≥ 22.19；`~/.npmrc` 的 registry 为 npmmirror，装 vitest 约 2 秒）。
-- 跑测试：`pnpm test`（= `vitest run`，当前 91 个用例全绿：`auto-approve` 23 + `records` 10 + `package` 4 + `policy` 28 + `policy-gate` 23 + `client` 3）。
+- 跑测试：`pnpm test`（= `vitest run`，当前 92 个用例全绿：`auto-approve` 24 + `records` 10 + `package` 4 + `policy` 28 + `policy-gate` 23 + `client` 3）。
 - **客户端半只有 `tests/client.spec.js` 覆盖**：它不进构建流水线。测试用假 `window.__ModuleLoader__` + 带「渲染帧」的假 react 加载 bundle，把组件**渲染到稳定状态**（反复求值 + 跑副作用 + 等微任务，直到没有新的 `setState`）——漏定义变量、漏闭合花括号、以及「异步拉到记录之后」那一轮渲染里的问题就靠它兜住（都真的漏过）。
 - `tests/auto-approve.spec.js` 文件名沿用权限档位名 `auto-approve`，与包名 `dsh-auto-pass` 不同，改名时不要误删。
 - **受限沙箱下 `pnpm test` 会 `spawn EPERM`**（vite 会 `exec("net use")`、vitest 默认 forks 池也要 spawn 子进程）；需要以更宽权限运行，否则测试跑不起来。
@@ -37,6 +37,7 @@
 - 策略文件：全局 `$DSH_HOME/dsh-auto-pass/policy.json`（阈值 + 全局名单 + 计数），项目 `<cwd>/.dsh-auto-pass/policy.json`（项目名单）。计数统一放全局文件、键带 `cwd` 前缀，所以项目目录只在真的写了项目规则时才多出 `.dsh-auto-pass/`。项目写盘失败自动降级写全局；策略 IO 失败只告警，绝不影响审批结论。
 - HTTP：`GET/POST /api/dsh-auto-pass/policy`（快照 / `op=threshold|add|remove`）、`POST /api/dsh-auto-pass/rule {recordId, scope, list, sessionId?}`（时间线一键升级/降级，回写记录的 `ruleApplied`）。
 - **手动升级也必须经过模型（2026-09-15 用户指出后修正）**：`/rule` 的规则文本一律来自模型——① 记录里已有审查时的 `suggestedRule` → 直接用（`optimizedBy: 'record'`）；② 没有就现场起一次只读的 `optimizeRule`（`optimizedBy: 'model'`），父 Agent 按「客户端给的 sessionId → 记录所在 sessionId → 任一在册 root」逐级兜底（`ctx.get('agents').get(sessionId)` 取的就是在册 Agent，见 dsh-subagent 的 `catalogView`）；③ 服务或模型不可用才精确回落到签名（`optimizedBy: 'signature'`，客户端用警告色如实说明）。两条模型路径写下的规则 `source` 都是 `model`。历史教训：早期版本查不到建议就直接写精确签名，用户点「升级」时完全没经过模型。
+- **PTC 与标准两种档位都要适配（2026-09-15 补齐）**：① 精确动作——`exactAction` 先认 `tool/call`，认不到再回退 `tool/ptc-dispatch-start`（派生 id 形如 `<父 callId>:ptc:<n>`）；② 证据——`buildReviewEvidence` 现在也消费 `tool/ptc-dispatch-start`（内层调用，标 `via_ptc: true`）与 `tool/ptc-dispatch`（内层结果，`name === 'ask_user_question'` 时照旧标 `trusted_for_authorization: true`）；不这么做的话，ptc 档位下 Reviewer 只看到一段 run_code 脚本，而且内层人工回答的授权标记会丢；③ 提示词——Reviewer（`REVIEW_PROMPT_TEXT`）与规则优化器（`prompts/rule-template.md` + `buildRulePrompt`）都写明「直接调 structured_output；ptc 档位把只读调查与 structured_output 都写在 run_code 里」；④ 工具闸门——`toolFilter` 只列 `read`/`glob`/`grep`（restrict 不得含保留的 run_code），guard 的 `REVIEWER_EXECUTABLE_TOOLS` 始终放行 `run_code` 与 `structured_output`，两种档位都能既调查又交结论。
 - 记录里的 `signature` 除了 `toolName/key/memoryKey/text` 还存 `command` 与 `paths`：手动升级时现场那次优化调用需要它们，才能判断前缀该窄到什么程度（老记录没有这两个字段，模型只能靠标签判断）。
 
 ## 客户端半与审批记录（读源码确认）
@@ -48,11 +49,11 @@
 - 面板数据形状：`/policy` 快照返回 `thresholds.{allow,deny}`（不再是单个 `threshold`），保存阈值用 `{ op: threshold, list, threshold }`；记录里除 `approvals` 外还有 `denials`，以及规则询问的结果 `ruleApplied` / `ruleDeclined`（时间线显示「已询问，未加入」）。
 - **布局要与对话等宽（读源码确认）**：对话区面板 = `.ap-frame`（`padding:16px calc(var(--dsh-composer-side-clearance,16px) + 16px) 24px`、`align-items:center`）里的 `.ap-col`（`width:100%;max-width:var(--dsh-chat-content-width,748px)`），再往里是一张张 `.ap-card`。这两个变量由会话根元素 `._0cyzDW_root` 下发（`publishWidths` 用 ResizeObserver 写 `--dsh-conversation-column-width`，`--dsh-chat-content-width = clamp(680px, column*0.64, 920px)`）；`conversation.view` 的内容渲染在 `._0cyzDW_viewArea` 里、是该根元素的后代，所以变量能继承到。官方插件 `dsh-client-ui-approval` / `dsh-client-ui-user-questions` 用的是同一套写法（照抄它们的对齐方式，别自己拍宽度）。
 - **设置页卡片必须渲染 `<li>`（踩过坑）**：`settings.plugin.item` 的宿主容器是 `ul.JMEyFa_cards`（外层 section `max-width:760px`），**整张卡片由插件自己拥有**。早期用 `<div>` + 内联 style，卡片样式一条都没生效，表现就是「设置里只有一段裸文字」。现在用 `card('li', …)` 复刻内置插件卡 `.TKtcza_card` 的外观（`.5px` 描边 `--dsw-alias-border-l4`、底色 `--dsw-alias-bg-layer-3`、16px 圆角、标题 15px/600 + 13px 说明）。
-- **时间线行内展示**：折叠态除时间/工具/结论外，还显示**审批意见**（`record.rationale`，CSS 两行截断）与**命中名单**徽标（`record.policy.list` → 白名单/黑名单 + 作用域 + 规则标签），所以命中名单时不展开也能看出为什么放行或转人工。
+- **时间线行内展示**：折叠态除时间/工具/结论外，还显示**审批意见**（`record.rationale`，CSS 单行截断）与**命中名单**徽标（`record.policy.list` → 白名单/黑名单 + 作用域 + 规则标签），所以命中名单时不展开也能看出为什么放行或转人工。
 - 项目目录的客户端来源：优先宿主 `sessions` 服务的 `list.getSnapshot().byId[sessionId].cwd`（照 dsh-context 的 `workspaceOf` 写法），拿不到就用本会话最新一条审批记录里的 `cwd`。**不要**把 `sessions` 写进 `exports.inject`——它只是可选探测，注入一个不存在的服务会让插件挂起。
 - 两处放置位置（参照 dsh-context 0.52.1 的实现）：
   - 对话标签页：`ctx.slots.inject('conversation.view', () => ctx.slots.register({ name:'conversation.view', id, order, label }, Cmp))`，出现位置就在「对话 / 轨迹」旁边。
-  - 右侧栏 tab：`ctx.inject(['sidebarRightTabs'], raw => ...)`（**延迟注入，座位按契约可选**）→ `raw.sidebarRightTabs.register({ id, kind, title, guide:[{ order, title, description, icon }] })` + `raw.slots.inject('sidebar.right.pane.tab', () => raw.slots.register({ name:'sidebar.right.pane.tab', key: id }, Cmp))`。`id` 同时是正文席位的 key；tab 一次都没打开过时它只出现在引导页/加号菜单里。
+  - 右侧栏 tab：`ctx.inject(['sidebarRightTabs'], raw => ...)`（**延迟注入，座位按契约可选**）→ `raw.sidebarRightTabs.register({ id, kind, title, guide:[{ order, title, description, icon }] })` + 正文 `raw.slots.inject('sidebar.right.pane.tab', …)` + **标题** `raw.slots.inject('sidebar.right.pane.tab.title', …)`（`key` 都等于 tab id）。**标题席位不给就只有文字、没有图标**——官方 chip 是「图标 + 标题」，dsh-context 就是这么做的（`makeContextTabTitle`）；我们照它把 `LogGlyph` + 文案注册进标题席位。`id` 同时是正文席位的 key；tab 一次都没打开过时它只出现在引导页/加号菜单里。
   - `slots.inject` 返回**幂等 disposer（函数）**；cordis 的 `ctx.inject` 返回带 `.dispose()` 的 handle，两者的卸载方式不同。
 - 面板数据来自 host 的 `GET /api/dsh-auto-pass/log?session=&limit=`（记录，倒序）、`/api/dsh-auto-pass/policy?cwd=`（阈值 + 两级名单）、`/api/dsh-auto-pass/config`（`placement`）；客户端每 3 秒轮询一次。
 - 放置策略 `placement: auto | tab | sidebar | all`，默认 **all**（与 dsh-context 一致：对话标签页 + 右侧栏 tab 都注册）；`auto` 表示 `ctx.get('sidebarRightTabs')` 存在就挂右侧栏，否则退回对话标签页。

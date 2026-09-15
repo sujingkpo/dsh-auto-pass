@@ -9,6 +9,7 @@
  * @date 2026-09-15
  * @modify 2026-09-15 对话区改放「审批设置」，时间线移入右侧栏并加升级/降级操作
  * @modify 2026-09-15 面板改为与消息列同宽的居中卡片；时间线行内展示审批意见摘要
+ * @modify 2026-09-15 右侧栏 chip 标题加图标；审批意见只显示一行
  */
 window.__ModuleLoader__.load({
   id: 'dsh-auto-pass',
@@ -232,6 +233,9 @@ window.__ModuleLoader__.load({
       tag.textContent = [
         '.ap-root{box-sizing:border-box;flex:auto;min-height:0;height:100%;display:flex;flex-direction:column;color:var(--dsw-alias-label-primary);font-size:13px}',
         // 对话区面板：内容列与消息列同宽并居中（--dsh-chat-content-width 由会话根元素下发，取不到时回退 748px）
+        // 右侧栏 chip 标题：图标 + 文案（标题席位 key 与 tab id 同名）
+        '.ap-tabTitle{display:inline-flex;align-items:center;gap:6px;min-width:0}',
+        '.ap-tabLabel{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
         '.ap-frame{flex:auto;min-height:0;overflow-y:auto;padding:16px calc(var(--dsh-composer-side-clearance,16px) + 16px) 24px;display:flex;flex-direction:column;align-items:center}',
         '.ap-col{width:100%;max-width:var(--dsh-chat-content-width,748px);display:flex;flex-direction:column;gap:12px}',
         // 卡片外观对齐设置页内置插件卡（.TKtcza_card）：.5px 描边 + 层三底色 + 16px 圆角
@@ -278,7 +282,7 @@ window.__ModuleLoader__.load({
         '.ap-warn{color:var(--dsw-alias-state-warn-primary)}',
         '.ap-rowMain{flex:auto;min-width:0;display:flex;flex-direction:column;gap:2px}',
         '.ap-rowTop{display:flex;align-items:center;gap:8px;min-width:0}',
-        '.ap-opinion{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;text-align:left;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}',
+        '.ap-opinion{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;text-align:left;overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical}',
         // 命中名单的提示行：折叠态就要看得见命中的是白名单还是黑名单、哪一条规则
         '.ap-hitRow{display:flex;align-items:center;gap:6px;min-width:0}',
         '.ap-hitText{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;min-width:0;overflow-wrap:anywhere}',
@@ -920,6 +924,13 @@ window.__ModuleLoader__.load({
               name: 'sidebar.right.pane.tab',
               key: SIDEBAR_ID,
             }, props => react.createElement(ApprovalTimelinePanel, props))))
+            // 标题席位：不加这一段时 chip 只有文字，跟别的插件（文件/上下文）不一致
+            own(raw.slots.inject('sidebar.right.pane.tab.title', () => raw.slots.register({
+              name: 'sidebar.right.pane.tab.title',
+              key: SIDEBAR_ID,
+            }, () => react.createElement('span', { className: 'ap-tabTitle' },
+              react.createElement(LogGlyph, { size: 16 }),
+              react.createElement('span', { className: 'ap-tabLabel' }, t.timelineTab)))))
             beacon('sidebar-registered')
           } catch (error) {
             beacon('sidebar-error', String(error?.message ?? error))

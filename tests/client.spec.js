@@ -221,6 +221,10 @@ describe('客户端半加载与注册', () => {
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
     expect(pane).toBeDefined()
 
+    // chip 的标题席位：没有它右侧栏标题就只有文字、没有图标
+    const tabTitle = slot(slotRegistrations, 'sidebar.right.pane.tab.title', 'dsh-auto-pass')
+    expect(tabTitle).toBeDefined()
+
     const card = slot(slotRegistrations, 'settings.plugin.item', 'dsh-auto-pass')
     expect(card).toBeDefined()
 
@@ -253,6 +257,12 @@ describe('客户端半加载与注册', () => {
     }
     // 设置页的容器是 ul：卡片必须是 li，否则一行卡片样式都拿不到
     expect(await rootType(react, card.component)).toBe('li')
+    // 右侧栏标题：图标 + 文案，两者缺一 chip 就与内置插件不一致
+    const tabTitle = slot(slotRegistrations, 'sidebar.right.pane.tab.title', 'dsh-auto-pass')
+    const titleTree = evaluate(tabTitle.component({}))
+    expect(titleTree.type).toBe('span')
+    expect(titleTree.children.some(child => child?.type === 'svg')).toBe(true)
+    expect(JSON.stringify(titleTree)).toContain('审批时间线')
     for (const cleanup of cleanups) cleanup()
 
     // 对话区标签页只放审批设置：有阈值输入，没有时间线的「本次会话/全部会话」切换
