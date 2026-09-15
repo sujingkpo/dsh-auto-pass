@@ -111,9 +111,11 @@ window.__ModuleLoader__.load({
         decidedBy: '决策来源',
         ruleAuto: '自动',
         ruleManual: '手动',
-        decidedAutoText: '模型审查通过，插件自动放行',
+        decidedAutoText: '模型自动审批',
         decidedHumanText: '人工审批',
         decidedUnknown: '无人工结论',
+        decidedAutoTitle: '模型自动审批',
+        decidedHumanTitle: '人工审批通过或拒绝',
         ruleAsk: '规则询问',
         ruleDeclined: '已询问，未加入',
         promote: '升级为白名单',
@@ -195,9 +197,11 @@ window.__ModuleLoader__.load({
         decidedBy: 'Decided by',
         ruleAuto: 'auto',
         ruleManual: 'manual',
-        decidedAutoText: 'reviewed by the model, allowed automatically',
+        decidedAutoText: 'allowed by the model automatically',
         decidedHumanText: 'human decision',
         decidedUnknown: 'no human outcome',
+        decidedAutoTitle: 'allowed by the model automatically',
+        decidedHumanTitle: 'approved or rejected by the human',
         ruleAsk: 'Rule prompt',
         ruleDeclined: 'Asked, not added',
         promote: 'Promote to allowlist',
@@ -544,16 +548,28 @@ window.__ModuleLoader__.load({
       return react.createElement('span', { className: 'ap-badge ' + hit[1] }, hit[0])
     }
 
-    /** 决策来源那个标签行：与「命中名单」同一形态（chip + 说明文字）。 */
-    function DecidedRow({ record }) {
+    /**
+     * 折叠态那一行标签：「命中名单」与「决策来源」合并成一行——
+     * chip 是「名单·自动/人工」（没命中名单时只剩 自动/人工），说明文字是命中规则信息，
+     * 没命中时是决策含义（自动 = 模型自动审批；人工 = 人工审批通过/拒绝）。
+     */
+    function TagRow({ record }) {
       const auto = decidedByOf(record) === 'auto'
-      const outcome = outcomeOf(record)
-      const text = auto
-        ? t.decidedAutoText
-        : t.decidedHumanText + ' · ' + (outcome === undefined ? t.decidedUnknown : outcome[0])
-      return react.createElement('span', { className: 'ap-hitRow' },
-        react.createElement('span', { className: 'ap-badge ' + (auto ? 'ap-badgeInfo' : 'ap-badgeMuted') },
-          auto ? t.decidedAuto : t.decidedHuman),
+      const policy = record.policy
+      const listLabel = policy === undefined ? '' : (policy.list === 'allow' ? t.hitAllow : t.hitDeny)
+      const sourceLabel = auto ? t.decidedAuto : t.decidedHuman
+      const text = policy === undefined
+        ? (auto ? t.decidedAutoText : t.decidedHumanText + ' · ' + (outcomeOf(record)?.[0] ?? t.decidedUnknown))
+        : scopeLabel(policy.scope) + ' · ' + String(policy.label ?? '')
+      const badgeClass = policy === undefined
+        ? (auto ? 'ap-badgeInfo' : 'ap-badgeMuted')
+        : (policy.list === 'allow' ? 'ap-badgeOk' : 'ap-badgeWarn')
+      return react.createElement('span', {
+        className: 'ap-hitRow',
+        title: auto ? t.decidedAutoTitle : t.decidedHumanTitle,
+      },
+        react.createElement('span', { className: 'ap-badge ' + badgeClass },
+          listLabel === '' ? sourceLabel : listLabel + '·' + sourceLabel),
         react.createElement('span', { className: 'ap-hitText' }, text))
     }
 
@@ -620,16 +636,10 @@ window.__ModuleLoader__.load({
       const promoted = record.promotedRule === undefined
         ? undefined
         : scopeLabel(record.promotedRule.scope) + ' · ' + String(record.promotedRule.label ?? '')
-      const hit = record.policy === undefined
+      // 命中规则信息（只在展开详情里用；折叠态由 TagRow 统一渲染）
+      const hitText = record.policy === undefined
         ? undefined
         : scopeLabel(record.policy.scope) + ' · ' + String(record.policy.label ?? '')
-      // 命中 chip 形如「白名单·自动」：自动 = 模型建议/记忆升级写进去的，手动 = 你自己加/升级的
-      const hitSourceOf = ruleSourceOf(record)
-      const hitSource = hitSourceOf === undefined ? '' : '·' + (hitSourceOf === 'user' ? t.ruleManual : t.ruleAuto)
-      const hitBadge = record.policy === undefined
-        ? undefined
-        : (record.policy.list === 'allow' ? t.hitAllow : t.hitDeny) + hitSource
-      const hitClass = record.policy?.list === 'allow' ? 'ap-badgeOk' : 'ap-badgeWarn'
       const declined = record.ruleDeclined === undefined
         ? undefined
         : t.ruleDeclined + ' · ' + (record.ruleDeclined.list === 'allow' ? t.allowList : t.denyList)
@@ -655,10 +665,7 @@ window.__ModuleLoader__.load({
               react.createElement(VerdictBadge, { record }),
               react.createElement(OutcomeBadge, { record })),
             opinion !== undefined && react.createElement('span', { className: 'ap-opinion' }, opinion),
-            react.createElement(DecidedRow, { record }),
-            hitBadge !== undefined && react.createElement('span', { className: 'ap-hitRow' },
-              react.createElement('span', { className: 'ap-badge ' + hitClass }, hitBadge),
-              react.createElement('span', { className: 'ap-hitText' }, hit)))),
+            react.createElement(TagRow, { record }))),
         open === true && react.createElement('div', { className: 'ap-detail' },
           react.createElement(Field, { label: t.risk, value: record.riskLevel }),
           react.createElement(Field, { label: t.authorization, value: record.userAuthorization }),
@@ -667,7 +674,7 @@ window.__ModuleLoader__.load({
           react.createElement(Field, { label: t.action, value: record.action, mono: true }),
           react.createElement(Field, { label: t.signature, value: record.signature === undefined ? undefined : record.signature.text, mono: true }),
           react.createElement(Field, { label: t.suggestedRule, value: suggested }),
-          react.createElement(Field, { label: t.policyHit, value: hit }),
+          react.createElement(Field, { label: t.policyHit, value: hitText }),
           react.createElement(Field, { label: t.applied, value: applied }),
           react.createElement(Field, { label: t.promoted, value: promoted }),
           react.createElement(Field, { label: t.approvals, value: approvals }),

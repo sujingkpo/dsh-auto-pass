@@ -35,6 +35,15 @@ function sampleRecords() {
       steps: 0,
       policy: { list: 'deny', scope: 'project', ruleId: 'rule-2', label: 'bash · rm -rf', kind: 'signature', source: 'user' },
     },
+    {
+      id: 'record-human',
+      time: '2026-09-15T04:02:00.000Z',
+      toolName: 'write',
+      verdict: 'defer',
+      outcome: 'allowed-once',
+      rationale: '已转交人工并由用户放行。',
+      steps: 2,
+    },
   ]
 }
 
@@ -296,12 +305,12 @@ describe('客户端半加载与注册', () => {
     expect(trees[1].includes('用户明确要求运行测试。')).toBe(true)
     expect(trees[1].includes('白名单')).toBe(true)
     expect(trees[1].includes('bash · npm test')).toBe(true)
-    // 命中 chip 带上规则来源（记录里没存时靠策略快照反查）：模型/记忆写的=自动，你手动加的=手动
+    // 一行标签 = 「名单·决策来源」：命中白名单且模型自动审批；命中黑名单则是人工介入
     expect(trees[1].includes('白名单·自动')).toBe(true)
-    expect(trees[1].includes('黑名单·手动')).toBe(true)
-    // 决策来源标签：与「命中名单」同一形态的 chip 行（不是塞在结论徽标前面）
-    expect(trees[1].includes('模型审查通过，插件自动放行')).toBe(true)
-    expect(trees[1].includes('人工审批 · 已拒绝')).toBe(true)
+    expect(trees[1].includes('黑名单·人工')).toBe(true)
+    // 没命中名单时只显示决策来源与其含义
+    expect(trees[1].includes('人工审批 · 已批准')).toBe(true)
+    // 命中黑名单的那条：chip 与说明文字都在同一行
     expect(trees[1].includes('bash · rm -rf')).toBe(true)
     // 设置页卡片是放置位置选择器
     expect(trees[2].includes('面板显示位置')).toBe(true)
