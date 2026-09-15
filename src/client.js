@@ -254,8 +254,13 @@ window.__ModuleLoader__.load({
     // 不改 React 的 DOM 结构、不依赖 DSH 的哈希类名，颜色跟文字走（currentColor），与内置单色图标一致。
     const PRESET_ICON_LABEL = '自动审批'
     const PRESET_ICON_CLASS = 'ap-presetGlyph'
-    // 菜单项里的图标要与内置 .itemIcon 对齐（16px + 三级文字色），chip 里则是 14px + 跟文字同色
-    const PRESET_ICON_MENU_CLASS = 'ap-presetGlyphMenu'
+    // 两套几何：chip 对齐内置 .triggerIcon svg（14px、跟文字同色），菜单项对齐内置 .itemIcon
+    // （16px、三级文字色、与 label 的间距 8px）。变体写成**内联自定义属性**（见 applyPresetIconVars），
+    // 不走「两个 class 比层叠」的路子 —— 上一版就是菜单态那条规则没生效，菜单里的图标一直是 chip 的 14px。
+    const PRESET_ICON_VARIANTS = Object.freeze({
+      chip: Object.freeze({ box: '14px', icon: '14px', gap: '4px', color: 'currentColor' }),
+      menu: Object.freeze({ box: '16px', icon: '16px', gap: '8px', color: 'var(--dsw-alias-label-tertiary,currentColor)' }),
+    })
     const PRESET_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none">'
       + '<path d="M8.20554 0.899994L14.7901 3.36857V7.01026C14.7901 12 11.0466 14.2103 8.20554 15.3C5.36446 14.2103 1.62012 12 1.62012 7.01026V3.36857L8.20554 0.899994Z" stroke="#fff" stroke-width="1.31831" stroke-linejoin="round"/>'
       + '<path d="M6.45 10.45 8.2 5.7 9.95 10.45" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>'
@@ -281,6 +286,35 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 这个 span 属于哪一处宿主：chip 的按钮带 aria-label（访问模式，当前：<档位名>），菜单项是 role=menuitem。
+     * @param {*} node 档位名所在的 span
+     * @returns {'chip'|'menu'} 变体名
+     */
+    function presetIconVariant(node) {
+      const owner = typeof node.closest === 'function' ? node.closest('button') : null
+      if (owner !== null && owner !== undefined && typeof owner.getAttribute === 'function') {
+        const label = owner.getAttribute('aria-label')
+        if (typeof label === 'string' && label.includes(PRESET_ICON_LABEL)) { return 'chip' }
+      }
+      return 'menu'
+    }
+
+    /**
+     * 把变体写成内联自定义属性：CSS 里只有一条规则读这些变量，谁也不会覆盖谁。
+     * @param {*} node 档位名所在的 span
+     * @param {'chip'|'menu'} variant 变体名
+     * @returns {void} 无返回值；拿不到 style（测试替身）时跳过
+     */
+    function applyPresetIconVars(node, variant) {
+      const spec = PRESET_ICON_VARIANTS[variant]
+      if (node.style === undefined || node.style === null || typeof node.style.setProperty !== 'function') { return }
+      node.style.setProperty('--ap-glyph-box', spec.box)
+      node.style.setProperty('--ap-glyph-icon', spec.icon)
+      node.style.setProperty('--ap-glyph-gap', spec.gap)
+      node.style.setProperty('--ap-glyph-color', spec.color)
+    }
+
+    /**
      * 给权限档位名补图标：只在档位 chip 与下拉菜单项里找，DOM 变动时重扫（React 重建节点会丢标记）。
      * @returns {void} 无返回值；浏览器环境缺失（测试/SSR）时直接退出
      */
@@ -293,14 +327,34 @@ window.__ModuleLoader__.load({
       // isPresetLabelNode 按文字精确过滤，选择器放宽不会误伤。
       const selector = '[role="menu"] span,[role="menuitem"] span,[aria-haspopup="menu"] span,'
         + 'button span,[aria-label*="' + PRESET_ICON_LABEL + '"] span'
-      /** 给尚未打标记的档位名加上图标类；菜单项额外带菜单态（16px + 三级文字色）。 */
+      // 每处宿主只回报一次：把浏览器算出来的几何写进宿主日志，便于「看着不对」时直接核对
+      const reported = new Set()
+      /**
+       * 回报一次该 span 的 ::before 实际几何（宽 / 右间距 / 图标色）。
+       * @param {*} node 档位名所在的 span
+       * @param {string} variant 变体名
+       * @returns {void} 无返回值
+       */
+      const report = (node, variant) => {
+        if (reported.has(variant) || typeof getComputedStyle !== 'function') { return }
+        reported.add(variant)
+        try {
+          const before = getComputedStyle(node, '::before')
+          beacon('preset-icon', variant + ' w=' + String(before.width) + ' mr=' + String(before.marginRight)
+            + ' va=' + String(before.verticalAlign) + ' color=' + String(before.backgroundColor))
+        } catch (error) {
+          // 计算样式拿不到只影响回报，不影响图标本身
+        }
+      }
+      /** 给尚未打标记的档位名加上图标类，并按所在宿主写入变体变量。 */
       const mark = () => {
         for (const node of document.querySelectorAll(selector)) {
           if (isPresetLabelNode(node, PRESET_ICON_LABEL) === false) { continue }
+          const variant = presetIconVariant(node)
+          // 先写变量再挂 class：class 一挂上规则就生效，不会出现「先按默认值渲染一帧」的闪烁
+          applyPresetIconVars(node, variant)
           node.classList.add(PRESET_ICON_CLASS)
-          if (typeof node.closest === 'function' && node.closest('[role="menuitem"]') !== null) {
-            node.classList.add(PRESET_ICON_MENU_CLASS)
-          }
+          report(node, variant)
         }
       }
       /** 合并同一帧内的多次变动：会话流式渲染时 DOM 变动很密集，避免反复全量查询。 */
@@ -386,10 +440,9 @@ window.__ModuleLoader__.load({
         '.ap-ruleLabel{min-width:0;flex:auto;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere}',
         '.ap-input{appearance:none;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:0 0;color:inherit;font:inherit;font-size:12px;line-height:18px;padding:2px 8px;width:5em}',
         '.ap-row2{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
-        // 档位 chip 里的「盾牌 + A」：14px、跟文字同色（对齐内置 .triggerIcon svg 的尺寸）
-        `.${PRESET_ICON_CLASS}::before{content:"";display:inline-block;flex:none;width:14px;height:14px;margin-right:4px;vertical-align:-2px;background-color:currentColor;-webkit-mask:${PRESET_ICON_MASK} center/14px 14px no-repeat;mask:${PRESET_ICON_MASK} center/14px 14px no-repeat}`,
-        // 菜单项里的：对齐内置 .itemIcon（16px 盒子、三级文字色的图标、与 label 之间 8px 间距）
-        `.${PRESET_ICON_MENU_CLASS}::before{width:16px;height:16px;margin-right:8px;vertical-align:-3px;background-color:var(--dsw-alias-label-tertiary,currentColor);-webkit-mask-size:16px 16px;mask-size:16px 16px}`,
+        // 档位名字前面的「盾牌 + A」：几何全部走 --ap-glyph-* 变量（chip 14/4/currentColor，菜单项 16/8/三级色），
+        // 变量由 applyPresetIconVars 内联写在 span 上；mask 用 longhand，避免简写与变量混在一起出歧义
+        `.${PRESET_ICON_CLASS}::before{content:"";display:inline-block;flex:none;width:var(--ap-glyph-box,16px);height:var(--ap-glyph-box,16px);margin-right:var(--ap-glyph-gap,8px);vertical-align:middle;background-color:var(--ap-glyph-color,currentColor);-webkit-mask-image:${PRESET_ICON_MASK};mask-image:${PRESET_ICON_MASK};-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-position:center;mask-position:center;-webkit-mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px);mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px)}`,
       ].join('\n')
       ;(document.head || document.documentElement).appendChild(tag)
     }
