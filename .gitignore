@@ -42,6 +42,9 @@ build/Release
 node_modules/
 jspm_packages/
 
+# 本插件不跟踪锁文件（上游同样不跟踪；跑测试时的 pnpm install 会重新生成它）
+pnpm-lock.yaml
+
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/
 
