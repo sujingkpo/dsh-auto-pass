@@ -49,6 +49,17 @@ describe('signatureOf', () => {
     expect(pwshSignature('git status').key).not.toBe(pwshSignature('git diff').key)
   })
 
+  it('噪声参数只影响精确签名，不影响记忆键', () => {
+    // description / justification / timeoutMs 只影响展示与管道，不该拆散「连续」
+    const first = pwshSignature('pnpm test', { description: '跑测试', justification: '理由一', timeoutMs: 300000 })
+    const second = pwshSignature('pnpm test', { description: '再跑一次', justification: '完全不同的理由', timeoutMs: 60000 })
+    expect(first.key).not.toBe(second.key)
+    expect(first.memoryKey).toBe(second.memoryKey)
+    // 提权标记改变的是授权范围，必须留在记忆键里：提权重试不与普通调用混计
+    const elevated = pwshSignature('pnpm test', { description: '跑测试', justification: '理由一', sandbox_permissions: 'danger-full-access' })
+    expect(elevated.memoryKey).not.toBe(first.memoryKey)
+  })
+
   it('提权标记等额外参数参与签名', () => {
     const plain = pwshSignature('git status')
     const elevated = pwshSignature('git status', { sandbox_permissions: 'danger-full-access' })
@@ -294,6 +305,14 @@ describe('observe（连续计数与升级建议）', () => {
     expect(instance.observe({ signature: undefined, cwd, signal: 'pass' }).suggestion).toBeNull()
     expect(instance.observe({ signature, cwd, signal: undefined }).suggestion).toBeNull()
     expect(instance.observe({ signature, cwd, signal: 'pass' }).approvals).toBe(1)
+  })
+
+  it('只有噪声参数不同时归到同一个计数（记忆键）', () => {
+    const instance = store(2)
+    const first = pwshSignature('pnpm test', { justification: '理由一' })
+    const second = pwshSignature('pnpm test', { justification: '理由二' })
+    expect(instance.observe({ signature: first, cwd, signal: 'pass' }).suggestion).toBeNull()
+    expect(instance.observe({ signature: second, cwd, signal: 'pass' }).suggestion).toEqual({ list: 'allow', count: 2 })
   })
 
   it('不同项目各自计数，互不影响', () => {

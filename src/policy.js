@@ -50,6 +50,15 @@ const PATH_ARG_KEYS = Object.freeze(['file_path', 'filePath', 'path', 'paths', '
 /** 前缀之后必须出现分隔符才算命中：`git status --short` 合法，`git statusx` 不合法。 */
 const PREFIX_BOUNDARY = /^[\s;&|<>)"']/
 
+/**
+ * 只影响展示或执行管道、不改变「这次到底在授权什么」的参数。
+ * 实测（approvals.json）：同一条 `pnpm test` 的两次自动放行，因为 description / justification /
+ * timeoutMs 不同而拿到不同的精确签名——连续计数永远攒不到阈值，记忆功能等于死代码。
+ * 所以计数另用一个「记忆键」（抹掉这些噪声），而**规则匹配仍用精确签名**：
+ * 用户手动升级某条记录时写下的仍是那条精确规则，不会因为计数变粗而放宽。
+ */
+export const NOISE_ARG_KEYS = Object.freeze(['description', 'justification', 'timeoutMs', 'timeout_ms'])
+
 /** 签名里保留的剩余参数 JSON 上限，避免超长 payload 撑爆策略文件。 */
 const MAX_SIGNATURE_ARGS_CHARS = 400
 
@@ -102,6 +111,13 @@ function pickPaths(args) {
   return Object.freeze(paths)
 }
 
+/** 复制一份参数并抹掉噪声键，供记忆键使用。 */
+function withoutNoise(args) {
+  const copy = { ...args }
+  for (const key of NOISE_ARG_KEYS) delete copy[key]
+  return copy
+}
+
 /** 生成人类可读的动作标签，用于时间线与规则列表展示。 */
 function labelOf(toolName, command, paths, args) {
   if (command !== undefined) return (toolName + ': ' + command).slice(0, 120)
@@ -115,7 +131,7 @@ function labelOf(toolName, command, paths, args) {
  * 同一工具 + 同一关键参数 = 同一签名，与调用 id、时间无关。
  * @param request 审批请求（只用 toolName）。
  * @param action 精确动作（exactAction 的结果，可能为 undefined）。
- * @returns 冻结的 { toolName, key, command, paths, text }；缺少动作参数时 key 仍可用（空参签名）。
+ * @returns 冻结的 { toolName, key, memoryKey, command, paths, text }；缺少动作参数时 key 仍可用（空参签名）。
  */
 export function signatureOf(request, action) {
   const toolName = String(request?.toolName ?? action?.toolName ?? 'unknown')
@@ -129,9 +145,15 @@ export function signatureOf(request, action) {
   const base = COMMAND_TOOLS.includes(toolName.toLowerCase()) && command !== undefined
     ? 'cmd:' + command
     : 'args:' + stableJson(args)
+  // 记忆键：同样去掉噪声参数，只换理由/超时/说明的重复动作会归到同一个计数；
+  // 提权标记这类真会改变授权范围的参数保留，提权重试不会与普通调用混在一起计数。
+  const memoryBase = COMMAND_TOOLS.includes(toolName.toLowerCase()) && command !== undefined
+    ? 'cmd:' + command
+    : 'args:' + stableJson(withoutNoise(args))
   return Object.freeze({
     toolName,
     key: toolName + '\u0000' + base + '\u0000x:' + extra,
+    memoryKey: toolName + '\u0000' + memoryBase + '\u0000x:' + stableJson(withoutNoise(structured)),
     command,
     paths,
     text: labelOf(toolName, command, paths, args),
@@ -231,6 +253,11 @@ export function matchRule(rule, signature) {
     })
   }
   return false
+}
+
+/** 计数用的键：记忆键抹掉了 description / justification / timeoutMs 这类噪声，取不到时退回精确签名。 */
+export function memoryKeyOf(signature) {
+  return signature?.memoryKey ?? signature?.key
 }
 
 /** 全局策略文件默认路径：`$DSH_HOME/dsh-auto-pass/policy.json`。 */
@@ -491,10 +518,10 @@ export function createPolicyStore(options = {}) {
      */
     observe({ signature, cwd, signal }) {
       const steady = { approvals: 0, denials: 0, suggestion: null }
-      if (signature === undefined || signature.key === undefined) return steady
+      if (signature === undefined || memoryKeyOf(signature) === undefined) return steady
       if (signal !== 'pass' && signal !== 'reject') return steady
       const doc = docs.get(globalFile)
-      const counterKey = (cwd ?? '') + '\u0000' + signature.key
+      const counterKey = (cwd ?? '') + '\u0000' + String(memoryKeyOf(signature))
       const entry = counterEntry(doc, counterKey)
       const list = signal === 'pass' ? 'allow' : 'deny'
       if (entry.dismissed?.[list] === true) {
@@ -516,10 +543,10 @@ export function createPolicyStore(options = {}) {
     },
     /** 用户在询问里选了「不加入」：该签名该名单不再计数、不再询问。 */
     dismiss({ signature, cwd, list }) {
-      if (signature === undefined || signature.key === undefined) return false
+      if (signature === undefined || memoryKeyOf(signature) === undefined) return false
       if (!POLICY_LISTS.includes(list)) return false
       const doc = docs.get(globalFile)
-      const counterKey = (cwd ?? '') + '\u0000' + signature.key
+      const counterKey = (cwd ?? '') + '\u0000' + String(memoryKeyOf(signature))
       const entry = counterEntry(doc, counterKey)
       entry[list] = 0
       entry.dismissed = { ...(entry.dismissed ?? {}), [list]: true }

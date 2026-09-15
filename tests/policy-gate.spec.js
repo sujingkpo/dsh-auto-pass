@@ -55,7 +55,7 @@ function sessionWith(options = {}) {
       step: 1,
       callId: options.callId ?? 'call-1',
       name: 'bash',
-      arguments: JSON.stringify({ command }),
+      arguments: JSON.stringify({ command, ...(options.extraArguments ?? {}) }),
     }, 2),
   ]
   return {
@@ -334,6 +334,37 @@ describe('权限记忆（达阈值后询问用户）', () => {
     expect(await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('allowed-once'))).toBe('allowed-once')
     await flush()
     expect(asked).toHaveLength(1)
+  })
+
+  it('只换了理由与说明的同一条命令也算连续：第三次询问', async () => {
+    const root = tempDir()
+    const projectDir = join(root, 'project')
+    const policies = policyStore(root, 3)
+    const asked = []
+    const ctx = contextWith([allowRun(), allowRun(), allowRun(), ruleRun()], {
+      userQuestions: {
+        ask: async askRequest => {
+          asked.push(askRequest)
+          return { answers: [{ id: 'dsh-auto-pass:allow', selected: ['不加入（以后不再询问这类动作）'] }] }
+        },
+      },
+    })
+    const config = resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' })
+    const handler = createAutoApprovalHandler(ctx, config, undefined, policies)
+
+    // 真实场景里，同一条命令每次的 description / justification / timeoutMs 都不一样
+    const drafts = [
+      { description: '跑测试', justification: '沙箱下必报 EPERM' },
+      { description: '再跑一次', justification: '另一段完全不同的理由' },
+      { description: '跑最后一遍', justification: '第三段理由' },
+    ]
+    for (const draft of drafts) {
+      const request = requestWith({ cwd: projectDir, extraArguments: draft })
+      expect(await handler(request, vi.fn().mockResolvedValue('allowed-once'))).toBe('allowed-once')
+      await flush()
+    }
+    expect(asked).toHaveLength(1)
+    expect(asked[0].questions[0].question).toContain('连续通过 3 次')
   })
 
   it('连续被拒达到阈值后询问是否加入黑名单', async () => {

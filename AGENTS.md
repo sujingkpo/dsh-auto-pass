@@ -12,7 +12,7 @@
 ## 命令（已验证）
 
 - 安装依赖：`pnpm install`（Node ≥ 22.19；`~/.npmrc` 的 registry 为 npmmirror，装 vitest 约 2 秒）。
-- 跑测试：`pnpm test`（= `vitest run`，当前 86 个用例全绿：`auto-approve` 23 + `records` 10 + `package` 4 + `policy` 26 + `policy-gate` 20 + `client` 3）。
+- 跑测试：`pnpm test`（= `vitest run`，当前 89 个用例全绿：`auto-approve` 23 + `records` 10 + `package` 4 + `policy` 28 + `policy-gate` 21 + `client` 3）。
 - **客户端半只有 `tests/client.spec.js` 覆盖**：它不进构建流水线。测试用假 `window.__ModuleLoader__` + 带「渲染帧」的假 react 加载 bundle，把组件**渲染到稳定状态**（反复求值 + 跑副作用 + 等微任务，直到没有新的 `setState`）——漏定义变量、漏闭合花括号、以及「异步拉到记录之后」那一轮渲染里的问题就靠它兜住（都真的漏过）。
 - `tests/auto-approve.spec.js` 文件名沿用权限档位名 `auto-approve`，与包名 `dsh-auto-pass` 不同，改名时不要误删。
 - **受限沙箱下 `pnpm test` 会 `spawn EPERM`**（vite 会 `exec("net use")`、vitest 默认 forks 池也要 spawn 子进程）；需要以更宽权限运行，否则测试跑不起来。
@@ -30,6 +30,7 @@
 - **审批前的判定顺序（`createAutoApprovalHandler`）**：`action === undefined` → 直接转人工（且**不建立签名**）；否则先查名单，`deny` 命中直接 `next()`、`allow` 命中直接 `allowed-once`（两者都不建 Reviewer）；都没命中才走模型审查；`tests/policy-gate.spec.js` 用「`ctx.subagents.start` 一次都没被调用」把这一点钉死，并要求记录里带上 `policy.{list,scope,label}`（时间线据此显示命中名单）。
 - **达阈值后的升级建议（`observeDecision` → `proposeRule`）**：`policy.observe` 只返回 `{approvals, denials, suggestion}`，**不再自行落规则**；`finish()` 拿到 `suggestion` 后立刻 `void proposeRule(...)`——**旁路异步**执行，既不改变已经确定的审批结论，也不阻塞这次工具调用（同一签名同一名单同时只挂一个问题）。proposeRule 先取规则：本次审查的 `suggestedRule`，没有就起一次只读的 `optimizeRule` 子 Agent（persona 来自 `prompts/rule-template.md`，输出 `ruleSuggestionSchema`）；再 `ctx.userQuestions.ask({ questions, agent })` 问「加入白名单/黑名单（本项目/全局）/ 不加入」；同意则 `addRule({ source: model })` 并回写记录的 `ruleApplied`，选「不加入」则 `dismiss`（该签名该名单从此不再计数、不再询问）。
 - **ask 的三个前提与失败姿态**：① `ctx.get(userQuestions)` 不存在（没人应答）→ 只记日志、不写规则；② `agent` 必须是在册的 runtime root，子 Agent 的审批会抛 `DELEGATED_CALLER` → 同样只记日志（触发时计数已清零，下次再攒够阈值会重问）；③ 回答按我们自己生成的选项 label 精确匹配，认不出来一律按「不加入」处理。三者都只影响「规则有没有被写入」，绝不影响审批结论。
+- **记忆键 ≠ 精确签名（2026-09-15 在真实记录里实测到的坑）**：`signatureOf` 现在同时给出 `key`（精确签名，规则匹配与时间线手动升级用它）与 `memoryKey`（同样的算法，但先抹掉 `NOISE_ARG_KEYS` = `description` / `justification` / `timeoutMs` / `timeout_ms` 这些只影响展示与执行管道、不改变「在授权什么」的参数）。原因是查 `~/.dsh/dsh-auto-pass/approvals.json` 发现：同一条 `pnpm test` 的两次自动放行因为 justification 与 description 逐次不同而拿到**不同的精确签名**，连续计数永远攒不到阈值——记忆功能在真实使用里等于死代码。计数与 `dismiss` 一律用 `memoryKey`，规则匹配仍用 `key`，因此计数变粗**不会放宽任何规则**；提权标记（`sandbox_permissions`）不在噪声表里，提权重试仍与普通调用分开计数。
 - **两侧计数与阈值**：计数键是 `<cwd>` + NUL + `<signatureKey>`，同一条目里 allow / deny 两侧各自累计，相反信号把另一侧清零；阈值按名单分开存（`thresholds.allow` / `thresholds.deny`，HTTP `op=threshold` 带 `list`），旧文件里的单个 `threshold` 字段按白名单阈值兼容读取。
 - **签名的三条安全性质（防过的坑）**：① `action` 拿不到时不建签名——否则所有解析不出参数的请求塌缩成同一个空签名，会被一起计数、一起触发询问；② 命中名单的那一次不计数（`decision.policyHit !== undefined`）：用户刚把这类动作写成规则，这一次的放行/拒绝是**单次**决定，不该继续滚成记忆；③ 达到阈值只产生**建议**：规则一律经「模型优化 → 用户确认」才落盘，选过「不加入」的动作记进 `dismissed` 不再询问。黑名单永远压过白名单。
 - `signatureOf` 会把字符串形态的 `arguments` 解析一层：`tool/call` 事件里 `arguments` 时而对象时而 JSON 字符串，字符串若不解析会退化成空参数签名，等于把一条规则放大到整个工具。
