@@ -109,6 +109,8 @@ window.__ModuleLoader__.load({
         decidedAuto: '自动',
         decidedHuman: '人工',
         decidedBy: '决策来源',
+        ruleAuto: '自动',
+        ruleManual: '手动',
         decidedAutoText: '模型审查通过，插件自动放行',
         decidedHumanText: '人工审批',
         decidedUnknown: '无人工结论',
@@ -191,6 +193,8 @@ window.__ModuleLoader__.load({
         decidedAuto: 'auto',
         decidedHuman: 'human',
         decidedBy: 'Decided by',
+        ruleAuto: 'auto',
+        ruleManual: 'manual',
         decidedAutoText: 'reviewed by the model, allowed automatically',
         decidedHumanText: 'human decision',
         decidedUnknown: 'no human outcome',
@@ -601,9 +605,13 @@ window.__ModuleLoader__.load({
       const hit = record.policy === undefined
         ? undefined
         : scopeLabel(record.policy.scope) + ' · ' + String(record.policy.label ?? '')
+      // 命中 chip 形如「白名单·自动」：自动 = 模型建议/记忆升级写进去的，手动 = 你自己加/升级的
+      const hitSource = record.policy?.source === undefined
+        ? ''
+        : '·' + (record.policy.source === 'user' ? t.ruleManual : t.ruleAuto)
       const hitBadge = record.policy === undefined
         ? undefined
-        : record.policy.list === 'allow' ? t.hitAllow : t.hitDeny
+        : (record.policy.list === 'allow' ? t.hitAllow : t.hitDeny) + hitSource
       const hitClass = record.policy?.list === 'allow' ? 'ap-badgeOk' : 'ap-badgeWarn'
       const declined = record.ruleDeclined === undefined
         ? undefined

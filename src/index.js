@@ -982,6 +982,9 @@ function describeHit(hit) {
     ruleId: hit.rule.id,
     label: hit.rule.label,
     kind: hit.rule.match?.kind,
+    // 这条规则是怎么来的：user=你手动加的，model=模型建议，memory=连续放行升级；
+    // 时间线据此在命中 chip 里显示「自动 / 手动」
+    source: hit.rule.source,
   }
 }
 

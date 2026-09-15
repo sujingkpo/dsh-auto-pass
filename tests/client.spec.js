@@ -22,7 +22,7 @@ function sampleRecords() {
       latencyMs: 3,
       decidedBy: 'auto',
       signature: { toolName: 'bash', key: 'bash:npm test', text: 'bash · npm test' },
-      policy: { list: 'allow', scope: 'global', ruleId: 'rule-1', label: 'bash · npm test', kind: 'signature' },
+      policy: { list: 'allow', scope: 'global', ruleId: 'rule-1', label: 'bash · npm test', kind: 'signature', source: 'model' },
     },
     {
       id: 'record-deny',
@@ -32,7 +32,7 @@ function sampleRecords() {
       outcome: 'rejected',
       rationale: '该命令已列入黑名单。',
       steps: 0,
-      policy: { list: 'deny', scope: 'project', ruleId: 'rule-2', label: 'bash · rm -rf', kind: 'signature' },
+      policy: { list: 'deny', scope: 'project', ruleId: 'rule-2', label: 'bash · rm -rf', kind: 'signature', source: 'user' },
     },
   ]
 }
@@ -281,7 +281,9 @@ describe('客户端半加载与注册', () => {
     expect(trees[1].includes('用户明确要求运行测试。')).toBe(true)
     expect(trees[1].includes('白名单')).toBe(true)
     expect(trees[1].includes('bash · npm test')).toBe(true)
-    expect(trees[1].includes('黑名单')).toBe(true)
+    // 命中 chip 带上规则来源：模型/记忆写的规则=自动，你手动加的=手动
+    expect(trees[1].includes('白名单·自动')).toBe(true)
+    expect(trees[1].includes('黑名单·手动')).toBe(true)
     // 决策来源标签：与「命中名单」同一形态的 chip 行（不是塞在结论徽标前面）
     expect(trees[1].includes('模型审查通过，插件自动放行')).toBe(true)
     expect(trees[1].includes('人工审批 · 已拒绝')).toBe(true)

@@ -201,6 +201,8 @@ describe('白名单与黑名单', () => {
     expect(record.policy.list).toBe('allow')
     expect(record.policy.scope).toBe('global')
     expect(record.policy.label).toContain('npm test')
+    // 规则来源一并写进记录：时间线在命中 chip 里显示 自动 / 手动
+    expect(record.policy.source).toBe('user')
   })
 
   it('黑名单命中的记录同样带上命中信息，结论是交给人工链', async () => {
