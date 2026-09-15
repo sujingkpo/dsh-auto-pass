@@ -113,6 +113,7 @@ export function apply(ctx, config) {
   ctx.on('approval/request', createAutoApprovalHandler(ctx, resolved, records), { prepend: true })
   installSettings(ctx)
   installRecordRoute(ctx, records, resolved)
+  installClientGraphProbe(ctx)
   ctx.logger.info('dsh-auto-pass: 审批记录已就绪 file=' + records.file + ' maxRecords=' + String(records.limit)
     + ' placement=' + effectivePlacement(ctx, resolved))
 }
@@ -148,6 +149,32 @@ function effectivePlacement(ctx, config) {
     }
   }
   return config.placement
+}
+
+/**
+ * 诊断：把客户端启动图是否包含本插件写进宿主日志。排查「面板不显示」时，
+ * 先看这里——如果 graphHas=false，说明客户端半压根没被加载（问题在合成/扫描），
+ * 而不是注册代码的问题。
+ */
+function installClientGraphProbe(ctx) {
+  const report = (when) => {
+    try {
+      const entries = typeof ctx.loader?.entries === 'function' ? ctx.loader.entries() : []
+      const own = entries.find(entry => entry?.options?.name === 'dsh-auto-pass')
+      const graph = typeof ctx.get === 'function' ? ctx.get('clientModules')?.graph?.() : undefined
+      const ids = Array.isArray(graph?.entries) ? graph.entries.map(item => item.id) : []
+      ctx.logger.info('dsh-auto-pass: client graph probe when=' + when
+        + ' loaderEntry=' + String(own !== undefined)
+        + ' fiber=' + String(own?.fiber !== undefined)
+        + ' graphHas=' + String(ids.includes('dsh-auto-pass'))
+        + ' graphEntries=' + String(ids.length)
+        + ' ids=' + safeLogValue(ids.join(','), 400))
+    } catch (error) {
+      ctx.logger.warn('dsh-auto-pass: client graph probe failed: ' + errorMessage(error))
+    }
+  }
+  report('boot')
+  setTimeout(() => report('after5s'), 5_000)
 }
 
 /**
