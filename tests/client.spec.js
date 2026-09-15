@@ -329,9 +329,9 @@ describe('客户端半加载与注册', () => {
 
     // DSH 只给三个内置 id 图标，我们的档位靠注入的这条 CSS：几何全走 --ap-glyph-* 变量
     const css = domStub.styled.join('\n')
+    expect(css).toContain('.ap-presetGlyph{display:inline-flex;align-items:center;gap:var(--ap-glyph-gap,8px)}')
     expect(css).toContain('.ap-presetGlyph::before')
     expect(css).toContain('width:var(--ap-glyph-box,16px)')
-    expect(css).toContain('margin-right:var(--ap-glyph-gap,8px)')
     expect(css).toContain('-webkit-mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px)')
     expect(css).toContain('-webkit-mask-image:url("data:image/svg+xml;charset=utf-8,')
     // chip（按钮带 aria-label）与菜单项各写一套变量；「自动审批面板」与带子元素的 span 都不该被打标记

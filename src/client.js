@@ -340,8 +340,11 @@ window.__ModuleLoader__.load({
         reported.add(variant)
         try {
           const before = getComputedStyle(node, '::before')
-          beacon('preset-icon', variant + ' w=' + String(before.width) + ' mr=' + String(before.marginRight)
-            + ' va=' + String(before.verticalAlign) + ' color=' + String(before.backgroundColor))
+          const own = getComputedStyle(node)
+          // 对齐相关的量都给出来：图标宽高、行高、display、gap、图标色 —— 真机上「看着不对」时按这几个值核对
+          beacon('preset-icon', variant + ' w=' + String(before.width) + ' h=' + String(before.height)
+            + ' gap=' + String(own.gap) + ' disp=' + String(own.display) + ' lineH=' + String(own.lineHeight)
+            + ' color=' + String(before.backgroundColor))
         } catch (error) {
           // 计算样式拿不到只影响回报，不影响图标本身
         }
@@ -442,7 +445,9 @@ window.__ModuleLoader__.load({
         '.ap-row2{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
         // 档位名字前面的「盾牌 + A」：几何全部走 --ap-glyph-* 变量（chip 14/4/currentColor，菜单项 16/8/三级色），
         // 变量由 applyPresetIconVars 内联写在 span 上；mask 用 longhand，避免简写与变量混在一起出歧义
-        `.${PRESET_ICON_CLASS}::before{content:"";display:inline-block;flex:none;width:var(--ap-glyph-box,16px);height:var(--ap-glyph-box,16px);margin-right:var(--ap-glyph-gap,8px);vertical-align:middle;background-color:var(--ap-glyph-color,currentColor);-webkit-mask-image:${PRESET_ICON_MASK};mask-image:${PRESET_ICON_MASK};-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-position:center;mask-position:center;-webkit-mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px);mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px)}`,
+        `.${PRESET_ICON_CLASS}{display:inline-flex;align-items:center;gap:var(--ap-glyph-gap,8px)}`,
+        // 图标本体：尺寸全走 --ap-glyph-* 变量；用 flex 的 align-items:center 对齐，和内置 itemIcon / triggerIcon 同一套机制（之前用 vertical-align 手调，真机上差了 2px）
+        `.${PRESET_ICON_CLASS}::before{content:"";flex:none;width:var(--ap-glyph-box,16px);height:var(--ap-glyph-box,16px);background-color:var(--ap-glyph-color,currentColor);-webkit-mask-image:${PRESET_ICON_MASK};mask-image:${PRESET_ICON_MASK};-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-position:center;mask-position:center;-webkit-mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px);mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px)}`,
       ].join('\n')
       ;(document.head || document.documentElement).appendChild(tag)
     }
