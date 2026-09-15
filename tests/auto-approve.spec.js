@@ -272,12 +272,12 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     // 通知只占一行：会进模型上下文，Reviewer 会话等细节留在时间线与宿主日志里
     expect(notice.content).toHaveLength(1)
     expect(notice.content[0].text.startsWith('[自动]')).toBe(true)
-    expect(notice.content[0].text).toContain('Auto Approve 已自动批准 bash')
+    expect(notice.content[0].text).toContain('自动审批 已自动批准 bash')
     expect(notice.content[0].text).toContain('low/high')
     expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).not.toContain('Reviewer 会话')
     // 折叠标题与正文用同一个标签
-    expect(notice.source).toMatchObject({ form: 'notice', summary: '[自动] Auto Approve：允许' })
+    expect(notice.source).toMatchObject({ form: 'notice', summary: '[自动] 自动审批：允许' })
   })
 
   it('Reviewer deny 时转交人工审批，且不再重复审查', async () => {
@@ -292,10 +292,10 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(request.agent.cancel).not.toHaveBeenCalled()
     const notice = request.agent.inject.mock.calls.at(-1)[0]
     expect(notice.content[0].text.startsWith('[人工]')).toBe(true)
-    expect(notice.content[0].text).toContain('Auto Approve 未自动批准 bash，已转交你审批')
+    expect(notice.content[0].text).toContain('自动审批 未自动批准 bash，已转交你审批')
     expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).toContain('理由：提权范围超过运行测试所需。')
-    expect(notice.source.summary).toBe('[人工] Auto Approve：转交人工审批')
+    expect(notice.source.summary).toBe('[人工] 自动审批：转交人工审批')
   })
 
   it('子 Agent 异常、无 structured 输出或缺少精确动作时一律转人工审批', async () => {

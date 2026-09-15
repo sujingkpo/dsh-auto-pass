@@ -14,7 +14,7 @@
       auto-approve:
         sandbox: workspace-write
         approval: ask
-        name: 🚦 Auto Approve
+        name: ✓ 自动审批
         description: 在工作区写入沙箱内自动放行审查通过的操作，其余一律转交人工审批。
       danger-full-access:
         sandbox: danger-full-access

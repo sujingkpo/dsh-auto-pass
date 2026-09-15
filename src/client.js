@@ -74,7 +74,7 @@ window.__ModuleLoader__.load({
       zh: {
         timelineTab: '审批时间线',
         policyTab: '审批设置',
-        guideDescription: 'Auto Approve 的自动批准与转人工记录，可一键升级为白名单或降级为黑名单',
+        guideDescription: '自动审批的自动批准与转人工记录，可一键升级为白名单或降级为黑名单',
         title: '审批时间线',
         subtitle: '最新的在最上面',
         scopeSession: '本次会话',

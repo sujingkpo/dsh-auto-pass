@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-- `dsh-auto-pass`：给 DSH WebUI 增加 `🚦 Auto Approve` 权限档位。入口 `src/index.js`，在 `approval/request` waterfall 上注册应答器。
+- `dsh-auto-pass`：给 DSH WebUI 增加 `✓ 自动审批` 权限档位（显示名在 `cordis.patch.yml` 的 `presets` 表里，预设 **id 固定为 `auto-approve`**，它是插件闸门）。入口 `src/index.js`，在 `approval/request` waterfall 上注册应答器。
 - **核心语义**：插件自身唯一会给出的结论是 `allowed-once`（只自动放行 Reviewer 判定 `outcome: allow` 的请求）；模型 deny、宿主安全降级（critical / high 授权不足）、审查失败（超时、无审查路由、拿不到精确动作、输出非法、子 Agent 异常）一律调用 `next()` 转回 DSH 原生人工审批链（ask），由用户决定。
 - 审查提示词与安全策略在 `prompts/policy-template.md`、`prompts/policy.md`（两种语言下策略正文都保持中文）。
 - **权限记忆（`src/policy.js`）**：白名单（直接放行）/黑名单（直接转人工）分项目与全局两级，命中名单**不启动 Reviewer**；同一项目同一签名连续放行（默认 3 次，自动放行与人工放行都算）或连续被拒（默认 3 次，模型 deny 与人工拒绝都算）达到阈值后，**先由 DSH 模型把这次动作优化成匹配条件，再用 `ctx.userQuestions.ask` 问用户是否加入名单**——用户确认才落盘，**不再静默升级**。匹配器只认三种闭集条件：`signature`（精确签名）/ `command_prefix` / `path_prefix`；时间线上的手动升级/降级仍优先采用 Reviewer 的 `rule` 建议。
@@ -25,7 +25,7 @@
 - Reviewer 子 Agent 隔离：`agent/created` 时 append `sandbox/mode=read-only` 与 `approval/policy=never`，装工具 guard（放行 `read`/`glob`/`grep`/`run_code`/结构化输出），并在 `agent/pre-step` 限制调查步数。
 - **ptc 档位必须放行 `run_code`（踩过坑）**：ptc 档位下模型唯一能直接调用的是 `run_code`，`read`/`glob`/`grep`/`structured_output` 都要写在里面。早期 guard 只放行后四个 → Reviewer 查不了也交不了结论，`turn/end reason=blocked`，插件只能按「审查失败→转人工」处理（表现为一串 `refusal`/`error` 通知）。内层调用仍逐个过 guard，所以放行 `run_code` 不放宽实际权限。
 - 排查材料：客户端信标 `GET /api/dsh-auto-pass/beacon?stage=&detail=` 把 boot 阶段写进宿主日志；Reviewer 子会话落在 `~/.dsh/sessions/<workspace>/<sessionId>/session.v3.jsonl.zstd`（按 zstd magic `28 b5 2f fd` 分帧逐帧解压）。
-- 通知通过 `agent.inject({ source: { kind: 'plugin', plugin: 'dsh-auto-pass', form: 'notice' } })` 写进父 session。**正文只有一行**（`injectReviewNotice` + `NOTICE_LABELS`）：`[自动] Auto Approve 已自动批准 bash · low/high · 2 步 · 理由：…`，上限 `MAX_NOTICE_LINE_CHARS = 240`；**折叠标题（`source.summary`）用同一个标签**（命中名单时是 `[白名单·自动]` / `[黑名单·人工]`，否则 `[自动]` / `[人工]`，后接 `Auto Approve：允许` / `Auto Approve：转交人工审批`）——用户要求正文与标题一致；Reviewer 会话、建议规则、命中规则全文都不进上下文（留在审批时间线与宿主日志）。原因见下一条：这行通知是模型能看到的，必须足够短。
+- 通知通过 `agent.inject({ source: { kind: 'plugin', plugin: 'dsh-auto-pass', form: 'notice' } })` 写进父 session。**正文只有一行**（`injectReviewNotice` + `NOTICE_LABELS`）：`[自动] 自动审批 已自动批准 bash · low/high · 2 步 · 理由：…`，上限 `MAX_NOTICE_LINE_CHARS = 240`；**折叠标题（`source.summary`）用同一个标签**（命中名单时是 `[白名单·自动]` / `[黑名单·人工]`，否则 `[自动]` / `[人工]`，后接 `自动审批：允许` / `自动审批：转交人工审批`）——用户要求正文与标题一致；Reviewer 会话、建议规则、命中规则全文都不进上下文（留在审批时间线与宿主日志）。原因见下一条：这行通知是模型能看到的，必须足够短。
 - `maxConsecutiveDenials` 与 turn 中断逻辑已删除：拒绝不再阻断，交给用户后可继续审批。
 - **审批前的判定顺序（`createAutoApprovalHandler`）**：`action === undefined` → 直接转人工（且**不建立签名**）；否则先查名单，`deny` 命中直接 `next()`、`allow` 命中直接 `allowed-once`（两者都不建 Reviewer）；都没命中才走模型审查；`tests/policy-gate.spec.js` 用「`ctx.subagents.start` 一次都没被调用」把这一点钉死，并要求记录里带上 `policy.{list,scope,label}`（时间线据此显示命中名单）。
 - **达阈值后的升级建议（`observeDecision` → `proposeRule`）**：`policy.observe` 只返回 `{approvals, denials, suggestion}`，**不再自行落规则**；`finish()` 拿到 `suggestion` 后立刻 `void proposeRule(...)`——**旁路异步**执行，既不改变已经确定的审批结论，也不阻塞这次工具调用（同一签名同一名单同时只挂一个问题）。proposeRule 先取规则：本次审查的 `suggestedRule`，没有就起一次只读的 `optimizeRule` 子 Agent（persona 来自 `prompts/rule-template.md`，输出 `ruleSuggestionSchema`）；再 `ctx.userQuestions.ask({ questions, agent })` 问「加入白名单/黑名单（本项目/全局）/ 不加入」；同意则 `addRule({ source: model })` 并回写记录的 `ruleApplied`，选「不加入」则 `dismiss`（该签名该名单从此不再计数、不再询问）。
@@ -68,6 +68,7 @@
 
 - 依赖形态：`C:\Users\czy\.dsh\profiles\desktop\package.json` 里写 `"dsh-auto-pass": "link:D:/work/github/dsh-auto"`，`dsh.profile.bundles` 末位是 `dsh-auto-pass`；`node_modules\dsh-auto-pass` 是指向本仓库的**符号链接**（等价于 pnpm 对 `link:` 依赖的物化结果，参照同 profile 的 `dsh-change-review`）。`pnpm-lock.yaml` 的 importer 段已同步为 link 形式，旧的 `dsh-auto@github:...` 条目已删除。
 - `dsh plugin <args>`（= 在 profile 目录转发 pnpm）在本机**当前不可用**：不加 `-w` 报 `ERR_PNPM_ADDING_TO_ROOT`（profile 有 `pnpm-workspace.yaml`），加了 `-w` 报 `ERR_PNPM_VIRTUAL_STORE_DIR_MAX_LENGTH_DIFF`（`node_modules/.modules.yaml` 记录 `virtualStoreDirMaxLength: 60`，而 shim 的 pnpm 9.15.9 默认值不同）。要重建依赖需显式带上该配置值（未验证）。
+- **权限档位的图标是 DSH 客户端硬编码的，第 4 个档位拿不到（2026-09-15 查证）**：输入框上方档位 chip/菜单里的图标来自 `@deepseek-ai/dsh-client-ui-conversation` 的 `permissionGlyphs` —— 一个只含 `read-only` / `workspace-write` / `danger-full-access` 三个 **id** 的 `Map`（注释原话：host-configured names outside the design set get none）；设置页的权限菜单（`dsh-client-ui-permission-presets`）更只有纯文字 `{id,label}`。宿主 `presets.<id>` 的 schema 只有 `{sandbox, approval, name, description}`，**没有图标位**，所以自建档位只能靠 `name` 里放字符。用户已明确要求改掉彩色 🚦、名字换中文，最终选 `name: ✓ 自动审批`（U+2713 无彩色变体，跟文字同色）（非 kebab-case 的 name 会被两处客户端原样透传）。**不要为了图标去改 id**：`src/index.js` 的闸门是 `selectedPermissionPreset(session) !== 'auto-approve'`，且三个内置 id 各有语义不可顶替。
 - 本机默认 `reviewerProvider: deepseek-official` 无凭证，必须由 profile 的 `cordis.patch.yml` 用 `- id: dsh-auto-pass` 覆盖审查模型；profile 层按 id 覆盖会**整体替换** config，所以要重述全部键。
 - 改插件代码、`cordis.patch.yml` 或策略后必须重启 DSH Desktop 才生效（客户端半也要重启，HMR 只在 dev:web 下生效）。
 - profile 的 `cordis.patch.yml` 覆盖里没有新键（`maxRecords`/`placement`/`autoApproveAfter`/`policyFile`）也无需改：profile 按 id 覆盖时未列出的键回落到代码默认值。

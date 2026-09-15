@@ -1,5 +1,5 @@
 /**
- * @description dsh-auto-pass 插件入口。为 `Auto Approve` 权限档位引入一个独立的
+ * @description dsh-auto-pass 插件入口。为 `自动审批` 权限档位引入一个独立的
  *   只读 Reviewer 子 Agent：只有审查结论为 allow 的请求由插件自动放行；模型 deny、
  *   宿主安全降级与审查失败一律交回 DSH 原生人工审批链（ask），由用户决定。
  * @author simon300000
@@ -640,7 +640,7 @@ function installReviewerIsolation(ctx) {
 }
 
 const GUARD_MESSAGES = Object.freeze({
-  zh: name => `Auto Approve Reviewer 只允许只读调查工具（read/glob/grep，ptc 档位下经 run_code 调用）与结构化结论，已拒绝 ${name}`,
+  zh: name => `自动审批 Reviewer 只允许只读调查工具（read/glob/grep，ptc 档位下经 run_code 调用）与结构化结论，已拒绝 ${name}`,
   en: name => `The Auto Approve Reviewer may only use read-only investigation tools (read/glob/grep, called through run_code under the ptc preset) and its structured assessment; ${name} was denied.`,
 })
 
@@ -1676,10 +1676,10 @@ const MAX_NOTICE_LINE_CHARS = 240
 
 const NOTICE_LABELS = Object.freeze({
   zh: Object.freeze({
-    allowedHeadline: toolName => `Auto Approve 已自动批准 ${toolName}`,
-    deferredHeadline: toolName => `Auto Approve 未自动批准 ${toolName}，已转交你审批`,
-    summaryAllowed: 'Auto Approve：允许',
-    summaryDeferred: 'Auto Approve：转交人工审批',
+    allowedHeadline: toolName => `自动审批 已自动批准 ${toolName}`,
+    deferredHeadline: toolName => `自动审批 未自动批准 ${toolName}，已转交你审批`,
+    summaryAllowed: '自动审批：允许',
+    summaryDeferred: '自动审批：转交人工审批',
     riskAuth: (risk, authorization) => `${risk}/${authorization}`,
     steps: steps => `${steps} 步`,
     rationale: '理由：',
