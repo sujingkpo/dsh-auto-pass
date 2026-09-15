@@ -30,8 +30,19 @@ window.__ModuleLoader__.load({
     const VIEW_ID = 'dsh-auto-pass'
     const PLACEMENTS = ['auto', 'tab', 'sidebar', 'all']
 
-    /** 上报一次启动阶段；失败静默（信标绝不影响插件本体）。 */
+    /**
+     * 上报一次启动阶段：既打宿主日志（fetch），也写 localStorage 轨迹
+     * （后者不依赖 fetch，可直接从渲染器的 leveldb 文件里读出来核对）。
+     * 两条通道都失败也不影响插件本体。
+     */
     function beacon(stage, detail = '') {
+      try {
+        const trail = JSON.parse(localStorage.getItem('dsh-auto-pass:boot') ?? '[]')
+        trail.push(stage + (detail === '' ? '' : '(' + detail + ')'))
+        localStorage.setItem('dsh-auto-pass:boot', JSON.stringify(trail.slice(-24)))
+      } catch (error) {
+        // localStorage 不可用时只靠宿主日志
+      }
       try {
         void fetch(API_BEACON + '?stage=' + encodeURIComponent(stage) + '&detail=' + encodeURIComponent(detail), {
           headers: { accept: 'application/json' },
@@ -39,6 +50,11 @@ window.__ModuleLoader__.load({
       } catch (error) {
         // fetch 本身不可用时忽略
       }
+    }
+    try {
+      localStorage.removeItem('dsh-auto-pass:boot')
+    } catch (error) {
+      // 忽略：清掉上一轮轨迹
     }
     beacon('factory')
 
@@ -385,14 +401,19 @@ window.__ModuleLoader__.load({
       const mountTab = () => {
         if (mounted.tab !== undefined) return
         mounted.tab = slots.inject('conversation.view', () => {
-          const dispose = slots.register({
-            name: 'conversation.view',
-            id: VIEW_ID,
-            order: 30,
-            label: () => t.tabLabel,
-          }, props => react.createElement(ApprovalLogPanel, props))
-          beacon('view-registered')
-          return dispose
+          try {
+            const dispose = slots.register({
+              name: 'conversation.view',
+              id: VIEW_ID,
+              order: 30,
+              label: () => t.tabLabel,
+            }, props => react.createElement(ApprovalLogPanel, props))
+            beacon('view-registered')
+            return dispose
+          } catch (error) {
+            beacon('view-error', String(error?.message ?? error))
+            throw error
+          }
         })
       }
       const mountSidebar = () => {
@@ -463,11 +484,20 @@ window.__ModuleLoader__.load({
         + ' hasSidebarSeat=' + String(ctx.get('sidebarRightTabs') !== undefined))
       void placementStore.load().then(remount)
 
-      ctx.effect(() => slots.inject('settings.plugin.item', () => slots.register({
-        name: 'settings.plugin.item',
-        key: 'dsh-auto-pass',
-        id: 'dsh-auto-pass',
-      }, () => react.createElement(PlacementCard))), 'dsh-auto-pass: placement settings card')
+      ctx.effect(() => slots.inject('settings.plugin.item', () => {
+        try {
+          const dispose = slots.register({
+            name: 'settings.plugin.item',
+            key: 'dsh-auto-pass',
+            id: 'dsh-auto-pass',
+          }, () => react.createElement(PlacementCard))
+          beacon('settings-registered')
+          return dispose
+        } catch (error) {
+          beacon('settings-error', String(error?.message ?? error))
+          throw error
+        }
+      }), 'dsh-auto-pass: placement settings card')
 
       ctx.effect(() => () => {
         unsubscribe()

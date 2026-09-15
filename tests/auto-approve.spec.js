@@ -251,7 +251,8 @@ describe('Auto Approve Reviewer 子 Agent', () => {
         maxTokens: 8_192,
       },
       persona: expect.stringContaining('独立安全审批 Reviewer'),
-      toolFilter: { allow: ['read', 'glob', 'grep', 'run_code'] },
+      // restrict 名单只能列端能力工具：run_code 是保留的 PTC 传输层，列进去会直接报错
+      toolFilter: { allow: ['read', 'glob', 'grep'] },
       outputSchema: assessmentSchema,
       maxDepth: 1,
     })

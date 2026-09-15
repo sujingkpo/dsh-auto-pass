@@ -21,11 +21,13 @@ export const name = 'dsh-auto-pass'
 export const inject = ['approval', 'subagents', 'tools']
 
 const REVIEWER_OPTIONS = Symbol('dsh-auto-pass-reviewer-options')
-// ptc（programmatic tool calling）档位下，模型唯一能直接调用的工具是 run_code，
-// read/glob/grep/structured_output 都得写在 run_code 里——所以它必须在允许列表里，
-// 否则 Reviewer 既无法调查也无法提交结构化结论（内层调用仍逐个过 guard）。
-const REVIEWER_TOOLS = Object.freeze(['read', 'glob', 'grep', 'run_code'])
-const REVIEWER_EXECUTABLE_TOOLS = new Set([...REVIEWER_TOOLS, 'structured_output'])
+// toolFilter（也就是 tools.restrict）只能声明**端能力工具**：DSH 会拒绝在 restrict
+// 名单里出现保留的 PTC 传输层 run_code（报 "cannot name reserved PTC mode
+// presentation transport"，Reviewer 连启动都会失败）。
+const REVIEWER_TOOLS = Object.freeze(['read', 'glob', 'grep'])
+// guard 是逐个执行判定的看门狗：ptc 档位下模型唯一能直接调用的是 run_code，
+// 必须放行，否则 Reviewer 既调查不了也交不了结构化结论；内层调用仍逐个过 guard。
+const REVIEWER_EXECUTABLE_TOOLS = new Set([...REVIEWER_TOOLS, 'run_code', 'structured_output'])
 const LANGUAGE_DETECTION_STATES = new WeakMap()
 const CHARS_PER_TOKEN = 4
 const HAN_CHARACTER_THRESHOLD = 3
