@@ -11,7 +11,7 @@
 ## 命令（已验证）
 
 - 安装依赖：`pnpm install`（Node ≥ 22.19；`~/.npmrc` 的 registry 为 npmmirror，装 vitest 约 2 秒）。
-- 跑测试：`pnpm test`（= `vitest run`，当前 29 个用例全绿：`tests/auto-approve.spec.js` 22 个 + `tests/records.spec.js` 7 个）。
+- 跑测试：`pnpm test`（= `vitest run`，当前 31 个用例全绿：`tests/auto-approve.spec.js` 22 个 + `tests/records.spec.js` 9 个）。
 - `tests/auto-approve.spec.js` 文件名沿用权限档位名 `auto-approve`，与包名 `dsh-auto-pass` 不同，改名时不要误删。
 - **受限沙箱下 `pnpm test` 会 `spawn EPERM`**（vite 会 `exec("net use")`、vitest 默认 forks 池也要 spawn 子进程）；需要以更宽权限运行，否则测试跑不起来。
 
@@ -32,7 +32,9 @@
   - 右侧栏 tab：`ctx.inject(['sidebarRightTabs'], raw => ...)`（**延迟注入，座位按契约可选**）→ `raw.sidebarRightTabs.register({ id, kind, title, guide:[{ order, title, description, icon }] })` + `raw.slots.inject('sidebar.right.pane.tab', () => raw.slots.register({ name:'sidebar.right.pane.tab', key: id }, Cmp))`。`id` 同时是正文席位的 key；tab 一次都没打开过时它只出现在引导页/加号菜单里。
   - `slots.inject` 返回**幂等 disposer（函数）**；cordis 的 `ctx.inject` 返回带 `.dispose()` 的 handle，两者的卸载方式不同。
 - 面板数据来自 host 的 `GET /api/dsh-auto-pass/log?session=&limit=`（记录，倒序）与 `/api/dsh-auto-pass/config`（`placement`）；客户端每 3 秒轮询一次。
-- 放置策略 `placement: auto | tab | sidebar | all`（默认 auto：`ctx.get('sidebarRightTabs')` 在就挂右侧栏，否则退回对话标签页）；设置页卡片写 `localStorage['dsh-auto-pass:placement']` 覆盖宿主配置并即时重挂。
+- 放置策略 `placement: auto | tab | sidebar | all`，默认 **all**（与 dsh-context 一致：对话标签页 + 右侧栏 tab 都注册）；`auto` 表示 `ctx.get('sidebarRightTabs')` 存在就挂右侧栏，否则退回对话标签页。
+- **设置页卡片的渲染条件（踩过坑）**：设置 → 插件 只为**宿主侧 `settings.register(命名空间, schema)` 注册过的命名空间**渲染卡片，并按 `entryKey = 命名空间` 派发 `settings.plugin.item`。只注册客户端卡片不会显示任何东西。本插件 host 半用动态 `import('@deepseek-ai/schemastery')`（软依赖，失败只丢卡片）注册命名空间 `dsh-auto-pass`，客户端卡片 key 与它同名。
+- 放置位置的唯一真值在宿主：`placement` config 是默认值，用户在设置页改过的值存在设置命名空间里（`GET/POST /api/dsh-auto-pass/config`），设置页写的值优先。客户端启动时拉一次 config、并订阅 `placementStore` 变更即时重挂。
 - 记录仓库在 `src/records.js`：内存列表 + JSON 原子落盘（`.tmp` + rename），默认 `$DSH_HOME/dsh-auto-pass/approvals.json`（无 `DSH_HOME` 时 `~/.dsh`），上限 `maxRecords`（默认 1000），`list({session})` 返回倒序。`createAutoApprovalHandler(ctx, config, records)` 的第三个参数默认 `noopRecordStore`；`finish()` 里对 `records.add` 做 try/catch，**写记录失败绝不影响审批结论**。
 
 ## 部署（本机 desktop profile）

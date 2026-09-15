@@ -43,7 +43,9 @@ const DEFAULTS = Object.freeze({
   maxOutputTokens: 8_192,
   logFile: '',
   maxRecords: DEFAULT_MAX_RECORDS,
-  placement: 'auto',
+  // 默认两处都注册（与 dsh-context 一致）：对话区标签页立刻可见，右侧栏 tab 也可用；
+  // 想只留一处就改成 tab / sidebar；auto 表示优先右侧栏、没有座位时退回对话标签页。
+  placement: 'all',
 })
 
 /** 审批记录路由前缀（webServer kind: prefix）与两条查询路径。 */
@@ -52,6 +54,8 @@ export const RECORD_LOG_PATH = '/api/dsh-auto-pass/log'
 export const RECORD_CONFIG_PATH = '/api/dsh-auto-pass/config'
 /** 时间轴可选的放置位置；auto 表示优先右侧栏座位、没有座位时退回对话标签页。 */
 export const PLACEMENTS = Object.freeze(['auto', 'tab', 'sidebar', 'all'])
+/** 设置命名空间：宿主 settings 注册与浏览器端设置卡片靠这个名字对齐。 */
+export const SETTINGS_NAMESPACE = 'dsh-auto-pass'
 /** 单次响应最多返回的记录条数，避免侧边栏一次拉取过多数据。 */
 const MAX_RECORDS_PER_RESPONSE = 500
 
@@ -100,8 +104,43 @@ export function apply(ctx, config) {
   })
   installReviewerIsolation(ctx)
   ctx.on('approval/request', createAutoApprovalHandler(ctx, resolved, records), { prepend: true })
+  installSettings(ctx)
   installRecordRoute(ctx, records, resolved)
-  ctx.logger.info('dsh-auto-pass: 审批记录已就绪 file=' + records.file + ' maxRecords=' + String(records.limit))
+  ctx.logger.info('dsh-auto-pass: 审批记录已就绪 file=' + records.file + ' maxRecords=' + String(records.limit)
+    + ' placement=' + effectivePlacement(ctx, resolved))
+}
+
+/**
+ * 注册设置命名空间。设置页只为**宿主侧注册过的**命名空间渲染插件卡片，
+ * 所以这张卡片能否出现取决于这里。settings 服务缺失时静默跳过。
+ */
+function installSettings(ctx) {
+  if (typeof ctx.inject !== 'function') return
+  ctx.inject(['settings'], settingsCtx => {
+    // schemastery 只在注册设置时需要：用动态 import 把它变成软依赖，
+    // 解析失败时只是没有设置页卡片，审批主链路照常工作。
+    void import('@deepseek-ai/schemastery').then(module => {
+      const z = module.default ?? module
+      const schema = z.object({ placement: z.union([...PLACEMENTS]).default('all') })
+      settingsCtx.settings.register(SETTINGS_NAMESPACE, schema)
+    }).catch(error => {
+      ctx.logger.warn('dsh-auto-pass: 注册设置命名空间失败：' + errorMessage(error))
+    })
+  })
+}
+
+/** 生效的放置位置：设置页的值优先，其次插件 config 的值。 */
+function effectivePlacement(ctx, config) {
+  const settings = typeof ctx.get === 'function' ? ctx.get('settings') : undefined
+  if (settings !== undefined && typeof settings.get === 'function') {
+    try {
+      const value = settings.get(SETTINGS_NAMESPACE)?.placement
+      if (PLACEMENTS.includes(value)) return value
+    } catch (error) {
+      ctx.logger.warn('dsh-auto-pass: 读取设置失败，回退到插件配置：' + errorMessage(error))
+    }
+  }
+  return config.placement
 }
 
 /**
@@ -120,8 +159,13 @@ function installRecordRoute(ctx, records, config) {
   })
 }
 
-/** 处理 `GET /api/dsh-auto-pass/log?session=&limit=` 与 `GET /api/dsh-auto-pass/config`。 */
-function serveRecordRequest(req, res, records, config, ctx) {
+/**
+ * 处理记录查询与设置读写：
+ * - `GET /api/dsh-auto-pass/log?session=&limit=` 倒序记录
+ * - `GET /api/dsh-auto-pass/config` 生效的 placement
+ * - `POST /api/dsh-auto-pass/config {placement}` 写入设置命名空间
+ */
+async function serveRecordRequest(req, res, records, config, ctx) {
   /** 统一的 JSON 响应；连接已断开时只告警，不再上抛。 */
   const writeJson = (code, body) => {
     try {
@@ -138,12 +182,27 @@ function serveRecordRequest(req, res, records, config, ctx) {
       writeJson(404, { ok: false, error: 'not found' })
       return
     }
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      writeJson(405, { ok: false, error: 'method not allowed' })
+    if (pathname === RECORD_CONFIG_PATH) {
+      if (req.method === 'POST' || req.method === 'PUT') {
+        await updatePlacement(req, ctx, writeJson)
+        return
+      }
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        writeJson(405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      const settings = typeof ctx.get === 'function' ? ctx.get('settings') : undefined
+      writeJson(200, {
+        ok: true,
+        placement: effectivePlacement(ctx, config),
+        writable: settings !== undefined && typeof settings.update === 'function',
+        maxRecords: config.maxRecords,
+        file: records.file,
+      })
       return
     }
-    if (pathname === RECORD_CONFIG_PATH) {
-      writeJson(200, { ok: true, placement: config.placement, maxRecords: config.maxRecords, file: records.file })
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      writeJson(405, { ok: false, error: 'method not allowed' })
       return
     }
     const session = url.searchParams.get('session') ?? ''
@@ -162,6 +221,30 @@ function serveRecordRequest(req, res, records, config, ctx) {
     ctx.logger.warn('dsh-auto-pass: 审批记录路由失败：' + errorMessage(error))
     writeJson(500, { ok: false, error: errorMessage(error) })
   }
+}
+
+/** 读取请求体并写入设置命名空间；没有可写 settings 时返回 503。 */
+async function updatePlacement(req, ctx, writeJson) {
+  const settings = typeof ctx.get === 'function' ? ctx.get('settings') : undefined
+  if (settings === undefined || typeof settings.update !== 'function') {
+    writeJson(503, { ok: false, error: 'settings unavailable' })
+    return
+  }
+  let body = ''
+  for await (const chunk of req) body += chunk
+  let placement
+  try {
+    placement = JSON.parse(body === '' ? '{}' : body).placement
+  } catch (error) {
+    writeJson(400, { ok: false, error: 'invalid json' })
+    return
+  }
+  if (!PLACEMENTS.includes(placement)) {
+    writeJson(400, { ok: false, error: 'placement must be one of ' + PLACEMENTS.join('/') })
+    return
+  }
+  await settings.update(SETTINGS_NAMESPACE, { placement })
+  writeJson(200, { ok: true, placement })
 }
 
 /** 对 loader 或测试传入的配置做运行时边界校验。 */

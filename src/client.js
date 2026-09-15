@@ -2,7 +2,7 @@
  * @description dsh-auto-pass 客户端半：把审批记录注册成「对话区标签页」或「右侧栏标签页」
  *   的时间轴面板（倒序）。放置位置参照 dsh-context：placement=auto 时优先右侧栏座位
  *   （ctx.sidebarRightTabs），座位不可用则退回对话区 conversation.view 标签页；
- *   另提供设置页分段开关（localStorage 覆盖宿主配置），切换即时生效。
+ *   放置位置默认值来自宿主 config（默认 all），设置页卡片可通过宿主设置命名空间覆盖它。
  * @author simon300000
  * @date 2026-09-15
  */
@@ -26,10 +26,6 @@ window.__ModuleLoader__.load({
     const SIDEBAR_KIND = 'dsh-auto-pass-log'
     /** 对话区标签页的席位 id（conversation.view 内必须唯一）。 */
     const VIEW_ID = 'dsh-auto-pass'
-    /** placement 覆盖值的 localStorage 键。 */
-    const PLACEMENT_KEY = 'dsh-auto-pass:placement'
-    /** 宿主配置到达 / 设置页切换时广播，用于重新决定挂载位置。 */
-    const PLACEMENT_EVENT = 'dsh-auto-pass:placement'
     const PLACEMENTS = ['auto', 'tab', 'sidebar', 'all']
 
     /** 界面语言：跟随浏览器语言，简体/繁体中文都用中文文案。 */
@@ -153,24 +149,44 @@ window.__ModuleLoader__.load({
         react.createElement('path', { d: 'M11.4 12.4l1.5 1.5 2.4-2.9' }))
     }
 
-    /** 读取 localStorage 里的放置覆盖值，非法值一律忽略。 */
-    function readOverride() {
-      try {
-        const raw = localStorage.getItem(PLACEMENT_KEY)
-        return PLACEMENTS.includes(raw) ? raw : undefined
-      } catch (error) {
-        // 隐私模式下 localStorage 不可用：交给宿主配置
-        return undefined
-      }
-    }
-
-    /** 写入放置覆盖值（'auto' 表示回到宿主配置）。 */
-    function writeOverride(value) {
-      try {
-        localStorage.setItem(PLACEMENT_KEY, value)
-      } catch (error) {
-        console.warn(LOG, '无法写入 localStorage 覆盖值', error)
-      }
+    /**
+     * placement 状态：唯一真值在宿主（config 默认值 + 设置命名空间覆盖）。
+     * 设置页卡片与挂载逻辑共用它，任何变更都会广播给订阅者重新挂载。
+     */
+    const placementStore = {
+      value: 'all',
+      writable: false,
+      listeners: new Set(),
+      subscribe(listener) {
+        this.listeners.add(listener)
+        return () => { this.listeners.delete(listener) }
+      },
+      set(value) {
+        if (this.value === value) return
+        this.value = value
+        for (const listener of [...this.listeners]) listener(value)
+      },
+      async load() {
+        try {
+          const response = await fetch(API_CONFIG, { headers: { accept: 'application/json' } })
+          const data = await response.json()
+          if (typeof data?.placement === 'string' && PLACEMENTS.includes(data.placement)) this.set(data.placement)
+          this.writable = data?.writable === true
+        } catch (error) {
+          console.warn(LOG, '读取宿主 placement 失败，沿用默认 all', error)
+        }
+        return this.value
+      },
+      async save(next) {
+        const response = await fetch(API_CONFIG, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ placement: next }),
+        })
+        const data = await response.json()
+        if (data?.ok !== true) throw new Error(String(data?.error ?? 'save failed'))
+        this.set(typeof data.placement === 'string' ? data.placement : next)
+      },
     }
 
     /** 把一组字段渲染成详情行。 */
@@ -299,18 +315,20 @@ window.__ModuleLoader__.load({
             }))))
     }
 
-    /** 设置页卡片：选择记录显示在哪里（写 localStorage，即时重挂）。 */
+    /** 设置页卡片：选择记录显示在哪里（写宿主设置命名空间，即时重挂）。 */
     function PlacementCard() {
-      const [value, setValue] = react.useState(() => readOverride() ?? 'auto')
-      react.useEffect(() => {
-        const sync = () => setValue(readOverride() ?? 'auto')
-        window.addEventListener(PLACEMENT_EVENT, sync)
-        return () => window.removeEventListener(PLACEMENT_EVENT, sync)
-      }, [])
+      const [value, setValue] = react.useState(() => placementStore.value)
+      const [error, setError] = react.useState('')
+      react.useEffect(() => placementStore.subscribe(setValue), [])
       const choose = (next) => {
-        writeOverride(next)
+        setError('')
+        const previous = placementStore.value
         setValue(next)
-        window.dispatchEvent(new Event(PLACEMENT_EVENT))
+        placementStore.save(next).catch(cause => {
+          console.warn(LOG, '保存 placement 失败', cause)
+          setValue(previous)
+          setError(String(cause?.message ?? cause))
+        })
       }
       const options = [
         ['auto', t.placementAuto],
@@ -323,7 +341,8 @@ window.__ModuleLoader__.load({
         react.createElement('div', { className: 'ap-seg', style: { alignSelf: 'flex-start' } },
           options.map(([id, label]) => react.createElement('button', {
             key: id, type: 'button', 'data-on': value === id ? '1' : '0', onClick: () => choose(id),
-          }, label))))
+          }, label))),
+        error !== '' && react.createElement('div', { className: 'ap-error' }, error))
     }
 
     /** 客户端插件入口：按 placement 决定挂载对话标签页、右侧栏 tab 或两者。 */
@@ -333,9 +352,6 @@ window.__ModuleLoader__.load({
         console.warn(LOG, '没有 slots 服务，审批记录面板未注册')
         return
       }
-      // 宿主配置（placement 默认值）；拉取失败时按 auto 处理。
-      let hostPlacement = 'auto'
-      let hostPlacementReady = false
       const mounted = { tab: undefined, sidebar: undefined }
       let lastKey = ''
 
@@ -395,35 +411,21 @@ window.__ModuleLoader__.load({
       }
 
       /** 决定当前生效的放置方式；auto 优先右侧栏座位，没有座位时退回对话标签页。 */
-      const effective = () => {
-        const override = readOverride()
-        const placement = override ?? hostPlacement
-        if (placement !== 'auto') return placement
-        return ctx.get('sidebarRightTabs') === undefined ? 'tab' : 'sidebar'
-      }
+      const effective = placement => placement === 'auto'
+        ? (ctx.get('sidebarRightTabs') === undefined ? 'tab' : 'sidebar')
+        : placement
       const remount = () => {
-        const placement = effective()
-        const key = placement + '|' + hostPlacement
-        if (key === lastKey) return
-        lastKey = key
+        const placement = effective(placementStore.value)
+        if (placement === lastKey) return
+        lastKey = placement
         unmount()
         if (placement === 'tab' || placement === 'all') mountTab()
         if (placement === 'sidebar' || placement === 'all') mountSidebar()
       }
 
-      window.addEventListener(PLACEMENT_EVENT, remount)
+      const unsubscribe = placementStore.subscribe(remount)
       remount()
-      void (async () => {
-        try {
-          const response = await fetch(API_CONFIG, { headers: { accept: 'application/json' } })
-          const data = await response.json()
-          if (typeof data?.placement === 'string' && PLACEMENTS.includes(data.placement)) hostPlacement = data.placement
-        } catch (error) {
-          console.warn(LOG, '读取宿主 placement 配置失败，按 auto 处理', error)
-        }
-        hostPlacementReady = true
-        remount()
-      })()
+      void placementStore.load().then(remount)
 
       ctx.effect(() => slots.inject('settings.plugin.item', () => slots.register({
         name: 'settings.plugin.item',
@@ -432,10 +434,10 @@ window.__ModuleLoader__.load({
       }, () => react.createElement(PlacementCard))), 'dsh-auto-pass: placement settings card')
 
       ctx.effect(() => () => {
-        window.removeEventListener(PLACEMENT_EVENT, remount)
+        unsubscribe()
         unmount()
       }, 'dsh-auto-pass: placement mounts')
-      console.log(LOG, 'client loaded, hostPlacementReady=' + String(hostPlacementReady))
+      console.log(LOG, 'client loaded, placement=' + placementStore.value)
     }
 
     exports.inject = ['slots']

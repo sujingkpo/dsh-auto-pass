@@ -30,12 +30,14 @@ function record(id, sessionId = 'session-1') {
 }
 
 /** 造一个只实现审批记录所需面的假宿主 ctx。 */
-function fakeContext() {
+function fakeContext(options = {}) {
   const routes = []
   const listeners = new Map()
+  const settings = options.settings
   return {
     routes,
     listeners,
+    settings,
     ctx: {
       logger: { info: vi.fn(), warn: vi.fn() },
       on: (name, listener) => {
@@ -43,7 +45,7 @@ function fakeContext() {
         return () => {}
       },
       effect: fn => fn(),
-      get: () => undefined,
+      get: name => (name === 'settings' ? settings : undefined),
       inject: (names, callback) => {
         if (names.includes('webServer')) {
           callback({
@@ -51,21 +53,44 @@ function fakeContext() {
             webServer: { register: registration => { routes.push(registration); return () => {} } },
           })
         }
+        if (names.includes('settings')) {
+          callback({ effect: fn => fn(), settings: settings ?? { register: () => {} } })
+        }
         return { dispose: () => {} }
       },
     },
   }
 }
 
+/** 造一个假的设置服务：记录 update 调用，get 返回给定文档。 */
+function fakeSettings(document = {}) {
+  const updates = []
+  return {
+    updates,
+    register: vi.fn(),
+    get: () => document,
+    update: async (namespace, partial) => {
+      updates.push([namespace, partial])
+      return { ok: true }
+    },
+  }
+}
+
 /** 造一个最小 http req/res，返回响应内容与状态码。 */
-function fakeHttp(method, url) {
+function fakeHttp(method, url, body) {
   const state = { code: 0, body: '' }
   return {
     state,
-    req: { method, url },
+    req: {
+      method,
+      url,
+      async *[Symbol.asyncIterator]() {
+        if (body !== undefined) yield Buffer.from(body, 'utf8')
+      },
+    },
     res: {
       writeHead(code) { state.code = code },
-      end(body) { state.body = String(body ?? '') },
+      end(chunk) { state.body = String(chunk ?? '') },
     },
   }
 }
@@ -150,6 +175,38 @@ describe('审批记录路由', () => {
     const config = fakeHttp('GET', '/api/dsh-auto-pass/config')
     routes[0].handler(config.req, config.res)
     expect(JSON.parse(config.state.body)).toMatchObject({ ok: true, placement: 'sidebar', maxRecords: 5 })
+  })
+
+  it('设置命名空间有值时优先用它，并声明可写', async () => {
+    const settings = fakeSettings({ placement: 'tab' })
+    const { ctx, routes } = fakeContext({ settings })
+    apply(ctx, { logFile: tempFile(), placement: 'all' })
+
+    const config = fakeHttp('GET', '/api/dsh-auto-pass/config')
+    await routes[0].handler(config.req, config.res)
+    expect(JSON.parse(config.state.body)).toMatchObject({ ok: true, placement: 'tab', writable: true })
+  })
+
+  it('POST 写入设置命名空间，非法值 400，没有设置服务时 503', async () => {
+    const settings = fakeSettings({})
+    const { ctx, routes } = fakeContext({ settings })
+    apply(ctx, { logFile: tempFile(), placement: 'all' })
+
+    const saved = fakeHttp('POST', '/api/dsh-auto-pass/config', JSON.stringify({ placement: 'sidebar' }))
+    await routes[0].handler(saved.req, saved.res)
+    expect(saved.state.code).toBe(200)
+    expect(JSON.parse(saved.state.body)).toEqual({ ok: true, placement: 'sidebar' })
+    expect(settings.updates).toEqual([['dsh-auto-pass', { placement: 'sidebar' }]])
+
+    const bad = fakeHttp('POST', '/api/dsh-auto-pass/config', JSON.stringify({ placement: 'nope' }))
+    await routes[0].handler(bad.req, bad.res)
+    expect(bad.state.code).toBe(400)
+
+    const noService = fakeContext()
+    apply(noService.ctx, { logFile: tempFile(), placement: 'all' })
+    const refused = fakeHttp('POST', '/api/dsh-auto-pass/config', JSON.stringify({ placement: 'tab' }))
+    await noService.routes[0].handler(refused.req, refused.res)
+    expect(refused.state.code).toBe(503)
   })
 
   it('未知路径 404、非 GET 405', () => {

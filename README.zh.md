@@ -43,8 +43,8 @@ flowchart TD
 
 每次审批都会记一条记录，并以时间倒序的时间轴展示。宿主通过 `/api/dsh-auto-pass/log` 提供数据，由插件的客户端半渲染。
 
-- 放置位置沿用 [`dsh-context`](https://github.com/bowenliang123/dsh-context) 的模型：对话区里和「对话/轨迹」并排的标签页（`conversation.view`）、右侧栏标签页（`sidebarRightTabs`），或两处都放。`placement: auto`（默认）优先右侧栏，右侧栏座位不可用时退回对话标签页——因此不装任何第三方侧边栏插件也能用。
-- 设置页卡片（`settings.plugin.item`）可即时切换位置，选择存在 `localStorage`，优先于 `placement` 配置值。
+- 放置位置沿用 [`dsh-context`](https://github.com/bowenliang123/dsh-context) 的模型：对话区里和「对话/轨迹」并排的标签页（`conversation.view`）、右侧栏标签页（`sidebarRightTabs`），或两处都放。`placement: all`（默认，与 dsh-context 一致）两处都注册，对话区标签页立刻可见；`auto` 表示优先右侧栏、右侧栏座位不可用时退回对话标签页——因此不装任何第三方侧边栏插件也能用。
+- 设置页卡片（`settings.plugin.item`，位于 设置 → 插件）可即时切换位置，选择写进 DSH 设置命名空间 `dsh-auto-pass`、跨重启保留，并优先于 `placement` 配置值。**注意**：设置页只为宿主侧注册过设置命名空间的插件渲染卡片，所以插件的 host 半会注册这个命名空间（客户端卡片的 key 必须与它同名）。
 - 每行显示时间、工具名、结论（`自动批准` / `转人工` / `审查未完成`），转人工的还会显示你最终的选择；展开可见风险等级、用户授权、理由、审批原因、动作参数（裁剪到 500 字符）、耗时、Reviewer 会话与调查步数。
 - 记录以 JSON 落盘、跨重启保留：`$DSH_HOME/dsh-auto-pass/approvals.json`（默认 `~/.dsh/dsh-auto-pass/approvals.json`），只保留最新 1000 条，先写临时文件再改名。`logFile` 改路径，`maxRecords` 改上限。记录只存本地审批数据，并且只在 localhost 上提供。
 
