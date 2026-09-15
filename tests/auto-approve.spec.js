@@ -251,7 +251,7 @@ describe('Auto Approve Reviewer 子 Agent', () => {
         maxTokens: 8_192,
       },
       persona: expect.stringContaining('独立安全审批 Reviewer'),
-      toolFilter: { allow: ['read', 'glob', 'grep'] },
+      toolFilter: { allow: ['read', 'glob', 'grep', 'run_code'] },
       outputSchema: assessmentSchema,
       maxDepth: 1,
     })
@@ -451,7 +451,10 @@ describe('Reviewer 创建期隔离', () => {
     })
     expect(guard({ name: 'read', arguments: { file_path: 'src/index.js' } })).toBeUndefined()
     expect(guard({ name: 'structured_output' })).toBeUndefined()
+    // ptc 档位下 run_code 是唯一入口：必须放行，否则 Reviewer 既查不了也交不了结论
+    expect(guard({ name: 'run_code', arguments: { code: 'await tools.read({ file_path: "a" })' } })).toBeUndefined()
     expect(guard({ name: 'write' })).toMatch(/只允许只读/)
+    expect(guard({ name: 'bash' })).toMatch(/只允许只读/)
     expect(guard({ name: 'read', arguments: { file_path: '.env' } })).toBeUndefined()
     expect(guard({ name: 'grep', arguments: { pattern: 'token', path: '.ssh' } })).toBeUndefined()
     expect(guard({ name: 'grep', arguments: { pattern: 'token', include: '*.ts' } })).toBeUndefined()

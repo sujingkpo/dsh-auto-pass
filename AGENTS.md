@@ -11,7 +11,7 @@
 ## 命令（已验证）
 
 - 安装依赖：`pnpm install`（Node ≥ 22.19；`~/.npmrc` 的 registry 为 npmmirror，装 vitest 约 2 秒）。
-- 跑测试：`pnpm test`（= `vitest run`，当前 31 个用例全绿：`tests/auto-approve.spec.js` 22 个 + `tests/records.spec.js` 9 个）。
+- 跑测试：`pnpm test`（= `vitest run`，当前 33 个用例全绿：`tests/auto-approve.spec.js` 23 个 + `tests/records.spec.js` 10 个）。
 - `tests/auto-approve.spec.js` 文件名沿用权限档位名 `auto-approve`，与包名 `dsh-auto-pass` 不同，改名时不要误删。
 - **受限沙箱下 `pnpm test` 会 `spawn EPERM`**（vite 会 `exec("net use")`、vitest 默认 forks 池也要 spawn 子进程）；需要以更宽权限运行，否则测试跑不起来。
 
@@ -20,7 +20,9 @@
 - `ctx.on('approval/request', handler, { prepend: true })`（`src/index.js` 的 `apply`）：靠 `prepend` 抢在 `@deepseek-ai/dsh-api-remotes`（把审批转发给 WebUI 人工应答）之前，**不依赖 bundles 顺序**。
 - 审批 waterfall 的返回值只能取自 `'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'`（`@deepseek-ai/dsh-user-approval` 的 `OUTCOMES`，非闭集值会被归一化为 `unavailable`）。**没有 `'ask'` 这个返回值**：所谓「转 ask」= 不返回结论、调用 `next()` 让后续应答器接手。
 - `ApprovalService.decide()` 先看会话 `approval/policy`：为 `never` 时直接返回 `'rejected'` 且**不分发 waterfall**，因此本插件只在 policy ≠ never 时才会被调用。
-- Reviewer 子 Agent 隔离：`agent/created` 时 append `sandbox/mode=read-only` 与 `approval/policy=never`，装工具 guard（只放行 `read`/`glob`/`grep`/结构化输出），并在 `agent/pre-step` 限制调查步数。
+- Reviewer 子 Agent 隔离：`agent/created` 时 append `sandbox/mode=read-only` 与 `approval/policy=never`，装工具 guard（放行 `read`/`glob`/`grep`/`run_code`/结构化输出），并在 `agent/pre-step` 限制调查步数。
+- **ptc 档位必须放行 `run_code`（踩过坑）**：ptc 档位下模型唯一能直接调用的是 `run_code`，`read`/`glob`/`grep`/`structured_output` 都要写在里面。早期 guard 只放行后四个 → Reviewer 查不了也交不了结论，`turn/end reason=blocked`，插件只能按「审查失败→转人工」处理（表现为一串 `refusal`/`error` 通知）。内层调用仍逐个过 guard，所以放行 `run_code` 不放宽实际权限。
+- 排查材料：客户端信标 `GET /api/dsh-auto-pass/beacon?stage=&detail=` 把 boot 阶段写进宿主日志；Reviewer 子会话落在 `~/.dsh/sessions/<workspace>/<sessionId>/session.v3.jsonl.zstd`（按 zstd magic `28 b5 2f fd` 分帧逐帧解压）。
 - 通知通过 `agent.inject({ source: { kind: 'plugin', plugin: 'dsh-auto-pass', form: 'notice' } })` 写进父 session；allow 与转人工用不同 headline/summary。
 - `maxConsecutiveDenials` 与 turn 中断逻辑已删除：拒绝不再阻断，交给用户后可继续审批。
 
