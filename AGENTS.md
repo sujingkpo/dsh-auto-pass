@@ -12,8 +12,8 @@
 ## 命令（已验证）
 
 - 安装依赖：`pnpm install`（Node ≥ 22.19；`~/.npmrc` 的 registry 为 npmmirror，装 vitest 约 2 秒）。
-- 跑测试：`pnpm test`（= `vitest run`，当前 81 个用例全绿：`auto-approve` 23 + `records` 10 + `package` 4 + `policy` 25 + `policy-gate` 16 + `client` 3）。
-- **客户端半只有 `tests/client.spec.js` 覆盖**：它不进构建流水线。测试用假 `window.__ModuleLoader__` + 假 react 加载 bundle，并把三个面板组件**真渲染**一遍（递归求值到字符串 type）——漏定义变量、漏闭合花括号这类问题就靠它兜住（曾经真的漏过）。
+- 跑测试：`pnpm test`（= `vitest run`，当前 83 个用例全绿：`auto-approve` 23 + `records` 10 + `package` 4 + `policy` 25 + `policy-gate` 18 + `client` 3）。
+- **客户端半只有 `tests/client.spec.js` 覆盖**：它不进构建流水线。测试用假 `window.__ModuleLoader__` + 带「渲染帧」的假 react 加载 bundle，把组件**渲染到稳定状态**（反复求值 + 跑副作用 + 等微任务，直到没有新的 `setState`）——漏定义变量、漏闭合花括号、以及「异步拉到记录之后」那一轮渲染里的问题就靠它兜住（都真的漏过）。
 - `tests/auto-approve.spec.js` 文件名沿用权限档位名 `auto-approve`，与包名 `dsh-auto-pass` 不同，改名时不要误删。
 - **受限沙箱下 `pnpm test` 会 `spawn EPERM`**（vite 会 `exec("net use")`、vitest 默认 forks 池也要 spawn 子进程）；需要以更宽权限运行，否则测试跑不起来。
 
@@ -27,7 +27,7 @@
 - 排查材料：客户端信标 `GET /api/dsh-auto-pass/beacon?stage=&detail=` 把 boot 阶段写进宿主日志；Reviewer 子会话落在 `~/.dsh/sessions/<workspace>/<sessionId>/session.v3.jsonl.zstd`（按 zstd magic `28 b5 2f fd` 分帧逐帧解压）。
 - 通知通过 `agent.inject({ source: { kind: 'plugin', plugin: 'dsh-auto-pass', form: 'notice' } })` 写进父 session；allow 与转人工用不同 headline/summary。
 - `maxConsecutiveDenials` 与 turn 中断逻辑已删除：拒绝不再阻断，交给用户后可继续审批。
-- **审批前的判定顺序（`createAutoApprovalHandler`）**：`action === undefined` → 直接转人工（且**不建立签名**）；否则先查名单，`deny` 命中直接 `next()`、`allow` 命中直接 `allowed-once`（两者都不建 Reviewer）；都没命中才走模型审查。
+- **审批前的判定顺序（`createAutoApprovalHandler`）**：`action === undefined` → 直接转人工（且**不建立签名**）；否则先查名单，`deny` 命中直接 `next()`、`allow` 命中直接 `allowed-once`（两者都不建 Reviewer）；都没命中才走模型审查；`tests/policy-gate.spec.js` 用「`ctx.subagents.start` 一次都没被调用」把这一点钉死，并要求记录里带上 `policy.{list,scope,label}`（时间线据此显示命中名单）。
 - **签名的三条安全性质（防过的坑）**：① `action` 拿不到时不建签名——否则所有解析不出参数的请求塌缩成同一个空签名，会被一起自动放行；② 计数只认 `fromHuman`（插件自己放行不算）**且** `decision.policyHit === undefined`（刚被黑名单拦下的动作，用户这一次放行是单次决定，不该长成记忆规则）；③ 记忆规则只写 `signature`（精确）条件，只有用户手动升级才可能带 `command_prefix`/`path_prefix`。黑名单永远压过白名单。
 - `signatureOf` 会把字符串形态的 `arguments` 解析一层：`tool/call` 事件里 `arguments` 时而对象时而 JSON 字符串，字符串若不解析会退化成空参数签名，等于把一条规则放大到整个工具。
 - 策略文件：全局 `$DSH_HOME/dsh-auto-pass/policy.json`（阈值 + 全局名单 + 计数），项目 `<cwd>/.dsh-auto-pass/policy.json`（项目名单）。计数统一放全局文件、键带 `cwd` 前缀，所以项目目录只在真的写了项目规则时才多出 `.dsh-auto-pass/`。项目写盘失败自动降级写全局；策略 IO 失败只告警，绝不影响审批结论。
@@ -39,6 +39,9 @@
 - **必须导出 `exports["./package.json"]`（踩过坑，代价是四次重启）**：合成器 `dsh-client-modules` 的 `locatePkgJson` 在拿不到 loader `internal.resolveSync` 时走回退分支 `createRequire(baseUrl).resolve('<pkg>/package.json')`；本机 loader 恰好走的就是这条。`exports` 一旦是受限白名单（只有 `.` 与 `./client`），该调用抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`，被 `catch { return }` 吞掉 → `pkgMeta` 缓存 `null` → **本插件静默不入图：不报错、宿主日志无任何 warn、渲染器也不报 boot failed**，表现就是「各入口完全不存在」。已核对：图里 66 个 row 的第三方插件（dsh-context / dsh-todo-guard / dsh-change-review / dsh-better-sidebar / dsh-notify-me …）**全部**导出了 `./package.json`。`tests/package.spec.js` 把它钉成断言。
 - 排查「为什么不入图」的判定链（可复用）：宿主日志 probe 报 `graphEntries=66 graphHas=false` 且**无** client-modules 报错 → 不是 throw（throw 会 FATAL 掉整个 clientModules 服务，graphEntries 会变 0），只能是 `resolveMeta` 静默返回 `null`；再比对渲染器缓存里的 boot 清单（`__DSH_BOOT__` 内联在首屏 HTML 里，落在 `%APPDATA%\DSH Desktop\Partitions\dsh-desktop-renderer\Cache\Cache_Data`）确认 row 真的不在图里，而不是加载后才掉队。
 - **两个面板刻意分开**：对话区标签页 = 「审批设置」（阈值 + 项目/全局 × 白/黑名单），右侧栏 tab = 「审批时间线」（倒序记录 + 每条可升级/降级）。`placement` 的 `tab`/`sidebar` 现在各只留一处；`all` 两处都注册；`auto` 优先右侧栏、无座位退回对话区。
+- **布局要与对话等宽（读源码确认）**：对话区面板 = `.ap-frame`（`padding:16px calc(var(--dsh-composer-side-clearance,16px) + 16px) 24px`、`align-items:center`）里的 `.ap-col`（`width:100%;max-width:var(--dsh-chat-content-width,748px)`），再往里是一张张 `.ap-card`。这两个变量由会话根元素 `._0cyzDW_root` 下发（`publishWidths` 用 ResizeObserver 写 `--dsh-conversation-column-width`，`--dsh-chat-content-width = clamp(680px, column*0.64, 920px)`）；`conversation.view` 的内容渲染在 `._0cyzDW_viewArea` 里、是该根元素的后代，所以变量能继承到。官方插件 `dsh-client-ui-approval` / `dsh-client-ui-user-questions` 用的是同一套写法（照抄它们的对齐方式，别自己拍宽度）。
+- **设置页卡片必须渲染 `<li>`（踩过坑）**：`settings.plugin.item` 的宿主容器是 `ul.JMEyFa_cards`（外层 section `max-width:760px`），**整张卡片由插件自己拥有**。早期用 `<div>` + 内联 style，卡片样式一条都没生效，表现就是「设置里只有一段裸文字」。现在用 `card('li', …)` 复刻内置插件卡 `.TKtcza_card` 的外观（`.5px` 描边 `--dsw-alias-border-l4`、底色 `--dsw-alias-bg-layer-3`、16px 圆角、标题 15px/600 + 13px 说明）。
+- **时间线行内展示**：折叠态除时间/工具/结论外，还显示**审批意见**（`record.rationale`，CSS 两行截断）与**命中名单**徽标（`record.policy.list` → 白名单/黑名单 + 作用域 + 规则标签），所以命中名单时不展开也能看出为什么放行或转人工。
 - 项目目录的客户端来源：优先宿主 `sessions` 服务的 `list.getSnapshot().byId[sessionId].cwd`（照 dsh-context 的 `workspaceOf` 写法），拿不到就用本会话最新一条审批记录里的 `cwd`。**不要**把 `sessions` 写进 `exports.inject`——它只是可选探测，注入一个不存在的服务会让插件挂起。
 - 两处放置位置（参照 dsh-context 0.52.1 的实现）：
   - 对话标签页：`ctx.slots.inject('conversation.view', () => ctx.slots.register({ name:'conversation.view', id, order, label }, Cmp))`，出现位置就在「对话 / 轨迹」旁边。

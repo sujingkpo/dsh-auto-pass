@@ -161,6 +161,44 @@ describe('白名单与黑名单', () => {
     expect(ctx.subagents.start).not.toHaveBeenCalled()
   })
 
+  it('白名单命中的记录写清命中的是哪一侧与哪条规则（时间线据此显示白名单）', async () => {
+    const root = tempDir()
+    const policies = policyStore(root)
+    const request = requestWith()
+    expect(policies.addRule(signatureRuleFor(request, 'global', 'allow'), undefined).ok).toBe(true)
+
+    const records = { add: vi.fn(), list: () => [], size: () => 0 }
+    const outcome = await createAutoApprovalHandler(contextWith(), resolveConfig(), records, policies)(
+      request, vi.fn().mockResolvedValue('allowed-once'))
+
+    expect(outcome).toBe('allowed-once')
+    expect(records.add).toHaveBeenCalledOnce()
+    const record = records.add.mock.calls[0][0]
+    expect(record.verdict).toBe('allow')
+    expect(record.steps).toBe(0)
+    expect(record.policy.list).toBe('allow')
+    expect(record.policy.scope).toBe('global')
+    expect(record.policy.label).toContain('npm test')
+  })
+
+  it('黑名单命中的记录同样带上命中信息，结论是交给人工链', async () => {
+    const root = tempDir()
+    const policies = policyStore(root)
+    const request = requestWith()
+    expect(policies.addRule(signatureRuleFor(request, 'project', 'deny'), join(root, 'project')).ok).toBe(true)
+
+    const records = { add: vi.fn(), list: () => [], size: () => 0 }
+    const outcome = await createAutoApprovalHandler(contextWith(), resolveConfig(), records, policies)(
+      requestWith({ cwd: join(root, 'project') }), vi.fn().mockResolvedValue('rejected'))
+
+    expect(outcome).toBe('rejected')
+    const record = records.add.mock.calls[0][0]
+    expect(record.verdict).toBe('defer')
+    expect(record.policy.list).toBe('deny')
+    expect(record.policy.scope).toBe('project')
+    expect(record.policy.label).toContain('npm test')
+  })
+
   it('黑名单压过白名单', async () => {
     const root = tempDir()
     const policies = policyStore(root)

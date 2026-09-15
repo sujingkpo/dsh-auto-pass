@@ -8,6 +8,7 @@
  * @author simon300000
  * @date 2026-09-15
  * @modify 2026-09-15 对话区改放「审批设置」，时间线移入右侧栏并加升级/降级操作
+ * @modify 2026-09-15 面板改为与消息列同宽的居中卡片；时间线行内展示审批意见摘要
  */
 window.__ModuleLoader__.load({
   id: 'dsh-auto-pass',
@@ -89,7 +90,7 @@ window.__ModuleLoader__.load({
         outcomeCancelled: '已取消',
         risk: '风险',
         authorization: '授权',
-        rationale: '理由',
+        rationale: '审批意见',
         action: '动作',
         latency: '耗时',
         reviewer: 'Reviewer',
@@ -98,6 +99,8 @@ window.__ModuleLoader__.load({
         signature: '权限签名',
         suggestedRule: '模型建议规则',
         policyHit: '命中规则',
+        hitAllow: '白名单',
+        hitDeny: '黑名单',
         promoted: '已自动升级',
         applied: '已应用',
         approvals: '连续人工放行',
@@ -125,6 +128,7 @@ window.__ModuleLoader__.load({
         emptyList: '（空）',
         remove: '删除',
         projectUnknown: '还没有本会话的审批记录，暂时无法确定项目目录；本会话产生第一条审批记录后即可管理项目规则。',
+        cardName: '自动审批面板',
         placementTitle: '面板显示位置',
         placementDesc: '审批设置显示在对话标签页，审批时间线显示在右侧栏（auto 优先右侧栏，座位不可用时退回对话标签页）',
         placementAuto: '自动',
@@ -161,6 +165,8 @@ window.__ModuleLoader__.load({
         signature: 'Signature',
         suggestedRule: 'Suggested rule',
         policyHit: 'Matched rule',
+        hitAllow: 'Allowlist',
+        hitDeny: 'Denylist',
         promoted: 'Auto-promoted',
         applied: 'Applied',
         approvals: 'Consecutive manual approvals',
@@ -188,6 +194,7 @@ window.__ModuleLoader__.load({
         emptyList: '(empty)',
         remove: 'Remove',
         projectUnknown: 'No approval recorded in this session yet, so the project directory is unknown; project rules become manageable after the first approval in this session.',
+        cardName: 'Auto Approve panel',
         placementTitle: 'Panel placement',
         placementDesc: 'Approval policy lives in the conversation tab, the approval timeline in the right sidebar (auto prefers the sidebar and falls back to the conversation tab)',
         placementAuto: 'Auto',
@@ -203,7 +210,17 @@ window.__ModuleLoader__.load({
       const tag = document.createElement('style')
       tag.id = 'dsh-auto-pass-style'
       tag.textContent = [
-        '.ap-root{box-sizing:border-box;height:100%;min-height:0;display:flex;flex-direction:column;color:var(--dsw-alias-label-primary);font-size:13px}',
+        '.ap-root{box-sizing:border-box;flex:auto;min-height:0;height:100%;display:flex;flex-direction:column;color:var(--dsw-alias-label-primary);font-size:13px}',
+        // 对话区面板：内容列与消息列同宽并居中（--dsh-chat-content-width 由会话根元素下发，取不到时回退 748px）
+        '.ap-frame{flex:auto;min-height:0;overflow-y:auto;padding:16px calc(var(--dsh-composer-side-clearance,16px) + 16px) 24px;display:flex;flex-direction:column;align-items:center}',
+        '.ap-col{width:100%;max-width:var(--dsh-chat-content-width,748px);display:flex;flex-direction:column;gap:12px}',
+        // 卡片外观对齐设置页内置插件卡（.TKtcza_card）：.5px 描边 + 层三底色 + 16px 圆角
+        '.ap-card{box-sizing:border-box;border:.5px solid var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3);border-radius:16px;list-style:none}',
+        '.ap-cardHead{padding:14px 16px 0}',
+        '.ap-cardText{display:flex;flex-direction:column;gap:4px;min-width:0}',
+        '.ap-cardName{color:var(--dsw-alias-label-primary);font-size:15px;font-weight:600;line-height:1.4}',
+        '.ap-cardDesc{color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:1.5}',
+        '.ap-cardBody{border-top:.5px solid var(--dsw-alias-border-l2);margin:12px 16px 0;padding:12px 0 14px;display:flex;flex-direction:column;gap:10px;min-width:0}',
         '.ap-head{flex:none;display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-l1)}',
         '.ap-title{font-size:13px;font-weight:600;line-height:20px}',
         '.ap-sub{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}',
@@ -238,7 +255,12 @@ window.__ModuleLoader__.load({
         '.ap-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding-top:4px}',
         '.ap-actionsLabel{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;min-width:5.5em}',
         '.ap-note{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}',
-        '.ap-body{flex:auto;min-height:0;overflow-y:auto;padding:8px 12px 16px;display:flex;flex-direction:column;gap:14px}',
+        '.ap-rowMain{flex:auto;min-width:0;display:flex;flex-direction:column;gap:2px}',
+        '.ap-rowTop{display:flex;align-items:center;gap:8px;min-width:0}',
+        '.ap-opinion{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;text-align:left;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}',
+        // 命中名单的提示行：折叠态就要看得见命中的是白名单还是黑名单、哪一条规则
+        '.ap-hitRow{display:flex;align-items:center;gap:6px;min-width:0}',
+        '.ap-hitText{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;min-width:0;overflow-wrap:anywhere}',
         '.ap-sectionTitle{font-size:12px;font-weight:600;line-height:18px}',
         '.ap-subTitle{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;margin-top:4px}',
         '.ap-ruleList{list-style:none;margin:4px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}',
@@ -493,9 +515,17 @@ window.__ModuleLoader__.load({
         : scopeLabel(record.promotedRule.scope) + ' · ' + String(record.promotedRule.label ?? '')
       const hit = record.policy === undefined
         ? undefined
-        : scopeLabel(record.policy.scope) + ' / ' + (record.policy.list === 'allow' ? t.allowList : t.denyList) + ' · ' + String(record.policy.label ?? '')
+        : scopeLabel(record.policy.scope) + ' · ' + String(record.policy.label ?? '')
+      const hitBadge = record.policy === undefined
+        ? undefined
+        : record.policy.list === 'allow' ? t.hitAllow : t.hitDeny
+      const hitClass = record.policy?.list === 'allow' ? 'ap-badgeOk' : 'ap-badgeWarn'
       const approvals = typeof record.approvals === 'number' && record.approvals > 0
         ? String(record.approvals)
+        : undefined
+      // 审批意见：折叠态也要看得见，展开后是完整文本（CSS 限两行）
+      const opinion = typeof record.rationale === 'string' && record.rationale.trim() !== ''
+        ? record.rationale
         : undefined
       return react.createElement('li', { className: 'ap-row' },
         react.createElement('button', {
@@ -503,11 +533,17 @@ window.__ModuleLoader__.load({
           onClick: onToggle,
         },
           react.createElement('span', { className: 'ap-chevron', 'aria-hidden': 'true' }, open ? '▾' : '▸'),
-          react.createElement('span', { className: 'ap-time', title: String(record.time ?? '') }, formatTime(record.time)),
-          react.createElement('span', { className: 'ap-tool' }, String(record.toolName ?? '?')),
-          react.createElement('span', { className: 'ap-grow' }, ''),
-          react.createElement(VerdictBadge, { record }),
-          react.createElement(OutcomeBadge, { record })),
+          react.createElement('span', { className: 'ap-rowMain' },
+            react.createElement('span', { className: 'ap-rowTop' },
+              react.createElement('span', { className: 'ap-time', title: String(record.time ?? '') }, formatTime(record.time)),
+              react.createElement('span', { className: 'ap-tool' }, String(record.toolName ?? '?')),
+              react.createElement('span', { className: 'ap-grow' }, ''),
+              react.createElement(VerdictBadge, { record }),
+              react.createElement(OutcomeBadge, { record })),
+            opinion !== undefined && react.createElement('span', { className: 'ap-opinion' }, opinion),
+            hitBadge !== undefined && react.createElement('span', { className: 'ap-hitRow' },
+              react.createElement('span', { className: 'ap-badge ' + hitClass }, hitBadge),
+              react.createElement('span', { className: 'ap-hitText' }, hit)))),
         open === true && react.createElement('div', { className: 'ap-detail' },
           react.createElement(Field, { label: t.risk, value: record.riskLevel }),
           react.createElement(Field, { label: t.authorization, value: record.userAuthorization }),
@@ -575,11 +611,26 @@ window.__ModuleLoader__.load({
         error !== '' && react.createElement('span', { className: 'ap-note' }, error))
     }
 
+    /**
+     * 渲染一张卡片：设置页插件卡与对话区面板共用同一套外观。
+     * 设置页的容器是 ul，所以那里必须传 'li'——传 div 会拿不到任何卡片样式，
+     * 表现就是「设置里只有一段裸文字」。
+     */
+    function card(tag, title, desc, children) {
+      const body = children === undefined || children === null
+        ? []
+        : Array.isArray(children) ? children : [children]
+      return react.createElement(tag, { className: 'ap-card' },
+        react.createElement('div', { className: 'ap-cardHead' },
+          react.createElement('div', { className: 'ap-cardText' },
+            react.createElement('div', { className: 'ap-cardName' }, title),
+            desc === undefined || desc === '' ? null : react.createElement('div', { className: 'ap-cardDesc' }, desc))),
+        react.createElement.apply(null, ['div', { className: 'ap-cardBody' }].concat(body)))
+    }
+
     /** 设置页卡片：选择面板显示在哪里（写宿主设置命名空间，即时重挂）。 */
     function PlacementCard() {
-      return react.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', padding: '8px 0' } },
-        react.createElement('div', { style: { fontSize: 13, color: 'var(--dsw-alias-label-primary)' } }, t.placementDesc),
-        react.createElement(PlacementControl, null))
+      return card('li', t.cardName, t.placementDesc, react.createElement(PlacementControl, null))
     }
 
     /**
@@ -641,36 +692,36 @@ window.__ModuleLoader__.load({
           .catch(cause => setError(String(cause?.message ?? cause)))
       }
       void revision
+      // 内容列与消息列同宽并居中：一屏一卡，卡片外观与设置页保持一致
       return react.createElement('div', { className: 'ap-root' },
-        react.createElement('div', { className: 'ap-head' },
-          react.createElement('div', { className: 'ap-grow' },
-            react.createElement('div', { className: 'ap-title' }, t.settingsTitle),
-            react.createElement('div', { className: 'ap-sub' }, t.settingsDesc))),
-        react.createElement('div', { className: 'ap-body' },
-          react.createElement('div', { className: 'ap-row2' },
-            react.createElement('span', { className: 'ap-fieldKey' }, t.thresholdLabel),
-            react.createElement('input', {
-              className: 'ap-input',
-              type: 'number',
-              min: '1',
-              value: shownThreshold,
-              onChange: event => { setThreshold(event.target.value); setSaved(false) },
-            }),
-            react.createElement('span', { className: 'ap-note' }, t.thresholdUnit),
-            react.createElement('button', { type: 'button', className: 'ap-btn', onClick: save }, t.save),
-            saved && react.createElement('span', { className: 'ap-note' }, t.saved)),
-          react.createElement(PlacementControl, null),
-          react.createElement('div', null,
-            react.createElement('div', { className: 'ap-sectionTitle' }, t.globalScope),
-            react.createElement(RuleList, { scope: 'global', list: 'allow', title: t.allowList, rules: globalRules.allow, onRemove: remove }),
-            react.createElement(RuleList, { scope: 'global', list: 'deny', title: t.denyList, rules: globalRules.deny, onRemove: remove })),
-          cwd === undefined
-            ? react.createElement('div', { className: 'ap-note' }, t.projectUnknown)
-            : react.createElement('div', null,
-              react.createElement('div', { className: 'ap-sectionTitle' }, t.projectScope + ' · ' + cwd),
-              react.createElement(RuleList, { scope: 'project', list: 'allow', title: t.allowList, rules: projectRules?.allow ?? [], onRemove: remove }),
-              react.createElement(RuleList, { scope: 'project', list: 'deny', title: t.denyList, rules: projectRules?.deny ?? [], onRemove: remove })),
-          (error !== '' || policyStore.error !== '') && react.createElement('div', { className: 'ap-note' }, error !== '' ? error : policyStore.error)))
+        react.createElement('div', { className: 'ap-frame' },
+          react.createElement('div', { className: 'ap-col' },
+            card('section', t.settingsTitle, t.settingsDesc,
+              react.createElement('div', { className: 'ap-row2' },
+                react.createElement('span', { className: 'ap-fieldKey' }, t.thresholdLabel),
+                react.createElement('input', {
+                  className: 'ap-input',
+                  type: 'number',
+                  min: '1',
+                  value: shownThreshold,
+                  onChange: event => { setThreshold(event.target.value); setSaved(false) },
+                }),
+                react.createElement('span', { className: 'ap-note' }, t.thresholdUnit),
+                react.createElement('button', { type: 'button', className: 'ap-btn', onClick: save }, t.save),
+                saved && react.createElement('span', { className: 'ap-note' }, t.saved))),
+            card('section', t.globalScope, undefined, [
+              react.createElement(RuleList, { scope: 'global', list: 'allow', title: t.allowList, rules: globalRules.allow, onRemove: remove }),
+              react.createElement(RuleList, { scope: 'global', list: 'deny', title: t.denyList, rules: globalRules.deny, onRemove: remove }),
+            ]),
+            cwd === undefined
+              ? card('section', t.projectScope, t.projectUnknown, null)
+              : card('section', t.projectScope + ' · ' + cwd, undefined, [
+                react.createElement(RuleList, { scope: 'project', list: 'allow', title: t.allowList, rules: projectRules?.allow ?? [], onRemove: remove }),
+                react.createElement(RuleList, { scope: 'project', list: 'deny', title: t.denyList, rules: projectRules?.deny ?? [], onRemove: remove }),
+              ]),
+            card('section', t.placementTitle, undefined, react.createElement(PlacementControl, null)),
+            (error !== '' || policyStore.error !== '')
+              && react.createElement('div', { className: 'ap-note' }, error !== '' ? error : policyStore.error))))
     }
 
     /** 右侧栏「审批时间线」：倒序记录，展开即可把某条记录升级/降级成规则。 */
