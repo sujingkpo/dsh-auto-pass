@@ -20,6 +20,7 @@ function sampleRecords() {
       rationale: '用户明确要求运行测试。',
       steps: 0,
       latencyMs: 3,
+      decidedBy: 'auto',
       signature: { toolName: 'bash', key: 'bash:npm test', text: 'bash · npm test' },
       policy: { list: 'allow', scope: 'global', ruleId: 'rule-1', label: 'bash · npm test', kind: 'signature' },
     },
@@ -145,7 +146,9 @@ function harness() {
  * depth 上限只是防御性的，正常组件树很浅。
  */
 function evaluate(element, depth = 0) {
-  if (depth > 8) return element
+  // 注册进槽位的组件通常是包装组件（`props => <Panel {...props}/>`），一层包装就吃掉两层深度；
+  // 上限太小会把深层徽标原样返回（函数类型的 type 还会被 JSON.stringify 丢掉），断言就变成空转。
+  if (depth > 14) return element
   if (Array.isArray(element)) return element.map(child => evaluate(child, depth + 1))
   if (element === null || typeof element !== 'object') return element
   if (typeof element.type === 'function') return evaluate(element.type(element.props ?? {}), depth + 1)
@@ -279,6 +282,9 @@ describe('客户端半加载与注册', () => {
     expect(trees[1].includes('白名单')).toBe(true)
     expect(trees[1].includes('bash · npm test')).toBe(true)
     expect(trees[1].includes('黑名单')).toBe(true)
+    // 决策来源标签：与「命中名单」同一形态的 chip 行（不是塞在结论徽标前面）
+    expect(trees[1].includes('模型审查通过，插件自动放行')).toBe(true)
+    expect(trees[1].includes('人工审批 · 已拒绝')).toBe(true)
     expect(trees[1].includes('bash · rm -rf')).toBe(true)
     // 设置页卡片是放置位置选择器
     expect(trees[2].includes('面板显示位置')).toBe(true)

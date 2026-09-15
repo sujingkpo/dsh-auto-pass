@@ -986,6 +986,15 @@ function describeHit(hit) {
 }
 
 /**
+ * 这次结论是谁给的：插件自己自动放行的记 'auto'，其余（转交人工后通过/拒绝/无人应答）一律记 'human'。
+ * 时间线与注入通知都用它显示「自动 / 人工」标签。
+ */
+export function decisionSource(settled, decision) {
+  const pluginDecided = decision?.verdict === 'allow' || decision?.policyHit?.list === 'allow'
+  return pluginDecided && settled === 'allowed-once' ? 'auto' : 'human'
+}
+
+/**
  * 把一次审批结果翻译成计数信号。模型判定 deny 与人工拒绝都算「拒绝」，最终获准执行才算
  * 「通过」——插件自己放行的与用户放行的都算通过：两种路径都代表这次判断结果是「可以执行」。
  * 其余结果（cancelled / unavailable）不参与计数。
@@ -1237,6 +1246,8 @@ function buildRecord(request, action, outcome, decision, latencyMs, signature, o
     steps: decision.steps,
     route: decision.route,
     outcome: typeof outcome === 'string' ? outcome : String(outcome),
+    // 决策来源：时间线与通知据此显示「自动 / 人工」
+    decidedBy: decisionSource(outcome, decision),
     latencyMs,
     ...(actionText === undefined ? {} : { action: truncateText(actionText, MAX_RECORD_ACTION_CHARS) }),
     // command / paths 也存下来：时间线上的手动升级要现场起一次规则优化调用，需要这些字段
@@ -1670,6 +1681,8 @@ const NOTICE_LABELS = Object.freeze({
     steps: steps => `${steps} 步`,
     rationale: '理由：',
     policy: '命中：',
+    tagAuto: '[自动]',
+    tagHuman: '[人工]',
   }),
   en: Object.freeze({
     allowedHeadline: toolName => `Auto Approve allowed ${toolName}`,
@@ -1680,6 +1693,8 @@ const NOTICE_LABELS = Object.freeze({
     steps: steps => `${steps} steps`,
     rationale: 'Rationale: ',
     policy: 'Matched: ',
+    tagAuto: '[auto]',
+    tagHuman: '[human]',
   }),
 })
 
@@ -1697,7 +1712,9 @@ function injectReviewNotice(ctx, request, review, language) {
     ? review.rationale
     : `${review.rationale.slice(0, MAX_NOTICE_REASON_CHARS - 1)}…`
   const parts = [
-    allowed ? labels.allowedHeadline(request.toolName) : labels.deferredHeadline(request.toolName),
+    // 标签在最前：一眼看出这次是插件自动决定的，还是交回人工的
+    (allowed ? labels.tagAuto : labels.tagHuman)
+      + ' ' + (allowed ? labels.allowedHeadline(request.toolName) : labels.deferredHeadline(request.toolName)),
     ...(review.policyHit === undefined
       ? []
       : [labels.policy + review.policyHit.list + ' · ' + String(review.policyHit.label ?? '')]),

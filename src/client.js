@@ -106,6 +106,12 @@ window.__ModuleLoader__.load({
         applied: '已应用',
         approvals: '连续放行',
         denials: '连续被拒',
+        decidedAuto: '自动',
+        decidedHuman: '人工',
+        decidedBy: '决策来源',
+        decidedAutoText: '模型审查通过，插件自动放行',
+        decidedHumanText: '人工审批',
+        decidedUnknown: '无人工结论',
         ruleAsk: '规则询问',
         ruleDeclined: '已询问，未加入',
         promote: '升级为白名单',
@@ -182,6 +188,12 @@ window.__ModuleLoader__.load({
         applied: 'Applied',
         approvals: 'Consecutive approvals',
         denials: 'Consecutive denials',
+        decidedAuto: 'auto',
+        decidedHuman: 'human',
+        decidedBy: 'Decided by',
+        decidedAutoText: 'reviewed by the model, allowed automatically',
+        decidedHumanText: 'human decision',
+        decidedUnknown: 'no human outcome',
         ruleAsk: 'Rule prompt',
         ruleDeclined: 'Asked, not added',
         promote: 'Promote to allowlist',
@@ -268,6 +280,8 @@ window.__ModuleLoader__.load({
         '.ap-badgeOk{color:var(--dsw-alias-state-success-primary);background:var(--dsw-alias-state-success-tertiary)}',
         '.ap-badgeWarn{color:var(--dsw-alias-state-warn-primary);background:var(--dsw-alias-state-warn-tertiary)}',
         '.ap-badgeMuted{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-base)}',
+        // 「自动」标签用业务色，「人工」标签用中性色：与命中名单的绿/黄区分开
+        '.ap-badgeInfo{color:var(--dsw-alias-state-business-primary);background:var(--dsw-alias-state-business-tertiary)}',
         '.ap-chevron{flex:none;color:var(--dsw-alias-label-tertiary)}',
         '.ap-detail{padding:0 12px 10px;display:flex;flex-direction:column;gap:4px}',
         '.ap-field{display:flex;gap:6px;align-items:baseline}',
@@ -283,7 +297,7 @@ window.__ModuleLoader__.load({
         '.ap-rowMain{flex:auto;min-width:0;display:flex;flex-direction:column;gap:2px}',
         '.ap-rowTop{display:flex;align-items:center;gap:8px;min-width:0}',
         '.ap-opinion{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;text-align:left;overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical}',
-        // 命中名单的提示行：折叠态就要看得见命中的是白名单还是黑名单、哪一条规则
+        // 标签行（决策来源 / 命中名单共用）：chip + 说明文字，折叠态就能看见
         '.ap-hitRow{display:flex;align-items:center;gap:6px;min-width:0}',
         '.ap-hitText{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;min-width:0;overflow-wrap:anywhere}',
         '.ap-sectionTitle{font-size:12px;font-weight:600;line-height:18px}',
@@ -470,6 +484,13 @@ window.__ModuleLoader__.load({
         react.createElement('span', { className: 'ap-fieldVal' + (mono === true ? ' ap-mono' : '') }, String(value)))
     }
 
+/** 记录里的决策来源；老记录没有这个字段时按 verdict / outcome 兜底推断。 */
+    function decidedByOf(record) {
+      if (record.decidedBy === 'auto' || record.decidedBy === 'human') return record.decidedBy
+      const pluginDecided = record.verdict === 'allow' || record.policy?.list === 'allow'
+      return pluginDecided && record.outcome === 'allowed-once' ? 'auto' : 'human'
+    }
+
     /** 结论徽标：插件自身只可能给 allow，其余都是转交用户。 */
     function VerdictBadge({ record }) {
       const allow = record.verdict === 'allow'
@@ -482,18 +503,36 @@ window.__ModuleLoader__.load({
       }, label)
     }
 
-    /** 最终结果徽标：转人工的记录才需要展示人工侧结果。 */
-    function OutcomeBadge({ record }) {
-      if (record.verdict === 'allow') return null
+    /** 人工侧结论的文案与徽标样式；没有人工结论时返回 undefined。 */
+    function outcomeOf(record) {
       const map = {
         'allowed-once': [t.outcomeAllowed, 'ap-badgeOk'],
         rejected: [t.outcomeRejected, 'ap-badgeWarn'],
         unavailable: [t.outcomeUnavailable, 'ap-badgeMuted'],
         cancelled: [t.outcomeCancelled, 'ap-badgeMuted'],
       }
-      const hit = map[record.outcome]
+      return map[record.outcome]
+    }
+
+    /** 最终结果徽标：转人工的记录才需要展示人工侧结果。 */
+    function OutcomeBadge({ record }) {
+      if (record.verdict === 'allow') return null
+      const hit = outcomeOf(record)
       if (hit === undefined) return null
       return react.createElement('span', { className: 'ap-badge ' + hit[1] }, hit[0])
+    }
+
+    /** 决策来源那个标签行：与「命中名单」同一形态（chip + 说明文字）。 */
+    function DecidedRow({ record }) {
+      const auto = decidedByOf(record) === 'auto'
+      const outcome = outcomeOf(record)
+      const text = auto
+        ? t.decidedAutoText
+        : t.decidedHumanText + ' · ' + (outcome === undefined ? t.decidedUnknown : outcome[0])
+      return react.createElement('span', { className: 'ap-hitRow' },
+        react.createElement('span', { className: 'ap-badge ' + (auto ? 'ap-badgeInfo' : 'ap-badgeMuted') },
+          auto ? t.decidedAuto : t.decidedHuman),
+        react.createElement('span', { className: 'ap-hitText' }, text))
     }
 
     /** 时间戳格式化：完整时间放 title，行内只显示到秒。 */
@@ -591,6 +630,7 @@ window.__ModuleLoader__.load({
               react.createElement(VerdictBadge, { record }),
               react.createElement(OutcomeBadge, { record })),
             opinion !== undefined && react.createElement('span', { className: 'ap-opinion' }, opinion),
+            react.createElement(DecidedRow, { record }),
             hitBadge !== undefined && react.createElement('span', { className: 'ap-hitRow' },
               react.createElement('span', { className: 'ap-badge ' + hitClass }, hitBadge),
               react.createElement('span', { className: 'ap-hitText' }, hit)))),
@@ -606,6 +646,7 @@ window.__ModuleLoader__.load({
           react.createElement(Field, { label: t.applied, value: applied }),
           react.createElement(Field, { label: t.promoted, value: promoted }),
           react.createElement(Field, { label: t.approvals, value: approvals }),
+          react.createElement(Field, { label: t.decidedBy, value: decidedByOf(record) === 'auto' ? t.decidedAuto : t.decidedHuman }),
           react.createElement(Field, { label: t.denials, value: record.denials === undefined || record.denials === 0 ? undefined : String(record.denials) }),
           react.createElement(Field, { label: t.ruleAsk, value: declined }),
           react.createElement(Field, { label: t.latency, value: record.latencyMs === undefined ? undefined : String(record.latencyMs) + ' ms' }),

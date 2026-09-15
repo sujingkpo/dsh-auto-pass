@@ -271,6 +271,7 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     const notice = request.agent.inject.mock.calls.at(-1)[0]
     // 通知只占一行：会进模型上下文，Reviewer 会话等细节留在时间线与宿主日志里
     expect(notice.content).toHaveLength(1)
+    expect(notice.content[0].text.startsWith('[自动]')).toBe(true)
     expect(notice.content[0].text).toContain('Auto Approve 已自动批准 bash')
     expect(notice.content[0].text).toContain('low/high')
     expect(notice.content[0].text).not.toContain('\n')
@@ -289,6 +290,7 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(next).toHaveBeenCalledOnce()
     expect(request.agent.cancel).not.toHaveBeenCalled()
     const notice = request.agent.inject.mock.calls.at(-1)[0]
+    expect(notice.content[0].text.startsWith('[人工]')).toBe(true)
     expect(notice.content[0].text).toContain('Auto Approve 未自动批准 bash，已转交你审批')
     expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).toContain('理由：提权范围超过运行测试所需。')
@@ -343,6 +345,8 @@ describe('Auto Approve Reviewer 子 Agent', () => {
       reviewerSessionId: 'reviewer-session-1',
       steps: 2,
       route: { provider: 'reviewer', model: 'safe-model' },
+      // 插件自己决定的：时间线与通知都显示「自动」
+      decidedBy: 'auto',
     })
     expect(typeof entry.latencyMs).toBe('number')
     expect(entry.action).toContain('npm test')
@@ -361,6 +365,8 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(records.add.mock.calls[0][0]).toMatchObject({
       verdict: 'deny',
       outcome: 'allowed-once',
+      // 结论来自人工审批链（先被模型拒绝，再交用户放行）：显示「人工」
+      decidedBy: 'human',
       riskLevel: 'high',
       userAuthorization: 'low',
     })
@@ -377,7 +383,7 @@ describe('Auto Approve Reviewer 子 Agent', () => {
 
     expect(outcome).toBe('rejected')
     expect(ctx.subagents.start).not.toHaveBeenCalled()
-    expect(records.add.mock.calls[0][0]).toMatchObject({ verdict: 'defer', outcome: 'rejected', steps: 0 })
+    expect(records.add.mock.calls[0][0]).toMatchObject({ verdict: 'defer', outcome: 'rejected', steps: 0, decidedBy: 'human' })
   })
 
   it('写入记录抛错也不改变审批结论', async () => {
@@ -713,6 +719,7 @@ describe('审查语言自动选择', () => {
     expect(start.prompt[0].text).toContain('Review context')
     expect(start.prompt[0].text).not.toContain('审查上下文')
     const notice = request.agent.inject.mock.calls.at(-1)[0]
+    expect(notice.content[0].text.startsWith('[auto]')).toBe(true)
     expect(notice.content[0].text).toContain('Auto Approve allowed bash')
     expect(notice.content[0].text).not.toContain('Reviewer session')
     expect(notice.content[0].text).not.toContain('\n')
@@ -738,6 +745,7 @@ describe('审查语言自动选择', () => {
       .toBe('rejected')
     expect(failedNext).toHaveBeenCalledOnce()
     const deferredNotice = failed.agent.inject.mock.calls.at(-1)[0]
+    expect(deferredNotice.content[0].text.startsWith('[human]')).toBe(true)
     expect(deferredNotice.content[0].text)
       .toContain('Auto Approve did not allow bash; handed to you')
     expect(deferredNotice.content[0].text)
