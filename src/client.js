@@ -1,10 +1,13 @@
 /**
- * @description dsh-auto-pass 客户端半：把审批记录注册成「对话区标签页」或「右侧栏标签页」
- *   的时间轴面板（倒序）。放置位置参照 dsh-context：placement=auto 时优先右侧栏座位
- *   （ctx.sidebarRightTabs），座位不可用则退回对话区 conversation.view 标签页；
- *   放置位置默认值来自宿主 config（默认 all），设置页卡片可通过宿主设置命名空间覆盖它。
+ * @description dsh-auto-pass 客户端半：注册两个面板——
+ *   1) 对话区标签页「审批设置」：连续放行阈值 + 项目/全局 × 白名单/黑名单的查看与撤销；
+ *   2) 右侧栏「审批时间线」：倒序展示审批记录，并支持把某条记录一键升级为白名单
+ *      （以后直接放行）或降级为黑名单（以后直接转人工）；规则文本由 Reviewer 模型产出，
+ *      记录里没有模型建议时精确回落到该次动作签名。
+ *   放置位置参照 dsh-context：placement=auto 时优先右侧栏座位，座位不可用退回对话标签页。
  * @author simon300000
  * @date 2026-09-15
+ * @modify 2026-09-15 对话区改放「审批设置」，时间线移入右侧栏并加升级/降级操作
  */
 window.__ModuleLoader__.load({
   id: 'dsh-auto-pass',
@@ -16,9 +19,11 @@ window.__ModuleLoader__.load({
 
     /** 客户端日志前缀。 */
     const LOG = '[dsh-auto-pass]'
-    /** 审批记录接口。 */
+    /** 宿主接口。 */
     const API_CONFIG = '/api/dsh-auto-pass/config'
     const API_LOG = '/api/dsh-auto-pass/log'
+    const API_POLICY = '/api/dsh-auto-pass/policy'
+    const API_RULE = '/api/dsh-auto-pass/rule'
     /** 启动信标：把客户端半走到哪一步写进宿主日志（排查「看不到面板」用）。 */
     const API_BEACON = '/api/dsh-auto-pass/beacon'
     /** 时间轴轮询间隔（毫秒）。 */
@@ -41,7 +46,8 @@ window.__ModuleLoader__.load({
         trail.push(stage + (detail === '' ? '' : '(' + detail + ')'))
         localStorage.setItem('dsh-auto-pass:boot', JSON.stringify(trail.slice(-24)))
       } catch (error) {
-        // localStorage 不可用时只靠宿主日志
+        // localStorage 不可用时只靠宿主日志；这里不打断流程
+        void error
       }
       try {
         void fetch(API_BEACON + '?stage=' + encodeURIComponent(stage) + '&detail=' + encodeURIComponent(detail), {
@@ -49,22 +55,25 @@ window.__ModuleLoader__.load({
         }).catch(() => {})
       } catch (error) {
         // fetch 本身不可用时忽略
+        void error
       }
     }
     try {
       localStorage.removeItem('dsh-auto-pass:boot')
     } catch (error) {
-      // 忽略：清掉上一轮轨迹
+      // 清不掉上一轮轨迹不影响功能
+      void error
     }
     beacon('factory')
 
-    /** 界面语言：跟随浏览器语言，简体/繁体中文都用中文文案。 */
+    /** 取界面语言：跟随浏览器语言，中文用简体文案。 */
     const ZH = /^zh/i.test(typeof navigator === 'object' && navigator !== null ? String(navigator.language ?? '') : '')
     const COPY = {
       zh: {
-        tabLabel: '审批记录',
-        guideDescription: 'Auto Approve 的自动批准与转人工记录',
-        title: '审批记录',
+        timelineTab: '审批时间线',
+        policyTab: '审批设置',
+        guideDescription: 'Auto Approve 的自动批准与转人工记录，可一键升级为白名单或降级为黑名单',
+        title: '审批时间线',
         subtitle: '最新的在最上面',
         scopeSession: '本次会话',
         scopeAll: '全部会话',
@@ -86,17 +95,48 @@ window.__ModuleLoader__.load({
         reviewer: 'Reviewer',
         reason: '审批原因',
         time: '时间',
-        settingsTitle: '审批记录位置',
-        settingsDesc: 'Auto Approve 审批记录显示在哪里（auto 优先右侧栏，座位不可用时退回对话标签页）',
+        signature: '权限签名',
+        suggestedRule: '模型建议规则',
+        policyHit: '命中规则',
+        promoted: '已自动升级',
+        applied: '已应用',
+        approvals: '连续人工放行',
+        promote: '升级为白名单',
+        demote: '降级为黑名单',
+        scopeProject: '本项目',
+        scopeGlobal: '全局',
+        working: '处理中…',
+        sourceUser: '手动',
+        sourceModel: '模型',
+        sourceMemory: '记忆',
+        kindSignature: '精确签名',
+        kindCommandPrefix: '命令前缀',
+        kindPathPrefix: '路径前缀',
+        settingsTitle: '审批设置',
+        settingsDesc: '连续人工放行达到阈值后，该权限会被自动升级为免审查规则（以后直接放行）。',
+        thresholdLabel: '连续人工放行阈值',
+        thresholdUnit: '次',
+        save: '保存',
+        saved: '已保存',
+        globalScope: '全局（所有项目）',
+        projectScope: '项目',
+        allowList: '白名单 · 直接放行',
+        denyList: '黑名单 · 直接转人工',
+        emptyList: '（空）',
+        remove: '删除',
+        projectUnknown: '还没有本会话的审批记录，暂时无法确定项目目录；本会话产生第一条审批记录后即可管理项目规则。',
+        placementTitle: '面板显示位置',
+        placementDesc: '审批设置显示在对话标签页，审批时间线显示在右侧栏（auto 优先右侧栏，座位不可用时退回对话标签页）',
         placementAuto: '自动',
-        placementTab: '对话标签页',
-        placementSidebar: '右侧栏',
+        placementTab: '只保留审批设置',
+        placementSidebar: '只保留时间线',
         placementAll: '两处都显示',
       },
       en: {
-        tabLabel: 'Approvals',
-        guideDescription: 'Auto Approve auto-approvals and hand-offs',
-        title: 'Approval log',
+        timelineTab: 'Approval timeline',
+        policyTab: 'Approval policy',
+        guideDescription: 'Auto Approve auto-approvals and hand-offs; promote or demote each one',
+        title: 'Approval timeline',
         subtitle: 'newest first',
         scopeSession: 'This session',
         scopeAll: 'All sessions',
@@ -118,11 +158,41 @@ window.__ModuleLoader__.load({
         reviewer: 'Reviewer',
         reason: 'Approval reason',
         time: 'Time',
-        settingsTitle: 'Approval log placement',
-        settingsDesc: 'Where Auto Approve records its approvals (auto prefers the right sidebar and falls back to a conversation tab)',
+        signature: 'Signature',
+        suggestedRule: 'Suggested rule',
+        policyHit: 'Matched rule',
+        promoted: 'Auto-promoted',
+        applied: 'Applied',
+        approvals: 'Consecutive manual approvals',
+        promote: 'Promote to allowlist',
+        demote: 'Demote to denylist',
+        scopeProject: 'This project',
+        scopeGlobal: 'Global',
+        working: 'Working…',
+        sourceUser: 'manual',
+        sourceModel: 'model',
+        sourceMemory: 'memory',
+        kindSignature: 'exact signature',
+        kindCommandPrefix: 'command prefix',
+        kindPathPrefix: 'path prefix',
+        settingsTitle: 'Approval policy',
+        settingsDesc: 'After this many consecutive manual approvals the permission is promoted to a rule that needs no review.',
+        thresholdLabel: 'Consecutive approval threshold',
+        thresholdUnit: 'times',
+        save: 'Save',
+        saved: 'Saved',
+        globalScope: 'Global (all projects)',
+        projectScope: 'Project',
+        allowList: 'Allowlist · allowed directly',
+        denyList: 'Denylist · handed to the user',
+        emptyList: '(empty)',
+        remove: 'Remove',
+        projectUnknown: 'No approval recorded in this session yet, so the project directory is unknown; project rules become manageable after the first approval in this session.',
+        placementTitle: 'Panel placement',
+        placementDesc: 'Approval policy lives in the conversation tab, the approval timeline in the right sidebar (auto prefers the sidebar and falls back to the conversation tab)',
         placementAuto: 'Auto',
-        placementTab: 'Conversation tab',
-        placementSidebar: 'Right sidebar',
+        placementTab: 'Policy only',
+        placementSidebar: 'Timeline only',
         placementAll: 'Both',
       },
     }
@@ -144,6 +214,9 @@ window.__ModuleLoader__.load({
         '.ap-seg button[data-on="1"]{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}',
         '.ap-btn{appearance:none;flex:none;border:1px solid var(--dsw-alias-border-l1);background:0 0;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:18px;border-radius:8px;padding:2px 8px;cursor:pointer}',
         '.ap-btn:hover{border-color:var(--dsw-alias-label-dimmed)}',
+        '.ap-btn:disabled{opacity:.5;cursor:default}',
+        '.ap-btnPrimary{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}',
+        '.ap-btnDanger{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}',
         '.ap-list{flex:auto;min-height:0;overflow-y:auto;margin:0;padding:4px 0 12px;list-style:none}',
         '.ap-row{border-bottom:1px solid var(--dsw-alias-border-l1)}',
         '.ap-rowHead{width:100%;appearance:none;border:0;background:0 0;font:inherit;text-align:left;color:inherit;display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer}',
@@ -162,10 +235,20 @@ window.__ModuleLoader__.load({
         '.ap-mono{font-family:var(--dsw-font-family-mono,ui-monospace,monospace);font-size:11px}',
         '.ap-empty{color:var(--dsw-alias-label-tertiary);padding:16px 12px}',
         '.ap-error{color:var(--dsw-alias-state-warn-primary);padding:6px 12px;font-size:11px}',
+        '.ap-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding-top:4px}',
+        '.ap-actionsLabel{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;min-width:5.5em}',
+        '.ap-note{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}',
+        '.ap-body{flex:auto;min-height:0;overflow-y:auto;padding:8px 12px 16px;display:flex;flex-direction:column;gap:14px}',
+        '.ap-sectionTitle{font-size:12px;font-weight:600;line-height:18px}',
+        '.ap-subTitle{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;margin-top:4px}',
+        '.ap-ruleList{list-style:none;margin:4px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}',
+        '.ap-rule{display:flex;align-items:baseline;gap:6px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:4px 6px}',
+        '.ap-ruleLabel{min-width:0;flex:auto;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere}',
+        '.ap-input{appearance:none;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:0 0;color:inherit;font:inherit;font-size:12px;line-height:18px;padding:2px 8px;width:5em}',
+        '.ap-row2{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
       ].join('\n')
       ;(document.head || document.documentElement).appendChild(tag)
     }
-
     /** 记录图标：一个带勾的时间轴时钟，用于引导页胶囊。 */
     function LogGlyph({ size }) {
       const edge = typeof size === 'number' && size > 0 ? size : 16
@@ -181,7 +264,7 @@ window.__ModuleLoader__.load({
 
     /**
      * placement 状态：唯一真值在宿主（config 默认值 + 设置命名空间覆盖）。
-     * 设置页卡片与挂载逻辑共用它，任何变更都会广播给订阅者重新挂载。
+     * 设置页卡片、审批设置面板与挂载逻辑共用它，任何变更都会广播给订阅者重新挂载。
      */
     const placementStore = {
       value: 'all',
@@ -217,6 +300,113 @@ window.__ModuleLoader__.load({
         if (data?.ok !== true) throw new Error(String(data?.error ?? 'save failed'))
         this.set(typeof data.placement === 'string' ? data.placement : next)
       },
+    }
+
+    /** 客户端上下文：applyInner 时捕获，供组件里访问宿主客户端服务（sessions 等）。 */
+    let clientCtx
+
+    /**
+     * 取当前会话的工作目录（项目作用域规则要用）。真值来自宿主 sessions 服务的
+     * 会话列表快照；服务缺失或字段不对时返回 undefined，任何异常都吞掉——
+     * 拿不到项目目录只影响项目规则的展示，不该让面板白屏。
+     */
+    function workspaceOf(sessionId) {
+      if (typeof sessionId !== 'string' || sessionId === '') return undefined
+      try {
+        const sessions = typeof clientCtx?.get === 'function' ? clientCtx.get('sessions') : undefined
+        const snapshot = typeof sessions?.list?.getSnapshot === 'function' ? sessions.list.getSnapshot() : undefined
+        const row = snapshot !== null && typeof snapshot === 'object' && snapshot.byId !== undefined
+          ? snapshot.byId[sessionId]
+          : undefined
+        const cwd = row !== null && typeof row === 'object' ? row.cwd : undefined
+        return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
+      } catch (error) {
+        console.warn(LOG, '读取会话工作目录失败', error)
+        return undefined
+      }
+    }
+
+    /** 策略快照的客户端缓存：设置面板与时间线共用，任何变更广播给订阅者。 */
+    const policyStore = {
+      value: undefined,
+      error: '',
+      cwd: undefined,
+      listeners: new Set(),
+      subscribe(listener) {
+        this.listeners.add(listener)
+        return () => { this.listeners.delete(listener) }
+      },
+      emit() {
+        for (const listener of [...this.listeners]) listener()
+      },
+      /** 拉一次策略快照；cwd 给定时一并更新项目作用域。 */
+      async load(cwd) {
+        if (cwd !== undefined) this.cwd = cwd
+        const query = this.cwd === undefined ? '' : '?cwd=' + encodeURIComponent(this.cwd)
+        try {
+          const response = await fetch(API_POLICY + query, { headers: { accept: 'application/json' } })
+          const data = await response.json()
+          if (data === null || typeof data !== 'object' || data.ok !== true) {
+            throw new Error(String(data?.error ?? 'bad response'))
+          }
+          this.value = data
+          this.error = ''
+        } catch (error) {
+          this.error = String(error?.message ?? error)
+        }
+        this.emit()
+      },
+      /** 写策略（改阈值 / 删规则）；成功后自动重拉快照。 */
+      async post(body) {
+        const response = await fetch(API_POLICY, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+        const data = await response.json()
+        if (data === null || typeof data !== 'object' || data.ok !== true) {
+          throw new Error(String(data?.error ?? 'policy write failed'))
+        }
+        await this.load()
+        return data
+      },
+    }
+
+    /**
+     * 把一条审批记录升级/降级成规则。规则文本由宿主依据记录里的模型建议产出，
+     * 没有建议时精确回落到该次动作签名——客户端只负责发起与刷新。
+     */
+    async function promoteRecord(recordId, scope, list) {
+      const response = await fetch(API_RULE, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ recordId, scope, list }),
+      })
+      const data = await response.json()
+      if (data === null || typeof data !== 'object' || data.ok !== true) {
+        throw new Error(String(data?.error ?? 'rule write failed'))
+      }
+      await policyStore.load()
+      return data
+    }
+
+    /** 规则来源文案。 */
+    function sourceLabel(source) {
+      if (source === 'model') return t.sourceModel
+      if (source === 'memory') return t.sourceMemory
+      return t.sourceUser
+    }
+
+    /** 匹配条件文案。 */
+    function kindLabel(kind) {
+      if (kind === 'command_prefix') return t.kindCommandPrefix
+      if (kind === 'path_prefix') return t.kindPathPrefix
+      return t.kindSignature
+    }
+
+    /** 作用域文案。 */
+    function scopeLabel(scope) {
+      return scope === 'project' ? t.scopeProject : t.scopeGlobal
     }
 
     /** 把一组字段渲染成详情行。 */
@@ -261,9 +451,52 @@ window.__ModuleLoader__.load({
       return pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds())
     }
 
-    /** 单条记录：折叠只显示概要，展开显示风险/授权/理由/动作等。 */
-    function RecordRow({ record, open, onToggle }) {
+    /** 升级/降级按钮组：两种名单 × 两种作用域，作用域真值由宿主按记录里的 cwd 决定。 */
+    function RuleActions({ record, onDone }) {
+      const [busy, setBusy] = react.useState(false)
+      const [error, setError] = react.useState('')
+      const run = (list, scope) => {
+        setBusy(true)
+        setError('')
+        promoteRecord(record.id, scope, list)
+          .then(() => { if (typeof onDone === 'function') onDone() })
+          .catch(cause => setError(String(cause?.message ?? cause)))
+          .finally(() => setBusy(false))
+      }
+      const scopeButtons = (list, className) => ['project', 'global'].map(scope => react.createElement('button', {
+        key: list + ':' + scope,
+        type: 'button',
+        className: 'ap-btn ' + className,
+        disabled: busy || typeof record.id !== 'string',
+        onClick: () => run(list, scope),
+      }, scope === 'project' ? t.scopeProject : t.scopeGlobal))
+      return react.createElement('div', { className: 'ap-actions' },
+        react.createElement('span', { className: 'ap-actionsLabel' }, t.promote),
+        ...scopeButtons('allow', 'ap-btnPrimary'),
+        react.createElement('span', { className: 'ap-actionsLabel' }, t.demote),
+        ...scopeButtons('deny', 'ap-btnDanger'),
+        busy && react.createElement('span', { className: 'ap-note' }, t.working),
+        error !== '' && react.createElement('span', { className: 'ap-note' }, error))
+    }
+
+    /** 单条记录：折叠只显示概要，展开显示风险/授权/理由/动作，以及升级/降级操作。 */
+    function RecordRow({ record, open, onToggle, onChanged }) {
       const route = record.route === undefined ? undefined : record.route.provider + '/' + record.route.model
+      const suggested = record.suggestedRule === undefined
+        ? undefined
+        : record.suggestedRule.label + '（' + kindLabel(record.suggestedRule.match?.kind) + '：' + String(record.suggestedRule.match?.value ?? '') + '）'
+      const applied = record.ruleApplied === undefined
+        ? undefined
+        : scopeLabel(record.ruleApplied.scope) + ' / ' + (record.ruleApplied.list === 'allow' ? t.allowList : t.denyList) + ' · ' + String(record.ruleApplied.label ?? '')
+      const promoted = record.promotedRule === undefined
+        ? undefined
+        : scopeLabel(record.promotedRule.scope) + ' · ' + String(record.promotedRule.label ?? '')
+      const hit = record.policy === undefined
+        ? undefined
+        : scopeLabel(record.policy.scope) + ' / ' + (record.policy.list === 'allow' ? t.allowList : t.denyList) + ' · ' + String(record.policy.label ?? '')
+      const approvals = typeof record.approvals === 'number' && record.approvals > 0
+        ? String(record.approvals)
+        : undefined
       return react.createElement('li', { className: 'ap-row' },
         react.createElement('button', {
           type: 'button', className: 'ap-rowHead', 'aria-expanded': open,
@@ -281,13 +514,167 @@ window.__ModuleLoader__.load({
           react.createElement(Field, { label: t.rationale, value: record.rationale }),
           react.createElement(Field, { label: t.reason, value: record.reason }),
           react.createElement(Field, { label: t.action, value: record.action, mono: true }),
+          react.createElement(Field, { label: t.signature, value: record.signature === undefined ? undefined : record.signature.text, mono: true }),
+          react.createElement(Field, { label: t.suggestedRule, value: suggested }),
+          react.createElement(Field, { label: t.policyHit, value: hit }),
+          react.createElement(Field, { label: t.applied, value: applied }),
+          react.createElement(Field, { label: t.promoted, value: promoted }),
+          react.createElement(Field, { label: t.approvals, value: approvals }),
           react.createElement(Field, { label: t.latency, value: record.latencyMs === undefined ? undefined : String(record.latencyMs) + ' ms' }),
           react.createElement(Field, { label: t.reviewer, value: [record.reviewerSessionId, record.steps === undefined ? undefined : record.steps + ' steps'].filter(Boolean).join(' · ') }),
-          react.createElement(Field, { label: t.time, value: record.time })))
+          react.createElement(Field, { label: t.time, value: record.time }),
+          // 升级/降级需要记录的签名或模型建议；更早版本留下的老记录两者都没有，不显示死按钮
+          (record.signature !== undefined || record.suggestedRule !== undefined)
+            && react.createElement(RuleActions, { record, onDone: onChanged })))
     }
 
-    /** 时间轴面板：对话标签页与右侧栏 tab 共用同一个组件。 */
-    function ApprovalLogPanel(props) {
+    /** 一组规则的列表：显示标签、来源、匹配条件，并可删除。 */
+    function RuleList({ scope, list, title, rules, onRemove }) {
+      return react.createElement('div', null,
+        react.createElement('div', { className: 'ap-subTitle' }, title),
+        rules.length === 0
+          ? react.createElement('div', { className: 'ap-note' }, t.emptyList)
+          : react.createElement('ul', { className: 'ap-ruleList' },
+            rules.map(rule => react.createElement('li', { className: 'ap-rule', key: String(rule.id) },
+              react.createElement('span', { className: 'ap-ruleLabel' }, String(rule.label ?? '')),
+              react.createElement('span', { className: 'ap-badge ap-badgeMuted' }, sourceLabel(rule.source)),
+              react.createElement('span', { className: 'ap-badge ap-badgeMuted' }, kindLabel(rule.match?.kind)),
+              react.createElement('span', { className: 'ap-mono' }, String(rule.match?.value ?? '').slice(0, 48)),
+              react.createElement('button', {
+                type: 'button', className: 'ap-btn', onClick: () => onRemove(scope, list, rule.id),
+              }, t.remove)))))
+    }
+
+    /** 设置页卡片 / 审批设置面板共用的放置位置选择器。 */
+    function PlacementControl() {
+      const [value, setValue] = react.useState(() => placementStore.value)
+      const [error, setError] = react.useState('')
+      react.useEffect(() => placementStore.subscribe(setValue), [])
+      const choose = (next) => {
+        setError('')
+        const previous = placementStore.value
+        setValue(next)
+        placementStore.save(next).catch(cause => {
+          console.warn(LOG, '保存 placement 失败', cause)
+          setValue(previous)
+          setError(String(cause?.message ?? cause))
+        })
+      }
+      const options = [
+        ['auto', t.placementAuto],
+        ['tab', t.placementTab],
+        ['sidebar', t.placementSidebar],
+        ['all', t.placementAll],
+      ]
+      return react.createElement('div', { className: 'ap-row2' },
+        react.createElement('span', { className: 'ap-fieldKey' }, t.placementTitle),
+        react.createElement('div', { className: 'ap-seg' },
+          options.map(([id, label]) => react.createElement('button', {
+            key: id, type: 'button', 'data-on': value === id ? '1' : '0', onClick: () => choose(id),
+          }, label))),
+        error !== '' && react.createElement('span', { className: 'ap-note' }, error))
+    }
+
+    /** 设置页卡片：选择面板显示在哪里（写宿主设置命名空间，即时重挂）。 */
+    function PlacementCard() {
+      return react.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', padding: '8px 0' } },
+        react.createElement('div', { style: { fontSize: 13, color: 'var(--dsw-alias-label-primary)' } }, t.placementDesc),
+        react.createElement(PlacementControl, null))
+    }
+
+    /**
+     * 对话标签页「审批设置」：连续放行阈值 + 项目/全局两级的白名单与黑名单。
+     * 时间线不在这里——它只在右侧栏，两者刻意分开，避免对话区被审批噪声占满。
+     */
+    function ApprovalSettingsPanel(props) {
+      const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
+      const [cwd, setCwd] = react.useState(() => workspaceOf(sessionId))
+      const [error, setError] = react.useState('')
+      const [saved, setSaved] = react.useState(false)
+      const [threshold, setThreshold] = react.useState('')
+      const [revision, setRevision] = react.useState(0)
+
+      react.useEffect(() => policyStore.subscribe(() => setRevision(value => value + 1)), [])
+
+      react.useEffect(() => {
+        let alive = true
+        /** 项目目录：先问宿主 sessions 服务；拿不到就退回本会话最新一条记录里的 cwd。 */
+        const resolve = async () => {
+          let next = workspaceOf(sessionId)
+          if (next === undefined && sessionId !== '') {
+            try {
+              const response = await fetch(API_LOG + '?session=' + encodeURIComponent(sessionId) + '&limit=1', {
+                headers: { accept: 'application/json' },
+              })
+              const data = await response.json()
+              const first = Array.isArray(data?.records) ? data.records[0] : undefined
+              if (first !== undefined && typeof first.cwd === 'string' && first.cwd !== '') next = first.cwd
+            } catch (cause) {
+              console.warn(LOG, '读取审批记录以推断项目目录失败', cause)
+            }
+          }
+          if (!alive) return
+          setCwd(next)
+          await policyStore.load(next)
+        }
+        void resolve()
+        const timer = setInterval(() => { void resolve() }, POLL_MS)
+        return () => { alive = false; clearInterval(timer) }
+      }, [sessionId])
+
+      const snapshot = policyStore.value
+      const globalRules = snapshot?.global ?? { allow: [], deny: [] }
+      const projectRules = snapshot?.project
+      const shownThreshold = threshold === '' ? String(snapshot?.threshold ?? '') : threshold
+
+      const save = () => {
+        const value = Number.parseInt(shownThreshold, 10)
+        setError('')
+        setSaved(false)
+        policyStore.post({ op: 'threshold', threshold: value })
+          .then(() => { setSaved(true); setThreshold('') })
+          .catch(cause => setError(String(cause?.message ?? cause)))
+      }
+      const remove = (scope, list, id) => {
+        setError('')
+        policyStore.post({ op: 'remove', scope, list, id, cwd })
+          .catch(cause => setError(String(cause?.message ?? cause)))
+      }
+      void revision
+      return react.createElement('div', { className: 'ap-root' },
+        react.createElement('div', { className: 'ap-head' },
+          react.createElement('div', { className: 'ap-grow' },
+            react.createElement('div', { className: 'ap-title' }, t.settingsTitle),
+            react.createElement('div', { className: 'ap-sub' }, t.settingsDesc))),
+        react.createElement('div', { className: 'ap-body' },
+          react.createElement('div', { className: 'ap-row2' },
+            react.createElement('span', { className: 'ap-fieldKey' }, t.thresholdLabel),
+            react.createElement('input', {
+              className: 'ap-input',
+              type: 'number',
+              min: '1',
+              value: shownThreshold,
+              onChange: event => { setThreshold(event.target.value); setSaved(false) },
+            }),
+            react.createElement('span', { className: 'ap-note' }, t.thresholdUnit),
+            react.createElement('button', { type: 'button', className: 'ap-btn', onClick: save }, t.save),
+            saved && react.createElement('span', { className: 'ap-note' }, t.saved)),
+          react.createElement(PlacementControl, null),
+          react.createElement('div', null,
+            react.createElement('div', { className: 'ap-sectionTitle' }, t.globalScope),
+            react.createElement(RuleList, { scope: 'global', list: 'allow', title: t.allowList, rules: globalRules.allow, onRemove: remove }),
+            react.createElement(RuleList, { scope: 'global', list: 'deny', title: t.denyList, rules: globalRules.deny, onRemove: remove })),
+          cwd === undefined
+            ? react.createElement('div', { className: 'ap-note' }, t.projectUnknown)
+            : react.createElement('div', null,
+              react.createElement('div', { className: 'ap-sectionTitle' }, t.projectScope + ' · ' + cwd),
+              react.createElement(RuleList, { scope: 'project', list: 'allow', title: t.allowList, rules: projectRules?.allow ?? [], onRemove: remove }),
+              react.createElement(RuleList, { scope: 'project', list: 'deny', title: t.denyList, rules: projectRules?.deny ?? [], onRemove: remove })),
+          (error !== '' || policyStore.error !== '') && react.createElement('div', { className: 'ap-note' }, error !== '' ? error : policyStore.error)))
+    }
+
+    /** 右侧栏「审批时间线」：倒序记录，展开即可把某条记录升级/降级成规则。 */
+    function ApprovalTimelinePanel(props) {
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
       const info = typeof props.useTabInfo === 'function' ? props.useTabInfo() : undefined
       // 右侧栏 tab 隐藏时暂停轮询；对话标签页没有这个信号，保持轮询。
@@ -324,6 +711,8 @@ window.__ModuleLoader__.load({
 
       const records = state.records
       const auto = records.filter(record => record.verdict === 'allow').length
+      // 升级/降级成功后同时刷新记录与策略快照：记录上会回写「已应用」，设置面板同步见到新规则
+      const refresh = () => { void load(); void policyStore.load() }
       return react.createElement('div', { className: 'ap-root' },
         react.createElement('div', { className: 'ap-head' },
           react.createElement('div', { className: 'ap-grow' },
@@ -332,7 +721,7 @@ window.__ModuleLoader__.load({
           react.createElement('div', { className: 'ap-seg' },
             react.createElement('button', { type: 'button', 'data-on': scope === 'session' ? '1' : '0', onClick: () => setScope('session') }, t.scopeSession),
             react.createElement('button', { type: 'button', 'data-on': scope === 'all' ? '1' : '0', onClick: () => setScope('all') }, t.scopeAll)),
-          react.createElement('button', { type: 'button', className: 'ap-btn', onClick: () => { void load() } }, t.reload)),
+          react.createElement('button', { type: 'button', className: 'ap-btn', onClick: refresh }, t.reload)),
         state.error !== '' && react.createElement('div', { className: 'ap-error' }, state.error),
         records.length === 0
           ? react.createElement('div', { className: 'ap-empty' }, state.loaded ? t.empty : t.loading)
@@ -342,40 +731,11 @@ window.__ModuleLoader__.load({
               record,
               open: openId === String(record.id ?? record.time),
               onToggle: () => setOpenId(previous => previous === String(record.id ?? record.time) ? '' : String(record.id ?? record.time)),
+              onChanged: refresh,
             }))))
     }
 
-    /** 设置页卡片：选择记录显示在哪里（写宿主设置命名空间，即时重挂）。 */
-    function PlacementCard() {
-      const [value, setValue] = react.useState(() => placementStore.value)
-      const [error, setError] = react.useState('')
-      react.useEffect(() => placementStore.subscribe(setValue), [])
-      const choose = (next) => {
-        setError('')
-        const previous = placementStore.value
-        setValue(next)
-        placementStore.save(next).catch(cause => {
-          console.warn(LOG, '保存 placement 失败', cause)
-          setValue(previous)
-          setError(String(cause?.message ?? cause))
-        })
-      }
-      const options = [
-        ['auto', t.placementAuto],
-        ['tab', t.placementTab],
-        ['sidebar', t.placementSidebar],
-        ['all', t.placementAll],
-      ]
-      return react.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', padding: '8px 0' } },
-        react.createElement('div', { style: { fontSize: 13, color: 'var(--dsw-alias-label-primary)' } }, t.settingsDesc),
-        react.createElement('div', { className: 'ap-seg', style: { alignSelf: 'flex-start' } },
-          options.map(([id, label]) => react.createElement('button', {
-            key: id, type: 'button', 'data-on': value === id ? '1' : '0', onClick: () => choose(id),
-          }, label))),
-        error !== '' && react.createElement('div', { className: 'ap-error' }, error))
-    }
-
-    /** 客户端插件入口：按 placement 决定挂载对话标签页、右侧栏 tab 或两者。 */
+    /** 客户端插件入口：按 placement 决定挂载审批设置标签页、时间线 tab 或两者。 */
     function apply(ctx) {
       try {
         applyInner(ctx)
@@ -389,15 +749,17 @@ window.__ModuleLoader__.load({
     /** 真正的挂载逻辑；外层包一层 try/catch 只为把失败上报成信标。 */
     function applyInner(ctx) {
       beacon('apply')
+      clientCtx = ctx
       const slots = ctx.get('slots')
       if (slots === undefined) {
         beacon('no-slots')
-        console.warn(LOG, '没有 slots 服务，审批记录面板未注册')
+        console.warn(LOG, '没有 slots 服务，审批面板未注册')
         return
       }
       const mounted = { tab: undefined, sidebar: undefined }
       let lastKey = ''
 
+      /** 对话区标签页：只放「审批设置」，时间线不再出现在这里。 */
       const mountTab = () => {
         if (mounted.tab !== undefined) return
         mounted.tab = slots.inject('conversation.view', () => {
@@ -406,8 +768,8 @@ window.__ModuleLoader__.load({
               name: 'conversation.view',
               id: VIEW_ID,
               order: 30,
-              label: () => t.tabLabel,
-            }, props => react.createElement(ApprovalLogPanel, props))
+              label: () => t.policyTab,
+            }, props => react.createElement(ApprovalSettingsPanel, props))
             beacon('view-registered')
             return dispose
           } catch (error) {
@@ -416,12 +778,13 @@ window.__ModuleLoader__.load({
           }
         })
       }
+
+      /** 右侧栏 tab：审批时间线（含升级/降级操作）。座位按契约可选。 */
       const mountSidebar = () => {
         if (mounted.sidebar !== undefined) return
-        // 右侧栏座位按契约可选：没有该服务的旧版本上回调不触发，插件不因此挂起。
         mounted.sidebar = ctx.inject(['sidebarRightTabs'], raw => {
           const tabs = raw?.sidebarRightTabs
-          if (tabs === undefined || typeof tabs.register !== 'function') return
+          if (tabs === undefined || typeof tabs.register !== 'function') return undefined
           const disposers = []
           const own = (result) => {
             if (typeof result === 'function') disposers.push(result)
@@ -430,10 +793,10 @@ window.__ModuleLoader__.load({
             own(tabs.register({
               id: SIDEBAR_ID,
               kind: SIDEBAR_KIND,
-              title: () => t.tabLabel,
+              title: () => t.timelineTab,
               guide: [{
                 order: 30,
-                title: () => t.tabLabel,
+                title: () => t.timelineTab,
                 description: () => t.guideDescription,
                 icon: LogGlyph,
               }],
@@ -441,7 +804,7 @@ window.__ModuleLoader__.load({
             own(raw.slots.inject('sidebar.right.pane.tab', () => raw.slots.register({
               name: 'sidebar.right.pane.tab',
               key: SIDEBAR_ID,
-            }, props => react.createElement(ApprovalLogPanel, props))))
+            }, props => react.createElement(ApprovalTimelinePanel, props))))
             beacon('sidebar-registered')
           } catch (error) {
             beacon('sidebar-error', String(error?.message ?? error))
@@ -479,10 +842,11 @@ window.__ModuleLoader__.load({
 
       const unsubscribe = placementStore.subscribe(remount)
       remount()
-      beacon('mounted', 'placement=' + placementStore.value + ' view=' + String(mounted.tab !== undefined)
+      beacon('mounted', 'placement=' + placementStore.value + ' tab=' + String(mounted.tab !== undefined)
         + ' sidebar=' + String(mounted.sidebar !== undefined)
         + ' hasSidebarSeat=' + String(ctx.get('sidebarRightTabs') !== undefined))
       void placementStore.load().then(remount)
+      void policyStore.load(undefined)
 
       ctx.effect(() => slots.inject('settings.plugin.item', () => {
         try {
@@ -502,7 +866,7 @@ window.__ModuleLoader__.load({
       ctx.effect(() => () => {
         unsubscribe()
         unmount()
-      }, 'dsh-auto-pass: placement mounts')
+      }, 'dsh-auto-pass: panel mounts')
       console.log(LOG, 'client loaded, placement=' + placementStore.value)
     }
 

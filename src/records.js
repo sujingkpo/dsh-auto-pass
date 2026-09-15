@@ -36,6 +36,8 @@ export const noopRecordStore = Object.freeze({
   add: record => record,
   list: () => [],
   size: () => 0,
+  get: () => undefined,
+  update: () => undefined,
 })
 
 /**
@@ -98,6 +100,18 @@ export function createRecordStore(options = {}) {
       if (records.length > limit) records = records.slice(-limit)
       persistToDisk()
       return record
+    },
+    /** 按 id 取一条记录（时间线上的「升级/降级」要用它的签名与建议规则）。 */
+    get(id) {
+      return id === undefined || id === null ? undefined : records.find(record => record.id === id)
+    },
+    /** 就地合并字段并落盘；记录不存在时返回 undefined。 */
+    update(id, patch) {
+      const index = records.findIndex(record => record.id === id)
+      if (index === -1) return undefined
+      records[index] = { ...records[index], ...patch }
+      persistToDisk()
+      return records[index]
     },
     /** 倒序列出记录；`session` 给定时只返回该会话的记录。 */
     list(filter = {}) {

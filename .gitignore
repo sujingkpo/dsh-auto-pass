@@ -137,3 +137,7 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# 跑测试时 pnpm 可能在工作区落地 store；项目级策略文件（<cwd>/.dsh-auto-pass/policy.json）不进版本库
+.pnpm-store/
+.dsh-auto-pass/

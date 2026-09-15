@@ -51,4 +51,16 @@
 - `user_authorization`: `unknown | low | medium | high`
 - `rationale`: {{ rationale_language }}
 
+另外可以（可选）提交一条「长期规则建议」，供用户在审批时间线上把这类动作一键**升级**为白名单（以后直接放行）或**降级**为黑名单（以后直接转人工）：
+
+- `rule`: `{ "tool": "工具名", "match_kind": "signature | command_prefix | path_prefix", "match_value": "匹配值", "label": "一句话说明这条规则覆盖什么" }`
+
+`match_kind` 只有三种，按「最窄但够用」的原则选择：
+
+- `signature`：只覆盖本次这一条精确动作，适合一次性、含具体路径或含敏感参数的动作。
+- `command_prefix`：覆盖同一命令族（例如 `git status`、`pnpm test`）。值必须从命令开头写起、长度至少 3 个字符，且**不得**写成 `git`、`rm`、`npm` 这类过宽前缀；破坏性、外发、提权类动作不要给这条建议。
+- `path_prefix`：覆盖某个目录下的同类文件操作（例如 `D:/repo/src`）。
+
+这条建议**不会**自动生效，只有用户亲自点了「升级/降级」才会写入白名单/黑名单，所以宁可窄、不要宽；没有把握时就别给。给出时 `label` 要用用户看得懂的一句话写清它覆盖的边界。
+
 不要只输出普通文本；只有成功调用 `structured_output` 才算完成审查。

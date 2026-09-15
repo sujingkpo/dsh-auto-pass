@@ -6,6 +6,7 @@
  * @date 2026-08-14
  * @modify 2026-09-15 更名 dsh-auto-pass；拒绝与审查失败改为转人工审批，移除连续拒绝中断逻辑
  * @modify 2026-09-15 增加审批记录：落盘 JSON，并经 /api/dsh-auto-pass 供右栏/对话标签页时间轴读取
+ * @modify 2026-09-15 增加权限记忆与白/黑名单：命中名单直接放行或直接转人工，连续人工放行达阈值自动升级
  */
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -16,6 +17,13 @@ import {
   MAX_RECORD_ACTION_CHARS,
   noopRecordStore,
 } from './records.js'
+import {
+  createPolicyStore,
+  DEFAULT_AUTO_APPROVE_AFTER,
+  noopPolicyStore,
+  signatureOf,
+  validateRuleInput,
+} from './policy.js'
 
 export const name = 'dsh-auto-pass'
 export const inject = ['approval', 'subagents', 'tools']
@@ -48,6 +56,10 @@ const DEFAULTS = Object.freeze({
   maxOutputTokens: 8_192,
   logFile: '',
   maxRecords: DEFAULT_MAX_RECORDS,
+  // 同一项目下同一权限签名连续人工放行多少次后，自动升级为免审查规则（策略文件里可覆盖）。
+  autoApproveAfter: DEFAULT_AUTO_APPROVE_AFTER,
+  // 全局策略文件路径；空字符串表示用 $DSH_HOME/dsh-auto-pass/policy.json。
+  policyFile: '',
   // 默认两处都注册（与 dsh-context 一致）：对话区标签页立刻可见，右侧栏 tab 也可用；
   // 想只留一处就改成 tab / sidebar；auto 表示优先右侧栏、没有座位时退回对话标签页。
   placement: 'all',
@@ -59,6 +71,10 @@ export const RECORD_LOG_PATH = '/api/dsh-auto-pass/log'
 /** 客户端半启动信标：把「走到哪一步」写进宿主日志，用于定位「看不到面板」类问题。 */
 export const RECORD_BEACON_PATH = '/api/dsh-auto-pass/beacon'
 export const RECORD_CONFIG_PATH = '/api/dsh-auto-pass/config'
+/** 白名单/黑名单与阈值的读写入口（供「审批设置」面板使用）。 */
+export const POLICY_PATH = '/api/dsh-auto-pass/policy'
+/** 由一条审批记录一键升级/降级：规则文本由 Reviewer 模型产出，缺省回落到精确签名。 */
+export const RULE_PATH = '/api/dsh-auto-pass/rule'
 /** 时间轴可选的放置位置；auto 表示优先右侧栏座位、没有座位时退回对话标签页。 */
 export const PLACEMENTS = Object.freeze(['auto', 'tab', 'sidebar', 'all'])
 /** 设置命名空间：宿主 settings 注册与浏览器端设置卡片靠这个名字对齐。 */
@@ -74,6 +90,18 @@ export const assessmentSchema = Object.freeze({
     user_authorization: { type: 'string', enum: ['unknown', 'low', 'medium', 'high'] },
     outcome: { type: 'string', enum: ['allow', 'deny'] },
     rationale: { type: 'string' },
+    // 可选的「长期规则建议」：供用户在时间线上把这个动作一键升级为白名单或降级为黑名单。
+    rule: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        tool: { type: 'string' },
+        match_kind: { type: 'string', enum: ['signature', 'command_prefix', 'path_prefix'] },
+        match_value: { type: 'string' },
+        label: { type: 'string' },
+      },
+      required: ['tool', 'match_kind', 'match_value', 'label'],
+    },
   },
   required: ['outcome'],
 })
@@ -109,13 +137,20 @@ export function apply(ctx, config) {
     limit: resolved.maxRecords,
     warn: message => ctx.logger.warn(message),
   })
+  const policies = createPolicyStore({
+    globalFile: resolved.policyFile === '' ? undefined : resolved.policyFile,
+    autoApproveAfter: resolved.autoApproveAfter,
+    warn: message => ctx.logger.warn(message),
+  })
   installReviewerIsolation(ctx)
-  ctx.on('approval/request', createAutoApprovalHandler(ctx, resolved, records), { prepend: true })
+  ctx.on('approval/request', createAutoApprovalHandler(ctx, resolved, records, policies), { prepend: true })
   installSettings(ctx)
-  installRecordRoute(ctx, records, resolved)
+  installRecordRoute(ctx, records, resolved, policies)
   installClientGraphProbe(ctx)
   ctx.logger.info('dsh-auto-pass: 审批记录已就绪 file=' + records.file + ' maxRecords=' + String(records.limit)
-    + ' placement=' + effectivePlacement(ctx, resolved))
+    + ' placement=' + effectivePlacement(ctx, resolved)
+    + ' autoApproveAfter=' + String(policies.threshold())
+    + ' policy=' + String(policies.globalFile))
 }
 
 /**
@@ -181,14 +216,14 @@ function installClientGraphProbe(ctx) {
  * 注册只读的记录查询路由。非 Web 载体没有 webServer 服务，此时静默跳过，
  * 审批本身不受影响。
  */
-function installRecordRoute(ctx, records, config) {
+function installRecordRoute(ctx, records, config, policies) {
   // 极简宿主或测试替身可能没有 inject：此时只是没有查询路由，审批照常工作。
   if (typeof ctx.inject !== 'function') return
   ctx.inject(['webServer'], serverCtx => {
     serverCtx.effect(() => serverCtx.webServer.register({
       kind: 'prefix',
       path: RECORD_ROUTE,
-      handler: (req, res) => serveRecordRequest(req, res, records, config, ctx),
+      handler: (req, res) => serveRecordRequest(req, res, records, config, ctx, policies),
     }), 'dsh-auto-pass: 审批记录路由')
   })
 }
@@ -199,7 +234,7 @@ function installRecordRoute(ctx, records, config) {
  * - `GET /api/dsh-auto-pass/config` 生效的 placement
  * - `POST /api/dsh-auto-pass/config {placement}` 写入设置命名空间
  */
-async function serveRecordRequest(req, res, records, config, ctx) {
+async function serveRecordRequest(req, res, records, config, ctx, policies = noopPolicyStore) {
   /** 统一的 JSON 响应；连接已断开时只告警，不再上抛。 */
   const writeJson = (code, body) => {
     try {
@@ -212,7 +247,8 @@ async function serveRecordRequest(req, res, records, config, ctx) {
   try {
     const url = new URL(req.url ?? '/', 'http://dsh.local')
     const pathname = url.pathname.replace(/\/+$/, '')
-    if (pathname !== RECORD_LOG_PATH && pathname !== RECORD_CONFIG_PATH && pathname !== RECORD_BEACON_PATH) {
+    if (pathname !== RECORD_LOG_PATH && pathname !== RECORD_CONFIG_PATH && pathname !== RECORD_BEACON_PATH
+      && pathname !== POLICY_PATH && pathname !== RULE_PATH) {
       writeJson(404, { ok: false, error: 'not found' })
       return
     }
@@ -244,6 +280,14 @@ async function serveRecordRequest(req, res, records, config, ctx) {
         maxRecords: config.maxRecords,
         file: records.file,
       })
+      return
+    }
+    if (pathname === POLICY_PATH) {
+      await servePolicyRequest(req, url, writeJson, policies)
+      return
+    }
+    if (pathname === RULE_PATH) {
+      await serveRuleRequest(req, writeJson, policies, records)
       return
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -292,6 +336,128 @@ async function updatePlacement(req, ctx, writeJson) {
   writeJson(200, { ok: true, placement })
 }
 
+/** 读取请求体文本（超长请求由调用方的 try/catch 兜住）。 */
+async function readBody(req) {
+  let body = ''
+  for await (const chunk of req) body += chunk
+  return body
+}
+
+/** 解析请求体 JSON；失败返回 undefined 由调用方回 400。 */
+async function readJsonBody(req) {
+  try {
+    return JSON.parse((await readBody(req)) || '{}')
+  } catch (error) {
+    return undefined
+  }
+}
+
+/**
+ * 策略读写：
+ * - `GET /api/dsh-auto-pass/policy?cwd=` 返回阈值 + 全局/项目两级白黑名单快照
+ * - `POST` `{ op: 'threshold' | 'add' | 'remove', ... }`
+ */
+async function servePolicyRequest(req, url, writeJson, policies) {
+  const cwd = url.searchParams.get('cwd') ?? undefined
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    writeJson(200, { ok: true, ...policies.snapshot(cwd) })
+    return
+  }
+  if (req.method !== 'POST' && req.method !== 'PUT') {
+    writeJson(405, { ok: false, error: 'method not allowed' })
+    return
+  }
+  const body = await readJsonBody(req)
+  if (body === undefined) {
+    writeJson(400, { ok: false, error: 'invalid json' })
+    return
+  }
+  const target = body.cwd ?? cwd
+  if (body.op === 'threshold') {
+    const value = Number.parseInt(String(body.threshold), 10)
+    if (!Number.isSafeInteger(value) || value < 1) {
+      writeJson(400, { ok: false, error: 'threshold must be a positive integer' })
+      return
+    }
+    writeJson(200, { ok: true, threshold: policies.setThreshold(value) })
+    return
+  }
+  if (body.op === 'remove') {
+    const removed = policies.removeRule({ scope: body.scope, list: body.list, id: body.id }, target)
+    writeJson(removed ? 200 : 404, removed ? { ok: true } : { ok: false, error: 'rule not found' })
+    return
+  }
+  if (body.op === 'add') {
+    const added = policies.addRule({ scope: body.scope, list: body.list, rule: body.rule }, target)
+    writeJson(added.ok === true ? 200 : 400, added)
+    return
+  }
+  writeJson(400, { ok: false, error: 'unknown op' })
+}
+
+/**
+ * 时间线上的「升级/降级」：把一条审批记录变成白名单/黑名单规则。
+ * 优先使用 Reviewer 在本次审查里给出的建议规则（模型产出，可覆盖同类动作）；
+ * 没有建议（例如审查失败转人工）时精确回落到本次签名——宁可窄，不要宽。
+ */
+async function serveRuleRequest(req, writeJson, policies, records) {
+  if (req.method !== 'POST' && req.method !== 'PUT') {
+    writeJson(405, { ok: false, error: 'method not allowed' })
+    return
+  }
+  const body = await readJsonBody(req)
+  if (body === undefined) {
+    writeJson(400, { ok: false, error: 'invalid json' })
+    return
+  }
+  const record = typeof records.get === 'function' ? records.get(body.recordId) : undefined
+  if (record === undefined || record === null) {
+    writeJson(404, { ok: false, error: 'approval record not found' })
+    return
+  }
+  const rule = ruleFromRecord(record)
+  if (rule === undefined) {
+    writeJson(400, { ok: false, error: 'approval record has no usable rule signature' })
+    return
+  }
+  const added = policies.addRule({ scope: body.scope, list: body.list, rule }, record.cwd)
+  if (added.ok !== true) {
+    writeJson(400, { ok: false, error: added.error ?? 'policy write failed' })
+    return
+  }
+  if (typeof records.update === 'function') {
+    records.update(record.id, {
+      ruleApplied: { scope: added.scope, list: body.list, ruleId: added.rule.id, label: added.rule.label },
+    })
+  }
+  writeJson(200, { ok: true, rule: added.rule, scope: added.scope, file: added.file })
+}
+
+/** 由记录构造规则字段；模型建议优先，否则精确签名。 */
+export function ruleFromRecord(record) {
+  const suggested = record?.suggestedRule
+  if (suggested !== null && typeof suggested === 'object' && typeof suggested.tool === 'string') {
+    return {
+      tool: suggested.tool,
+      match: suggested.match,
+      label: suggested.label,
+      source: 'model',
+      note: '由 Reviewer 模型在本次审查中给出的建议规则',
+      cwd: record.cwd,
+    }
+  }
+  const signature = record?.signature
+  if (signature === undefined || typeof signature.key !== 'string') return undefined
+  return {
+    tool: signature.toolName,
+    match: { kind: 'signature', value: signature.key },
+    label: signature.text ?? signature.key,
+    source: 'user',
+    note: '精确到本次动作签名（这条记录没有模型建议规则）',
+    cwd: record.cwd,
+  }
+}
+
 /** 对 loader 或测试传入的配置做运行时边界校验。 */
 export function resolveConfig(config = {}, warn = message => console.warn(message)) {
   let resolved = { ...DEFAULTS, ...config }
@@ -314,6 +480,9 @@ export function resolveConfig(config = {}, warn = message => console.warn(messag
   if (typeof resolved.logFile !== 'string') {
     throw new Error('dsh-auto-pass: logFile 必须是字符串（空字符串表示使用默认路径）')
   }
+  if (typeof resolved.policyFile !== 'string') {
+    throw new Error('dsh-auto-pass: policyFile 必须是字符串（空字符串表示使用默认路径）')
+  }
   if (!PLACEMENTS.includes(resolved.placement)) {
     throw new Error('dsh-auto-pass: placement 必须是 ' + PLACEMENTS.join(' / ') + ' 之一')
   }
@@ -321,6 +490,7 @@ export function resolveConfig(config = {}, warn = message => console.warn(messag
     'timeoutMs',
     'maxInvestigationSteps',
     'maxRecords',
+    'autoApproveAfter',
     'maxMessageTranscriptTokens',
     'maxToolTranscriptTokens',
     'maxMessageEntryTokens',
@@ -392,6 +562,8 @@ const HOST_MESSAGES = Object.freeze({
     defaultAllowRationale: '自动审查返回低风险允许决定。',
     defaultDenyRationale: '自动审查返回拒绝决定，但没有提供理由。',
     criticalDowngrade: '宿主安全下限要求 critical 风险动作必须转交用户决定。',
+    whitelisted: hit => '命中' + (hit.scope === 'project' ? '项目' : '全局') + '白名单，已直接放行：' + hit.label,
+    blacklisted: hit => '命中' + (hit.scope === 'project' ? '项目' : '全局') + '黑名单，已直接转人工审批：' + hit.label,
     highRiskDowngrade: '宿主安全下限要求 high 风险动作至少具有 medium 用户授权，本次已转交用户决定。',
   }),
   en: Object.freeze({
@@ -410,6 +582,8 @@ const HOST_MESSAGES = Object.freeze({
     defaultAllowRationale: 'The automatic review returned a low-risk allow decision.',
     defaultDenyRationale: 'The automatic review returned a deny decision without a rationale.',
     criticalDowngrade: 'The host safety floor requires critical-risk actions to be decided by the user.',
+    whitelisted: hit => 'Matched the ' + hit.scope + ' whitelist and was allowed directly: ' + hit.label,
+    blacklisted: hit => 'Matched the ' + hit.scope + ' blacklist and was handed to the user: ' + hit.label,
     highRiskDowngrade: 'The host safety floor requires at least medium user authorization for high-risk actions; the request was handed to the user.',
   }),
 })
@@ -476,7 +650,7 @@ function isHanCharacter(codePoint) {
 }
 
 /** 创建可单测的 waterfall 监听器：插件只自动放行审查通过的请求。 */
-export function createAutoApprovalHandler(ctx, config, records = noopRecordStore) {
+export function createAutoApprovalHandler(ctx, config, records = noopRecordStore, policies = noopPolicyStore) {
   return async (request, next) => {
     if (selectedPermissionPreset(request.agent.session) !== 'auto-approve') {
       return next()
@@ -487,12 +661,18 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
     const startedAt = Date.now()
 
     const action = exactAction(request)
-    // 收尾：先拿到最终结论（插件自动放行，或人工审批链的答复），再落一条记录。
-    // 记录失败由仓库自己吞掉，绝不影响审批结果。
+    // 权限签名：与调用 id、时间无关，是「相似权限」的判定单位，也是权限记忆的计数键。
+    // 拿不到精确动作时**不建立签名**：所有解析不出参数的请求会塌缩成同一个空签名，
+    // 一旦参与记忆，几次人工放行后就会把它们一起自动放行——宁可不记。
+    const signature = action === undefined ? undefined : signatureOf(request, action)
+    const cwd = action?.cwd
+    // 收尾：先拿到最终结论（插件自动放行，或人工审批链的答复），更新权限记忆，再落一条记录。
+    // 记忆与记录都只是旁路，任何失败都不影响已经做出的审批结论。
     const finish = async (outcome, decision) => {
       const settled = await outcome
+      const observed = observeDecision(ctx, policies, { signature, cwd, settled, decision })
       try {
-        records.add(buildRecord(request, action, settled, decision, Date.now() - startedAt))
+        records.add(buildRecord(request, action, settled, decision, Date.now() - startedAt, signature, observed))
       } catch (error) {
         // 记录只是旁路：写失败也绝不能让已经做出的审批结论变形
         ctx.logger.warn('dsh-auto-pass: 审批记录写入失败：' + errorMessage(error))
@@ -501,6 +681,21 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
     }
     if (action === undefined) {
       return deferWithoutReview(ctx, request, messages.missingAction, next, language, finish)
+    }
+    // 名单优先于模型审查：黑名单直接交回人工审批链（不烧模型），白名单与记忆规则直接放行。
+    const hit = policies.match({ signature, cwd })
+    if (hit !== undefined) {
+      ctx.logger.info('dsh-auto-pass: 策略命中 list=' + hit.list + ' scope=' + hit.scope
+        + ' rule=' + String(hit.rule.id) + ' tool=' + request.toolName)
+      const policyHit = describeHit(hit)
+      if (hit.list === 'deny') {
+        const rationale = messages.blacklisted(policyHit)
+        injectReviewNotice(ctx, request, { outcome: 'defer', steps: 0, rationale, policyHit }, language)
+        return finish(next(), { verdict: 'defer', rationale, steps: 0, policyHit })
+      }
+      const rationale = messages.whitelisted(policyHit)
+      injectReviewNotice(ctx, request, { outcome: 'allow', steps: 0, rationale, policyHit }, language)
+      return finish('allowed-once', { verdict: 'allow', rationale, steps: 0, policyHit })
     }
     const actionJson = JSON.stringify(action)
     if (actionJson.length > config.maxActionChars) {
@@ -577,6 +772,7 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
         reviewerSessionId: run.id,
         steps,
         route,
+        ...(assessment.suggestedRule === undefined ? {} : { suggestedRule: assessment.suggestedRule }),
       }
       injectReviewNotice(ctx, request, {
         ...assessment,
@@ -628,6 +824,42 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
   }
 }
 
+/** 命中信息里挑出要写进审批记录的字段（时间线据此展示与一键升级/降级）。 */
+function describeHit(hit) {
+  return {
+    list: hit.list,
+    scope: hit.scope,
+    ruleId: hit.rule.id,
+    label: hit.rule.label,
+    kind: hit.rule.match?.kind,
+  }
+}
+
+/**
+ * 维护「连续人工放行」计数。只有用户亲自放行/拒绝（插件走的是 next() 分支）才计数：
+ * - 插件自己作出的自动放行不计，否则一次自动放行就会把计数推满、把权限越滚越宽；
+ * - 命中名单后的人工放行也不计：用户刚把这类动作列为黑名单，他这一次的放行是**单次**决定，
+ *   不该被当成「连续授权」而在白名单里长出一条记忆规则。
+ */
+function observeDecision(ctx, policies, { signature, cwd, settled, decision }) {
+  try {
+    const observed = policies.observe({
+      signature,
+      cwd,
+      outcome: settled,
+      fromHuman: decision?.verdict !== 'allow' && decision?.policyHit === undefined,
+    })
+    if (observed.promoted !== null && observed.promoted !== undefined) {
+      ctx.logger.info('dsh-auto-pass: 连续人工放行达到阈值，已自动升级为免审查规则 label=' + observed.promoted.label
+        + ' scope=' + observed.promoted.scope + ' id=' + String(observed.promoted.id))
+    }
+    return observed
+  } catch (error) {
+    ctx.logger.warn('dsh-auto-pass: 权限记忆更新失败：' + errorMessage(error))
+    return { approvals: 0, promoted: null }
+  }
+}
+
 /** 不进入模型审查的请求：记录转交理由后直接交给后续人工审批器。 */
 function deferWithoutReview(ctx, request, reason, next, language, finish) {
   ctx.logger.warn(`dsh-auto-pass: ${reason} 已转人工审批`)
@@ -640,7 +872,7 @@ function deferWithoutReview(ctx, request, reason, next, language, finish) {
 }
 
 /** 组装一条审批记录：动作参数裁剪到上限，其余字段原样保留。 */
-function buildRecord(request, action, outcome, decision, latencyMs) {
+function buildRecord(request, action, outcome, decision, latencyMs, signature, observed) {
   const actionText = action === undefined ? undefined : JSON.stringify(action)
   return Object.freeze({
     id: randomUUID(),
@@ -661,6 +893,13 @@ function buildRecord(request, action, outcome, decision, latencyMs) {
     outcome: typeof outcome === 'string' ? outcome : String(outcome),
     latencyMs,
     ...(actionText === undefined ? {} : { action: truncateText(actionText, MAX_RECORD_ACTION_CHARS) }),
+    ...(signature === undefined ? {} : { signature: { toolName: signature.toolName, key: signature.key, text: signature.text } }),
+    ...(decision.suggestedRule === undefined ? {} : { suggestedRule: decision.suggestedRule }),
+    ...(decision.policyHit === undefined ? {} : { policy: decision.policyHit }),
+    ...(observed?.promoted === null || observed?.promoted === undefined
+      ? {}
+      : { promotedRule: { id: observed.promoted.id, scope: observed.promoted.scope, list: observed.promoted.list, label: observed.promoted.label } }),
+    ...(observed === undefined ? {} : { approvals: observed.approvals }),
   })
 }
 
@@ -978,19 +1217,34 @@ export function parseAssessment(value, language = 'zh') {
   if (value.rationale !== undefined && typeof value.rationale !== 'string') {
     throw new Error(messages.invalidRationale)
   }
-  const allowedKeys = new Set(['risk_level', 'user_authorization', 'outcome', 'rationale'])
+  const allowedKeys = new Set(['risk_level', 'user_authorization', 'outcome', 'rationale', 'rule'])
   const extraKey = Object.keys(value).find(key => !allowedKeys.has(key))
   if (extraKey !== undefined) throw new Error(messages.unknownField(extraKey))
   const riskLevel = value.risk_level ?? (value.outcome === 'allow' ? 'low' : 'high')
   const rationale = value.rationale?.trim() || (value.outcome === 'allow'
     ? messages.defaultAllowRationale
     : messages.defaultDenyRationale)
+  // 规则建议是可选的：模型给了就记下来，但**不会**自动生效，只有用户在时间线上点
+  // 「升级/降级」才会写入白名单/黑名单；建议本身非法时静默丢弃，不影响审查结论。
+  const suggestedRule = parseSuggestedRule(value.rule)
   return Object.freeze({
     risk_level: riskLevel,
     user_authorization: value.user_authorization ?? 'unknown',
     outcome: value.outcome,
     rationale,
+    ...(suggestedRule === undefined ? {} : { suggestedRule }),
   })
+}
+
+/** 解析模型给出的可选规则建议；任何不合法都返回 undefined（它是增益，不该影响结论）。 */
+export function parseSuggestedRule(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const checked = validateRuleInput({
+    tool: value.tool,
+    label: value.label,
+    match: { kind: value.match_kind, value: value.match_value },
+  })
+  return checked.ok === true ? checked.rule : undefined
 }
 
 /** 宿主只能把 allow 降级为 deny（同样转人工审批），绝不能把模型 deny 升级。 */
@@ -1032,6 +1286,8 @@ const NOTICE_LABELS = Object.freeze({
     reviewerSession: 'Reviewer 会话：',
     steps: '调查步骤：',
     rationale: '理由：',
+    policy: '命中策略：',
+    suggestedRule: '建议规则（可在审批时间线一键升级/降级）：',
   }),
   en: Object.freeze({
     allowedHeadline: toolName => `Auto Approve automatically allowed this ${toolName} action.`,
@@ -1044,6 +1300,8 @@ const NOTICE_LABELS = Object.freeze({
     reviewerSession: 'Reviewer session: ',
     steps: 'Investigation steps: ',
     rationale: 'Rationale: ',
+    policy: 'Policy: ',
+    suggestedRule: 'Suggested rule (promote/demote it from the approval timeline): ',
   }),
 })
 
@@ -1057,6 +1315,8 @@ function injectReviewNotice(ctx, request, review, language) {
     : `${review.rationale.slice(0, MAX_NOTICE_REASON_CHARS - 1)}…`
   const details = [
     allowed ? labels.allowedHeadline(request.toolName) : labels.deferredHeadline(request.toolName),
+    ...(review.policyHit === undefined ? [] : [labels.policy + review.policyHit.scope + '/' + review.policyHit.list + ' · ' + review.policyHit.label]),
+    ...(review.suggestedRule === undefined ? [] : [labels.suggestedRule + review.suggestedRule.label]),
     ...(review.risk_level === undefined ? [] : [`${labels.riskLevel}${review.risk_level}`]),
     ...(review.user_authorization === undefined ? [] : [`${labels.userAuthorization}${review.user_authorization}`]),
     ...(review.route === undefined ? [] : [`${labels.reviewerModel}${review.route.provider}/${review.route.model}`]),
