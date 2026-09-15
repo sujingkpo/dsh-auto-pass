@@ -22,7 +22,8 @@ function sampleRecords() {
       latencyMs: 3,
       decidedBy: 'auto',
       signature: { toolName: 'bash', key: 'bash:npm test', text: 'bash · npm test' },
-      policy: { list: 'allow', scope: 'global', ruleId: 'rule-1', label: 'bash · npm test', kind: 'signature', source: 'model' },
+      // 故意不写 source：这条记录的规则来源要靠策略快照反查（老记录的真实情形）
+      policy: { list: 'allow', scope: 'global', ruleId: 'rule-1', label: 'bash · npm test', kind: 'signature' },
     },
     {
       id: 'record-deny',
@@ -93,7 +94,21 @@ function installBrowserStubs() {
   globalThis.fetch = vi.fn(async url => {
     const target = String(url)
     if (target.includes('/policy')) {
-      return { json: async () => ({ ok: true, thresholds: { allow: 3, deny: 3 }, global: { allow: [], deny: [] }, project: { allow: [], deny: [] } }) }
+      // 规则带上 source：命中 chip 的「自动 / 手动」由它反查出来
+      return {
+        json: async () => ({
+          ok: true,
+          thresholds: { allow: 3, deny: 3 },
+          global: {
+            allow: [{ id: 'rule-1', source: 'model', list: 'allow', scope: 'global', label: 'bash · npm test', match: { kind: 'signature', value: 'k' } }],
+            deny: [],
+          },
+          project: {
+            allow: [],
+            deny: [{ id: 'rule-2', source: 'user', list: 'deny', scope: 'project', label: 'bash · rm -rf', match: { kind: 'signature', value: 'k2' } }],
+          },
+        }),
+      }
     }
     if (target.includes('/log')) return { json: async () => ({ ok: true, records: sampleRecords() }) }
     return { json: async () => ({ ok: true, placement: 'all', writable: true }) }
@@ -281,7 +296,7 @@ describe('客户端半加载与注册', () => {
     expect(trees[1].includes('用户明确要求运行测试。')).toBe(true)
     expect(trees[1].includes('白名单')).toBe(true)
     expect(trees[1].includes('bash · npm test')).toBe(true)
-    // 命中 chip 带上规则来源：模型/记忆写的规则=自动，你手动加的=手动
+    // 命中 chip 带上规则来源（记录里没存时靠策略快照反查）：模型/记忆写的=自动，你手动加的=手动
     expect(trees[1].includes('白名单·自动')).toBe(true)
     expect(trees[1].includes('黑名单·手动')).toBe(true)
     // 决策来源标签：与「命中名单」同一形态的 chip 行（不是塞在结论徽标前面）

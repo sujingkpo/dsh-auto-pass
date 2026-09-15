@@ -488,7 +488,25 @@ window.__ModuleLoader__.load({
         react.createElement('span', { className: 'ap-fieldVal' + (mono === true ? ' ap-mono' : '') }, String(value)))
     }
 
-/** 记录里的决策来源；老记录没有这个字段时按 verdict / outcome 兜底推断。 */
+    /**
+     * 命中规则的来源：记录里存了就用记录里的；老记录没有这个字段时，按 ruleId 去当前策略快照反查——
+     * 规则本身带 source，所以历史记录也能显示「自动 / 手动」。
+     */
+    function ruleSourceOf(record) {
+      if (record.policy === undefined) return undefined
+      if (record.policy.source !== undefined) return record.policy.source
+      const snapshot = policyStore.value
+      if (snapshot === null || typeof snapshot !== 'object') return undefined
+      const view = record.policy.scope === 'project' ? snapshot.project : snapshot.global
+      if (view === undefined || view === null) return undefined
+      for (const list of ['allow', 'deny']) {
+        const rule = (view[list] ?? []).find(candidate => candidate.id === record.policy.ruleId)
+        if (rule !== undefined && rule.source !== undefined) return rule.source
+      }
+      return undefined
+    }
+
+    /** 记录里的决策来源；老记录没有这个字段时按 verdict / outcome 兜底推断。 */
     function decidedByOf(record) {
       if (record.decidedBy === 'auto' || record.decidedBy === 'human') return record.decidedBy
       const pluginDecided = record.verdict === 'allow' || record.policy?.list === 'allow'
@@ -606,9 +624,8 @@ window.__ModuleLoader__.load({
         ? undefined
         : scopeLabel(record.policy.scope) + ' · ' + String(record.policy.label ?? '')
       // 命中 chip 形如「白名单·自动」：自动 = 模型建议/记忆升级写进去的，手动 = 你自己加/升级的
-      const hitSource = record.policy?.source === undefined
-        ? ''
-        : '·' + (record.policy.source === 'user' ? t.ruleManual : t.ruleAuto)
+      const hitSourceOf = ruleSourceOf(record)
+      const hitSource = hitSourceOf === undefined ? '' : '·' + (hitSourceOf === 'user' ? t.ruleManual : t.ruleAuto)
       const hitBadge = record.policy === undefined
         ? undefined
         : (record.policy.list === 'allow' ? t.hitAllow : t.hitDeny) + hitSource
@@ -869,6 +886,8 @@ window.__ModuleLoader__.load({
 
       react.useEffect(() => {
         let alive = true
+        // 时间线也要有一份策略快照：命中 chip 的「自动 / 手动」靠它反查规则来源
+        void policyStore.load()
         const tick = () => {
           if (alive && (visible || state.loaded === false)) void load()
         }
