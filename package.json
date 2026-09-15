@@ -1,7 +1,7 @@
 {
-  "name": "dsh-auto",
-  "version": "0.1.0",
-  "description": "Model-reviewed Auto Approve permission preset for the DeepSeek Harness Web UI",
+  "name": "dsh-auto-pass",
+  "version": "0.2.0",
+  "description": "Model-reviewed Auto Approve permission preset: only review-passed actions are auto-approved, everything else is handed back to the user",
   "type": "module",
   "main": "src/index.js",
   "exports": {

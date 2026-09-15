@@ -1,10 +1,18 @@
+/**
+ * @description dsh-auto-pass 插件入口。为 `Auto Approve` 权限档位引入一个独立的
+ *   只读 Reviewer 子 Agent：只有审查结论为 allow 的请求由插件自动放行；模型 deny、
+ *   宿主安全降级与审查失败一律交回 DSH 原生人工审批链（ask），由用户决定。
+ * @author simon300000
+ * @date 2026-08-14
+ * @modify 2026-09-15 更名 dsh-auto-pass；拒绝与审查失败改为转人工审批，移除连续拒绝中断逻辑
+ */
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 
-export const name = 'dsh-auto-approve'
+export const name = 'dsh-auto-pass'
 export const inject = ['approval', 'subagents', 'tools']
 
-const REVIEWER_OPTIONS = Symbol('dsh-auto-reviewer-options')
+const REVIEWER_OPTIONS = Symbol('dsh-auto-pass-reviewer-options')
 const REVIEWER_TOOLS = Object.freeze(['read', 'glob', 'grep'])
 const REVIEWER_EXECUTABLE_TOOLS = new Set([...REVIEWER_TOOLS, 'structured_output'])
 const LANGUAGE_DETECTION_STATES = new WeakMap()
@@ -16,7 +24,6 @@ const DEFAULTS = Object.freeze({
   language: 'auto',
   timeoutMs: 90_000,
   maxInvestigationSteps: 4,
-  maxConsecutiveDenials: 3,
   maxMessageTranscriptTokens: 4_000,
   maxToolTranscriptTokens: 3_000,
   maxMessageEntryTokens: 1_000,
@@ -61,38 +68,37 @@ const guardianPrompts = Object.freeze({
 
 /**
  * 挂载自动审批编排器及 Reviewer 的同步创建期隔离。只有 `auto-approve`
- * 会话由模型审查，其他权限档位继续调用后续人工审批器。
+ * 会话由模型审查：插件对审查通过的请求返回 `allowed-once`，其余结果一律调用
+ * `next()` 交回后续人工审批器（ask）；其他权限档位直接沿用原生审批链。
  */
 export function apply(ctx, config) {
   const resolved = resolveConfig(config, message => ctx.logger.warn(message))
   installReviewerIsolation(ctx)
-  const denials = new WeakMap()
-  ctx.on('approval/request', createAutoApprovalHandler(ctx, resolved, denials), { prepend: true })
+  ctx.on('approval/request', createAutoApprovalHandler(ctx, resolved), { prepend: true })
 }
 
 /** 对 loader 或测试传入的配置做运行时边界校验。 */
 export function resolveConfig(config = {}, warn = message => console.warn(message)) {
   let resolved = { ...DEFAULTS, ...config }
   if (!LANGUAGES.includes(resolved.language)) {
-    warn(`dsh-auto: language=${String(resolved.language)} 无效，已回退为 auto`)
+    warn(`dsh-auto-pass: language=${String(resolved.language)} 无效，已回退为 auto`)
     resolved = { ...resolved, language: 'auto' }
   }
   const hasProvider = resolved.reviewerProvider !== undefined
   const hasModel = resolved.reviewerModel !== undefined
   if (hasProvider !== hasModel) {
-    throw new Error('dsh-auto: reviewerProvider 和 reviewerModel 必须同时设置')
+    throw new Error('dsh-auto-pass: reviewerProvider 和 reviewerModel 必须同时设置')
   }
   if (hasProvider && (resolved.reviewerProvider.trim() === '' || resolved.reviewerModel.trim() === '')) {
-    throw new Error('dsh-auto: 审查模型的提供方和模型名称不能为空')
+    throw new Error('dsh-auto-pass: 审查模型的提供方和模型名称不能为空')
   }
   if (resolved.reviewerReasoningEffort !== undefined
     && (typeof resolved.reviewerReasoningEffort !== 'string' || resolved.reviewerReasoningEffort.trim() === '')) {
-    throw new Error('dsh-auto: reviewerReasoningEffort 必须是非空字符串')
+    throw new Error('dsh-auto-pass: reviewerReasoningEffort 必须是非空字符串')
   }
   for (const key of [
     'timeoutMs',
     'maxInvestigationSteps',
-    'maxConsecutiveDenials',
     'maxMessageTranscriptTokens',
     'maxToolTranscriptTokens',
     'maxMessageEntryTokens',
@@ -104,7 +110,7 @@ export function resolveConfig(config = {}, warn = message => console.warn(messag
     'maxOutputTokens',
   ]) {
     if (!Number.isSafeInteger(resolved[key]) || resolved[key] <= 0) {
-      throw new Error(`dsh-auto: ${key} 必须是正整数`)
+      throw new Error(`dsh-auto-pass: ${key} 必须是正整数`)
     }
   }
   return Object.freeze(resolved)
@@ -153,7 +159,7 @@ const HOST_MESSAGES = Object.freeze({
     actionTooLong: maxChars => `待审批动作长度超过 ${maxChars} 字符上限。`,
     missingRoute: '没有可用的审查模型路由。',
     timeout: timeoutMs => `自动审查超过 ${timeoutMs} 毫秒总时限`,
-    reviewFailed: problem => `自动审查失败并按失败关闭处理：${problem}`,
+    reviewFailed: problem => `自动审查未能完成，已转人工审批：${problem}`,
     invalidAssessment: 'Reviewer 没有返回结构化审查对象',
     invalidRiskLevel: '审查结果 risk_level 无效',
     invalidAuthorization: '审查结果 user_authorization 无效',
@@ -163,16 +169,15 @@ const HOST_MESSAGES = Object.freeze({
     unknownField: key => `审查结果包含未知字段 ${key}`,
     defaultAllowRationale: '自动审查返回低风险允许决定。',
     defaultDenyRationale: '自动审查返回拒绝决定，但没有提供理由。',
-    criticalDowngrade: '宿主安全下限禁止批准 critical 风险动作。',
-    highRiskDowngrade: '宿主安全下限要求 high 风险动作至少具有 medium 用户授权。',
-    interrupted: count => `Auto Approve 在当前 turn 连续拒绝了 ${count} 次审批请求`,
+    criticalDowngrade: '宿主安全下限要求 critical 风险动作必须转交用户决定。',
+    highRiskDowngrade: '宿主安全下限要求 high 风险动作至少具有 medium 用户授权，本次已转交用户决定。',
   }),
   en: Object.freeze({
     missingAction: 'The exact tool call awaiting approval could not be found.',
     actionTooLong: maxChars => `The action awaiting approval exceeds the ${maxChars}-character limit.`,
     missingRoute: 'No reviewer model route is available.',
     timeout: timeoutMs => `The automatic review exceeded its total ${timeoutMs} ms timeout`,
-    reviewFailed: problem => `The automatic review failed and was closed safely: ${problem}`,
+    reviewFailed: problem => `The automatic review could not complete and the request was handed to the user: ${problem}`,
     invalidAssessment: 'The Reviewer did not return a structured assessment object',
     invalidRiskLevel: 'The assessment has an invalid risk_level',
     invalidAuthorization: 'The assessment has an invalid user_authorization',
@@ -182,9 +187,8 @@ const HOST_MESSAGES = Object.freeze({
     unknownField: key => `The assessment contains an unknown field: ${key}`,
     defaultAllowRationale: 'The automatic review returned a low-risk allow decision.',
     defaultDenyRationale: 'The automatic review returned a deny decision without a rationale.',
-    criticalDowngrade: 'The host safety floor forbids approval of critical-risk actions.',
-    highRiskDowngrade: 'The host safety floor requires at least medium user authorization for high-risk actions.',
-    interrupted: count => `Auto Approve denied ${count} approval requests consecutively in the current turn`,
+    criticalDowngrade: 'The host safety floor requires critical-risk actions to be decided by the user.',
+    highRiskDowngrade: 'The host safety floor requires at least medium user authorization for high-risk actions; the request was handed to the user.',
   }),
 })
 
@@ -249,8 +253,8 @@ function isHanCharacter(codePoint) {
     || (codePoint >= 0x20000 && codePoint <= 0x323af)
 }
 
-/** 创建可单测的 waterfall 监听器。 */
-export function createAutoApprovalHandler(ctx, config, denialState = new WeakMap()) {
+/** 创建可单测的 waterfall 监听器：插件只自动放行审查通过的请求。 */
+export function createAutoApprovalHandler(ctx, config) {
   return async (request, next) => {
     if (selectedPermissionPreset(request.agent.session) !== 'auto-approve') {
       return next()
@@ -261,40 +265,16 @@ export function createAutoApprovalHandler(ctx, config, denialState = new WeakMap
 
     const action = exactAction(request)
     if (action === undefined) {
-      return rejectWithoutReview(
-        ctx,
-        request,
-        messages.missingAction,
-        config,
-        denialState,
-        undefined,
-        language,
-      )
+      return deferWithoutReview(ctx, request, messages.missingAction, next, language)
     }
     const actionJson = JSON.stringify(action)
     if (actionJson.length > config.maxActionChars) {
-      return rejectWithoutReview(
-        ctx,
-        request,
-        messages.actionTooLong(config.maxActionChars),
-        config,
-        denialState,
-        action.turn,
-        language,
-      )
+      return deferWithoutReview(ctx, request, messages.actionTooLong(config.maxActionChars), next, language)
     }
 
     const route = resolveRoute(request, config)
     if (route === undefined) {
-      return rejectWithoutReview(
-        ctx,
-        request,
-        messages.missingRoute,
-        config,
-        denialState,
-        action.turn,
-        language,
-      )
+      return deferWithoutReview(ctx, request, messages.missingRoute, next, language)
     }
 
     const timeoutSignal = AbortSignal.timeout(config.timeoutMs)
@@ -304,13 +284,16 @@ export function createAutoApprovalHandler(ctx, config, denialState = new WeakMap
     const evidence = buildReviewEvidence(ctx, request, action, config)
     const prompt = buildReviewPrompt(evidence, language)
     ctx.logger.info(
-      `dsh-auto: 开始审查 parentSession=${request.agent.session.id} `
+      `dsh-auto-pass: 开始审查 parentSession=${request.agent.session.id} `
       + `callId=${request.callId} route=${route.provider}/${route.model} language=${language} `
       + `timeoutMs=${config.timeoutMs}`,
     )
 
     let run
     let reviewerStopReason = '<not-started>'
+    // 只有完整通过审查协议且结论为 allow 时才自动放行；其余情况让 assessment
+    // 保持 undefined，统一落到函数末尾的转人工审批分支。
+    let assessment
     try {
       run = await ctx.subagents.start('spawn', {
         label: `_auto-approve:${request.callId}`,
@@ -342,17 +325,10 @@ export function createAutoApprovalHandler(ctx, config, denialState = new WeakMap
         throw new Error(messages.incompleteReview(result.stopReason))
       }
       const modelAssessment = parseAssessment(result.structured, language)
-      const assessment = enforceHostPolicy(modelAssessment, language)
-      const denial = recordAssessment(
-        denialState,
-        request.agent,
-        action.turn,
-        assessment.outcome,
-        config.maxConsecutiveDenials,
-      )
+      assessment = enforceHostPolicy(modelAssessment, language)
 
       ctx.logger.info(
-        `dsh-auto: 审查完成 parentSession=${request.agent.session.id} reviewerSession=${run.id} `
+        `dsh-auto-pass: 审查完成 parentSession=${request.agent.session.id} reviewerSession=${run.id} `
         + `callId=${request.callId} steps=${steps} stopReason=${result.stopReason} `
         + `language=${language} risk=${assessment.risk_level} `
         + `authorization=${assessment.user_authorization} outcome=${assessment.outcome}`,
@@ -362,12 +338,7 @@ export function createAutoApprovalHandler(ctx, config, denialState = new WeakMap
         route,
         reviewerSessionId: run.id,
         steps,
-        consecutiveDenials: denial.count,
-        denialThreshold: config.maxConsecutiveDenials,
-        turnInterrupted: denial.interrupt,
       }, language)
-      if (denial.interrupt) queueTurnInterrupt(request.agent, denial.count, language)
-      return assessment.outcome === 'allow' ? 'allowed-once' : 'rejected'
     } catch (error) {
       if (request.signal?.aborted) return 'cancelled'
       const problem = signal.aborted && timeoutSignal.aborted
@@ -375,70 +346,44 @@ export function createAutoApprovalHandler(ctx, config, denialState = new WeakMap
         : error instanceof Error ? error.message : String(error)
       if (signal.aborted && timeoutSignal.aborted) reviewerStopReason = 'timeout'
       ctx.logger.warn(
-        `dsh-auto: 审查失败并关闭 parentSession=${request.agent.session.id} `
+        `dsh-auto-pass: 审查未完成并转人工审批 parentSession=${request.agent.session.id} `
         + `reviewerSession=${run?.id ?? '<not-created>'} callId=${request.callId} `
         + `steps=${countReviewerSteps(run?.localAgent)} stopReason=${reviewerStopReason} reason=${safeLogValue(problem)}`,
       )
-      const denial = recordAssessment(
-        denialState,
-        request.agent,
-        action.turn,
-        'deny',
-        config.maxConsecutiveDenials,
-      )
       injectReviewNotice(ctx, request, {
-        outcome: 'deny',
+        outcome: 'defer',
         route,
         reviewerSessionId: run?.id,
         steps: countReviewerSteps(run?.localAgent),
-        consecutiveDenials: denial.count,
-        denialThreshold: config.maxConsecutiveDenials,
-        turnInterrupted: denial.interrupt,
         rationale: messages.reviewFailed(problem),
       }, language)
-      if (denial.interrupt) queueTurnInterrupt(request.agent, denial.count, language)
-      return 'rejected'
     } finally {
       if (run !== undefined) {
         try {
           await run.dispose()
         } catch (error) {
           ctx.logger.warn(
-            `dsh-auto: Reviewer 子 Agent 释放失败 reviewerSession=${run.id} reason=${safeLogValue(errorMessage(error))}`,
+            `dsh-auto-pass: Reviewer 子 Agent 释放失败 reviewerSession=${run.id} reason=${safeLogValue(errorMessage(error))}`,
           )
         }
       }
     }
+
+    // 插件绝不代替用户拒绝：非 allow 的结论（模型 deny、宿主安全降级、审查
+    // 失败）一律调用 next() 进入 DSH 原生人工审批链，把决定权交还用户。
+    return assessment?.outcome === 'allow' ? 'allowed-once' : next()
   }
 }
 
-function rejectWithoutReview(
-  ctx,
-  request,
-  reason,
-  config,
-  denialState,
-  turn = approvalTurn(request),
-  language = 'zh',
-) {
-  ctx.logger.warn(`dsh-auto: ${reason} 已拒绝`)
-  const denial = recordAssessment(
-    denialState,
-    request.agent,
-    turn,
-    'deny',
-    config.maxConsecutiveDenials,
-  )
+/** 不进入模型审查的请求：记录转交理由后直接交给后续人工审批器。 */
+function deferWithoutReview(ctx, request, reason, next, language) {
+  ctx.logger.warn(`dsh-auto-pass: ${reason} 已转人工审批`)
   injectReviewNotice(ctx, request, {
-    outcome: 'deny',
+    outcome: 'defer',
     steps: 0,
-    consecutiveDenials: denial.count,
-    denialThreshold: config.maxConsecutiveDenials,
-    turnInterrupted: denial.interrupt,
     rationale: reason,
   }, language)
-  if (denial.interrupt) queueTurnInterrupt(request.agent, denial.count, language)
-  return 'rejected'
+  return next()
 }
 
 /** 提取与 callId 对应的原始工具参数；缺少关联参数时拒绝猜测。 */
@@ -659,7 +604,7 @@ function boundedJson(value, maxTokens) {
 function boundedText(text, maxTokens) {
   const maxChars = maxTokens * CHARS_PER_TOKEN
   if (text.length <= maxChars) return text
-  const marker = `<dsh-auto-truncated omitted_chars=${text.length - maxChars} />`
+  const marker = `<dsh-auto-pass-truncated omitted_chars=${text.length - maxChars} />`
   const available = Math.max(0, maxChars - marker.length)
   const prefix = Math.floor(available / 2)
   return `${text.slice(0, prefix)}${marker}${text.slice(text.length - (available - prefix))}`
@@ -736,7 +681,7 @@ export function parseAssessment(value, language = 'zh') {
   })
 }
 
-/** 宿主只能把 allow 降级，绝不能把模型 deny 升级。 */
+/** 宿主只能把 allow 降级为 deny（同样转人工审批），绝不能把模型 deny 升级。 */
 export function enforceHostPolicy(assessment, language = 'zh') {
   const messages = HOST_MESSAGES[language]
   if (assessment.outcome === 'deny') return assessment
@@ -758,40 +703,6 @@ export function enforceHostPolicy(assessment, language = 'zh') {
   return assessment
 }
 
-function recordAssessment(states, agent, turn, outcome, threshold) {
-  const previous = states.get(agent)
-  if (outcome === 'allow') {
-    states.set(agent, { turn, count: 0, interrupted: false })
-    return { count: 0, interrupt: false }
-  }
-  const count = previous?.turn === turn ? previous.count + 1 : 1
-  const interrupt = count >= threshold && !(previous?.turn === turn && previous.interrupted)
-  states.set(agent, { turn, count, interrupted: interrupt || previous?.interrupted === true })
-  return { count, interrupt }
-}
-
-function approvalTurn(request) {
-  const session = request.agent.session
-  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
-    const event = session.eventAt(seq)
-    if (event.type === 'tool/call' && event.data.callId === request.callId) return event.data.turn
-  }
-  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
-    const event = session.eventAt(seq)
-    if (event.data?.turn !== undefined) return event.data.turn
-  }
-  return '<unknown-turn>'
-}
-
-function queueTurnInterrupt(agent, count, language) {
-  setTimeout(() => {
-    agent.cancel({
-      kind: 'hook',
-      reason: HOST_MESSAGES[language].interrupted(count),
-    })
-  }, 0)
-}
-
 function countReviewerSteps(agent) {
   if (agent === undefined) return 0
   return agent.session.snapshotEvents().filter(event => event.type === 'step/start').length
@@ -799,31 +710,27 @@ function countReviewerSteps(agent) {
 
 const NOTICE_LABELS = Object.freeze({
   zh: Object.freeze({
-    allowed: '允许',
-    denied: '拒绝',
-    headline: (verdict, toolName) => `Auto Approve 自动审查已${verdict}这次 ${toolName} 操作。`,
-    summary: verdict => `Auto Approve：${verdict}`,
+    allowedHeadline: toolName => `Auto Approve 已自动批准这次 ${toolName} 操作。`,
+    deferredHeadline: toolName => `Auto Approve 未自动批准这次 ${toolName} 操作，已转交你审批。`,
+    summaryAllowed: 'Auto Approve：允许',
+    summaryDeferred: 'Auto Approve：转交人工审批',
     riskLevel: '风险等级：',
     userAuthorization: '用户授权：',
     reviewerModel: '审查模型：',
     reviewerSession: 'Reviewer 会话：',
     steps: '调查步骤：',
-    consecutiveDenials: '当前 turn 连续拒绝：',
-    interrupted: '已达到阈值，将中断当前 turn。',
     rationale: '理由：',
   }),
   en: Object.freeze({
-    allowed: 'allowed',
-    denied: 'denied',
-    headline: (verdict, toolName) => `Auto Approve automatically ${verdict} this ${toolName} action.`,
-    summary: verdict => `Auto Approve: ${verdict}`,
+    allowedHeadline: toolName => `Auto Approve automatically allowed this ${toolName} action.`,
+    deferredHeadline: toolName => `Auto Approve did not auto-approve this ${toolName} action; it has been handed to you to decide.`,
+    summaryAllowed: 'Auto Approve: allowed',
+    summaryDeferred: 'Auto Approve: deferred to the user',
     riskLevel: 'Risk level: ',
     userAuthorization: 'User authorization: ',
     reviewerModel: 'Reviewer model: ',
     reviewerSession: 'Reviewer session: ',
     steps: 'Investigation steps: ',
-    consecutiveDenials: 'Consecutive denials in this turn: ',
-    interrupted: 'The denial threshold was reached; the current turn will be interrupted.',
     rationale: 'Rationale: ',
   }),
 })
@@ -831,21 +738,18 @@ const NOTICE_LABELS = Object.freeze({
 /** 把安全摘要加入父 Agent；完整调查过程保留在 Reviewer 子 session。 */
 function injectReviewNotice(ctx, request, review, language) {
   const labels = NOTICE_LABELS[language]
-  const verdict = review.outcome === 'allow' ? labels.allowed : labels.denied
+  // 只有 allow 是插件自己给出的结论，其余（deny / defer）都是转交用户处理。
+  const allowed = review.outcome === 'allow'
   const rationale = review.rationale.length <= MAX_NOTICE_REASON_CHARS
     ? review.rationale
     : `${review.rationale.slice(0, MAX_NOTICE_REASON_CHARS - 1)}…`
   const details = [
-    labels.headline(verdict, request.toolName),
+    allowed ? labels.allowedHeadline(request.toolName) : labels.deferredHeadline(request.toolName),
     ...(review.risk_level === undefined ? [] : [`${labels.riskLevel}${review.risk_level}`]),
     ...(review.user_authorization === undefined ? [] : [`${labels.userAuthorization}${review.user_authorization}`]),
     ...(review.route === undefined ? [] : [`${labels.reviewerModel}${review.route.provider}/${review.route.model}`]),
     ...(review.reviewerSessionId === undefined ? [] : [`${labels.reviewerSession}${review.reviewerSessionId}`]),
     `${labels.steps}${review.steps}`,
-    ...(review.consecutiveDenials === undefined || review.consecutiveDenials === 0
-      ? []
-      : [`${labels.consecutiveDenials}${review.consecutiveDenials}/${review.denialThreshold}`]),
-    ...(review.turnInterrupted === true ? [labels.interrupted] : []),
     `${labels.rationale}${rationale}`,
   ]
   try {
@@ -855,13 +759,13 @@ function injectReviewNotice(ctx, request, review, language) {
       content: [{ type: 'text', text: details.join('\n') }],
       source: {
         kind: 'plugin',
-        plugin: 'dsh-auto',
+        plugin: 'dsh-auto-pass',
         form: 'notice',
-        summary: labels.summary(verdict),
+        summary: allowed ? labels.summaryAllowed : labels.summaryDeferred,
       },
     })
   } catch (error) {
-    ctx.logger.warn(`dsh-auto: 无法把审查通知加入会话：${safeLogValue(errorMessage(error))}`)
+    ctx.logger.warn(`dsh-auto-pass: 无法把审查通知加入会话：${safeLogValue(errorMessage(error))}`)
   }
 }
 

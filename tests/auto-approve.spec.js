@@ -1,3 +1,10 @@
+/**
+ * @description dsh-auto-pass 单元测试：覆盖结构化审查协议、Reviewer 创建期隔离、
+ *   证据装配、语言自动选择，以及「只自动放行 allow，其余一律转人工审批」的审批语义。
+ * @author simon300000
+ * @date 2026-08-14
+ * @modify 2026-09-15 适配 dsh-auto-pass：deny 与审查失败改为调用 next() 转人工
+ */
 import { describe, expect, it, vi } from 'vitest'
 import {
   apply,
@@ -266,46 +273,59 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     }))
   })
 
-  it('一次 Reviewer 正常 deny 后直接拒绝，不重新审查或转人工', async () => {
+  it('Reviewer deny 时转交人工审批，且不再重复审查', async () => {
     const ctx = contextWith(reviewerRun(deny))
-    const next = vi.fn()
-    const outcome = await createAutoApprovalHandler(ctx, resolveConfig())(requestWith(), next)
+    const next = vi.fn().mockResolvedValue('rejected')
+    const request = requestWith()
+    const outcome = await createAutoApprovalHandler(ctx, resolveConfig())(request, next)
+
     expect(outcome).toBe('rejected')
     expect(ctx.subagents.start).toHaveBeenCalledOnce()
-    expect(next).not.toHaveBeenCalled()
+    expect(next).toHaveBeenCalledOnce()
+    expect(request.agent.cancel).not.toHaveBeenCalled()
+    const notice = request.agent.inject.mock.calls.at(-1)[0]
+    expect(notice.content[0].text).toContain('未自动批准这次 bash 操作，已转交你审批。')
+    expect(notice.content[0].text).toContain('理由：提权范围超过运行测试所需。')
+    expect(notice.source.summary).toBe('Auto Approve：转交人工审批')
   })
 
-  it('子 Agent 异常、无 structured 输出或缺少精确动作时失败关闭', async () => {
+  it('子 Agent 异常、无 structured 输出或缺少精确动作时一律转人工审批', async () => {
     const failedRun = reviewerRun(undefined, {
       result: Promise.resolve({ stopReason: 'error', output: [] }),
     })
     const ctx = contextWith(failedRun)
-    expect(await createAutoApprovalHandler(ctx, resolveConfig())(requestWith(), vi.fn())).toBe('rejected')
+    const failedNext = vi.fn().mockResolvedValue('allowed-once')
+    const failedRequest = requestWith()
+    expect(await createAutoApprovalHandler(ctx, resolveConfig())(failedRequest, failedNext)).toBe('allowed-once')
     expect(ctx.subagents.start).toHaveBeenCalledOnce()
+    expect(failedNext).toHaveBeenCalledOnce()
+    expect(failedRequest.agent.inject.mock.calls.at(-1)[0].content[0].text)
+      .toContain('Reviewer 子 Agent 未正常结束：error')
 
     const missing = requestWith('auto-approve', { callId: undefined })
-    expect(await createAutoApprovalHandler(ctx, resolveConfig())(missing, vi.fn())).toBe('rejected')
+    const missingNext = vi.fn().mockResolvedValue('rejected')
+    expect(await createAutoApprovalHandler(ctx, resolveConfig())(missing, missingNext)).toBe('rejected')
+    expect(missingNext).toHaveBeenCalledOnce()
+    expect(missing.agent.inject.mock.calls.at(-1)[0].content[0].text)
+      .toContain('理由：找不到待审批工具调用的精确参数。')
     expect(ctx.subagents.start).toHaveBeenCalledOnce()
   })
 
-  it('连续三次有效拒绝会在当前 turn 结束后中断父 Agent', async () => {
-    vi.useFakeTimers()
+  it('连续多次 deny 不再中断 turn，每次都会转交人工审批', async () => {
     const runs = [reviewerRun(deny), reviewerRun(deny), reviewerRun(deny)]
     const ctx = contextWith(runs)
     const request = requestWith()
-    const handler = createAutoApprovalHandler(ctx, resolveConfig({ maxConsecutiveDenials: 3 }))
+    const handler = createAutoApprovalHandler(ctx, resolveConfig())
+    const next = vi.fn().mockResolvedValue('allowed-once')
 
-    await handler(request, vi.fn())
-    await handler(request, vi.fn())
-    await handler(request, vi.fn())
+    for (let index = 0; index < 3; index += 1) {
+      expect(await handler(request, next)).toBe('allowed-once')
+    }
+    expect(next).toHaveBeenCalledTimes(3)
     expect(request.agent.cancel).not.toHaveBeenCalled()
-    await vi.runAllTimersAsync()
-    expect(request.agent.cancel).toHaveBeenCalledWith(expect.objectContaining({
-      kind: 'hook',
-      reason: expect.stringContaining('连续拒绝了 3 次'),
-    }))
-    expect(request.agent.inject.mock.calls.at(-1)[0].content[0].text).toContain('3/3')
-    vi.useRealTimers()
+    const notice = request.agent.inject.mock.calls.at(-1)[0]
+    expect(notice.content[0].text).not.toContain('连续拒绝')
+    expect(notice.content[0].text).not.toContain('中断')
   })
 })
 
@@ -378,7 +398,8 @@ describe('输入装配与配置', () => {
       maxAgentInstructionTokens: 6_000,
       maxRecentNonUserEntries: 20,
     })
-    expect(() => resolveConfig({ maxConsecutiveDenials: 0 })).toThrow(/正整数/)
+    expect(() => resolveConfig({ maxActionChars: 0 })).toThrow(/正整数/)
+    expect(resolveConfig()).not.toHaveProperty('maxConsecutiveDenials')
     expect(() => resolveConfig({ reviewerReasoningEffort: ' ' })).toThrow(/reviewerReasoningEffort/)
     const warn = vi.fn()
     expect(resolveConfig({ language: 'ja' }, warn).language).toBe('auto')
@@ -522,9 +543,26 @@ describe('审查语言自动选择', () => {
       callId: undefined,
       sessionOverrides: { directUserText: 'Please run the tests' },
     })
-    expect(await createAutoApprovalHandler(contextWith(reviewerRun(allowEnglish)), resolveConfig())(failed, vi.fn()))
+    const failedNext = vi.fn().mockResolvedValue('rejected')
+    expect(await createAutoApprovalHandler(contextWith(reviewerRun(allowEnglish)), resolveConfig())(failed, failedNext))
       .toBe('rejected')
-    expect(failed.agent.inject.mock.calls.at(-1)[0].content[0].text)
+    expect(failedNext).toHaveBeenCalledOnce()
+    const deferredNotice = failed.agent.inject.mock.calls.at(-1)[0]
+    expect(deferredNotice.content[0].text)
+      .toContain('Auto Approve did not auto-approve this bash action; it has been handed to you to decide.')
+    expect(deferredNotice.content[0].text)
       .toContain('Rationale: The exact tool call awaiting approval could not be found.')
+    expect(deferredNotice.source.summary).toBe('Auto Approve: deferred to the user')
+
+    const denied = requestWith('auto-approve', {
+      sessionOverrides: { directUserText: 'Please run the tests' },
+    })
+    const deniedNext = vi.fn().mockResolvedValue('allowed-once')
+    expect(await createAutoApprovalHandler(
+      contextWith(reviewerRun({ ...deny, rationale: 'Out of scope.' })),
+      resolveConfig(),
+    )(denied, deniedNext)).toBe('allowed-once')
+    expect(deniedNext).toHaveBeenCalledOnce()
+    expect(denied.agent.inject.mock.calls.at(-1)[0].content[0].text).toContain('Rationale: Out of scope.')
   })
 })
