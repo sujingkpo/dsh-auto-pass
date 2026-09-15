@@ -506,6 +506,62 @@ describe('输入装配与配置', () => {
     })
   })
 
+  it('ptc 子调用：审批请求带派生 id 时回退到 tool/ptc-dispatch-start', () => {
+    const events = [
+      event('tool/call', {
+        turn: 3,
+        step: 2,
+        callId: 'call-parent',
+        name: 'run_code',
+        arguments: '{"code":"await tools.pwsh({ command: \"git push\" })"}',
+      }, 0),
+      event('tool/ptc-dispatch-start', {
+        rootCallId: 'call-parent',
+        parentCallId: 'call-parent',
+        subCallId: 'call-parent:ptc:1',
+        name: 'pwsh',
+        arguments: {
+          command: 'git push',
+          sandbox_permissions: 'danger-full-access',
+          justification: '推送提交',
+        },
+      }, 1),
+    ]
+    const session = {
+      id: 'session-ptc',
+      seq: events.length,
+      eventAt: seq => events[seq],
+      snapshotEvents: () => events,
+      header: { cwd: '/workspace' },
+    }
+    const request = {
+      agent: { session },
+      toolName: 'pwsh',
+      callId: 'call-parent:ptc:1',
+      reason: 'escalate sandbox to danger-full-access: 推送提交',
+    }
+
+    expect(exactAction(request)).toEqual({
+      toolName: 'pwsh',
+      callId: 'call-parent:ptc:1',
+      turn: 3,
+      step: 2,
+      arguments: {
+        command: 'git push',
+        sandbox_permissions: 'danger-full-access',
+        justification: '推送提交',
+      },
+      approvalReason: 'escalate sandbox to danger-full-access: 推送提交',
+      cwd: '/workspace',
+      subCallId: 'call-parent:ptc:1',
+      parentCallId: 'call-parent',
+      parentToolName: 'run_code',
+    })
+    // 派生 id 对不上、或工具名对不上时，仍然拒绝猜测
+    expect(exactAction({ ...request, callId: 'call-parent:ptc:9' })).toBeUndefined()
+    expect(exactAction({ ...request, toolName: 'bash' })).toBeUndefined()
+  })
+
   it('从原始 events 分离 system、AGENTS、消息、工具和当前权限', () => {
     const request = requestWith()
     const ctx = contextWith(reviewerRun(allow))

@@ -624,28 +624,57 @@ function truncateText(text, maxChars) {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`
 }
 
-/** 提取与 callId 对应的原始工具参数；缺少关联参数时拒绝猜测。 */
+/**
+ * 提取与 callId 对应的原始工具参数；缺少关联参数时拒绝猜测。
+ *
+ * ptc 预设（run_code 里内联调用别的工具）下，审批请求带的是**派生子调用 id**
+ * `<父 callId>:ptc:<n>`（dsh-tools 的 `subCallId`），会话里没有该 id 的
+ * `tool/call` 事件——直接查必然失配。此时回退到 `tool/ptc-dispatch-start`
+ * （它带 subCallId、真实的 name 与内层 arguments），并从父 `tool/call` 补齐
+ * turn/step，让 Reviewer 看到的是真正在跑的那条命令。
+ */
 export function exactAction(request) {
   if (request.callId === undefined) return undefined
-  let toolCall
   const session = request.agent.session
+  const direct = lastEventMatching(session, event => event.type === 'tool/call'
+    && event.data?.callId === request.callId)
+  if (direct !== undefined && direct.data.name === request.toolName) {
+    return actionOf(request, direct.data)
+  }
+  const dispatch = lastEventMatching(session, event => event.type === 'tool/ptc-dispatch-start'
+    && event.data?.subCallId === request.callId)
+  if (dispatch === undefined || dispatch.data.name !== request.toolName) return undefined
+  const parent = lastEventMatching(session, event => event.type === 'tool/call'
+    && event.data?.callId === dispatch.data.parentCallId)
+  return actionOf(request, dispatch.data, {
+    subCallId: request.callId,
+    ...(dispatch.data.parentCallId === undefined ? {} : { parentCallId: dispatch.data.parentCallId }),
+    ...(parent === undefined
+      ? {}
+      : { parentToolName: parent.data.name, turn: parent.data.turn, step: parent.data.step }),
+  })
+}
+
+/** 从会话事件末尾往前找第一条满足条件的事件。 */
+function lastEventMatching(session, predicate) {
   for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
     const event = session.eventAt(seq)
-    if (event.type === 'tool/call' && event.data.callId === request.callId) {
-      toolCall = event.data
-      break
-    }
+    if (predicate(event)) return event
   }
-  if (toolCall === undefined) return undefined
-  if (toolCall.name !== request.toolName) return undefined
+  return undefined
+}
+
+/** 把事件里的调用数据整理成审查用的「精确动作」。 */
+function actionOf(request, data, extra = {}) {
   return {
     toolName: request.toolName,
     callId: request.callId,
-    turn: toolCall.turn,
-    step: toolCall.step,
-    arguments: toolCall.arguments,
+    turn: data.turn,
+    step: data.step,
+    arguments: data.arguments,
     ...(request.reason === undefined ? {} : { approvalReason: request.reason }),
     ...(request.agent.session.header?.cwd === undefined ? {} : { cwd: request.agent.session.header.cwd }),
+    ...extra,
   }
 }
 
