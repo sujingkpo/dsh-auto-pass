@@ -2,9 +2,9 @@
 
 English | [中文](README.zh.md)
 
-`dsh-auto-pass` adds a `自动审批` (Auto Approve) permission preset to the DeepSeek Harness Web UI. Each action that requires approval is reviewed by a fresh, restricted DSH child Agent, and the plugin only auto-approves the requests that pass that review. A model denial, a host safety downgrade, and a failed review are all handed back to DSH's normal approval chain, so the user decides — the plugin never denies on the user's behalf.
+`dsh-auto-pass` adds a `自动审批` (Auto Approve) permission preset to the DeepSeek Harness Web UI. Each action that requires approval goes through a single-shot model review (no child Agent, no transcript: just the normalized action plus your last message), and the plugin only auto-approves the requests that pass that review. A model denial, a host safety downgrade, and a failed review are all handed back to DSH's normal approval chain, so the user decides — the plugin never denies on the user's behalf.
 
-On top of that sit two layers of *permission memory*: an **allowlist** (allowed directly from then on, with no model call) and a **denylist** (handed to you directly, with no model call), both at **project** and **global** scope. A rule comes from one of three places: your own promote/demote action in the timeline, the suggested rule the Reviewer returned with its review, or **the confirmation prompt that follows a threshold** — after the same permission in the same project has been approved (default 3 times; auto-approvals and your own approvals both count) or denied (default 3 times; model denials and your own rejections both count) in a row, the plugin **first has the DSH model turn the action into a match condition** and then asks whether to add it to the allowlist/denylist (this project / global / do not add). Nothing is written until you confirm, and answering "do not add" stops the plugin from asking about that action again.
+On top of that sit two layers of *permission memory*: an **allowlist** (allowed directly from then on, with no model call) and a **denylist** (handed to you directly, with no model call), both at **project** and **global** scope. A rule comes from one of three places: your own promote/demote action in the timeline, the suggested rule the Reviewer returned with its review, or **the confirmation prompt that follows a threshold** — after the same permission in the same project has been approved (default 3 times; auto-approvals and your own approvals both count) or denied (default 3 times; model denials and your own rejections both count) in a row, the plugin asks whether to add it to the allowlist/denylist (this project / global / do not add), using the match condition the review already returned — or this exact signature when the review had none (no extra model call). Nothing is written until you confirm, and answering "do not add" stops the plugin from asking about that action again.
 
 The current release supports the Web UI only.
 
@@ -36,18 +36,17 @@ flowchart TD
 With `Auto Approve` selected, ordinary actions permitted by `workspace-write` run without a Reviewer call. The diagram shows the sandbox-escalation path; other tool approval rules can also trigger Auto Approve.
 
 - The plugin handles `approval/request` only when the session selects `Auto Approve`. Other permission presets continue through DSH's existing approval chain.
-- Each approval starts one `spawn` Reviewer session. DSH's own agent loop handles any bounded `read`, `glob`, or `grep` investigation and captures the final structured result; the plugin does not implement a separate model/tool loop.
-- The child is created with a read-only sandbox and `approval/policy = never`. An execution guard denies every tool except `read`, `glob`, `grep`, and the scoped structured-output tool, permits no further subagents, and allows at most four investigation steps plus the final response step. Sensitive files may be inspected only when a minimal read-only check can change the decision.
-- The Reviewer receives the exact pending action, approval reason, current permissions, bounded raw session events, the main Agent's assembled system instructions, and AGENTS.md or equivalent workspace instructions. Stable instructions are serialized in a separate cacheable prefix before session identifiers, transcripts, permissions, and action data. Direct user messages, human answers returned by `ask_user_question`, assembled system instructions, and workspace instructions can establish authorization; assistant content and other tool results remain untrusted evidence.
+- Each approval is one plain `llm.stream` call. The review gets no child Agent, no tools, no file access and no session history, so it cannot investigate — it decides from what it is handed.
+- The prompt is two JSON sections: the normalized action (tool name, command/paths, cwd, whether an escalation was requested) and minimal context (your last user message plus the most recent `ask_user_question` answer, each truncated to `maxEvidenceChars`, 400 by default). Only those two can establish authorization; anything else is not in the prompt at all.
 - Only `outcome` is required in the structured result. A compact `{"outcome":"allow"}` defaults to low risk and unknown authorization; omitted fields on a denial default to high risk and unknown authorization. Explicit assessments may also contain `risk_level`, `user_authorization`, and `rationale`. The host always denies critical risk and denies high risk without at least medium user authorization. Invalid output, missing action data, timeout, cancellation-independent infrastructure failure, and tool failure are never turned into an automatic denial: they hand the request back to the user.
 - A model denial is not re-reviewed and is never turned into an automatic rejection: the plugin calls the next answerer, so the request continues through DSH's normal approval chain and the user decides. `allowed-once` is the only outcome the plugin ever produces on its own.
-- **Lists take priority over the model review**: a denylist hit is handed to the user and an allowlist hit is allowed, both without starting a Reviewer (no model spend). The denylist always beats the allowlist, and a project rule beats a global one.
+- **Lists take priority over the model review**: a denylist hit is handed to the user and an allowlist hit is allowed, both without calling the model. The denylist always beats the allowlist, and a project rule beats a global one.
 - A **permission signature** is derived from the tool name plus normalized key arguments and is independent of call id and time: command tools use the command text (whitespace collapsed), file tools use path arguments, and everything else uses a key-sorted JSON of its arguments. Extra arguments such as an escalation marker are part of the signature, so an escalated retry is not treated as an ordinary call. The signature is what "similar permission" actually means here.
-- **Automatic promotion** counts only approvals you made yourself: approvals the plugin granted are excluded, and so are manual approvals of an action that matched a list rule. After the signature has been approved manually that many times in a row within one project (default 3, editable in the panel), the plugin writes an **exact-signature** memory rule and resets the counter; a single rejection resets the streak immediately.
+- **Automatic promotion** counts consecutive approvals of the same signature in one project (default 3, counts auto-approvals and your own approvals alike) and consecutive denials (default 3). The approval that matched a list rule never counts. When the threshold is reached the plugin asks you (this project / global / do not add) and only writes a rule after you confirm; a rejection of that suggestion stops future counting and asking for that action.
 - When the exact action cannot be resolved (for example the approval request arrives before its `tool/call` event) **no signature is created**. Such requests take part in neither list matching nor counting — otherwise they would all collapse into one empty signature and a few approvals would auto-approve every unresolvable call.
-- The default 90-second deadline covers child creation, all model steps, local read-only investigation, and final structured output. Each approval is still isolated in its own child session.
+- The default 90-second deadline covers that single streaming call.
 
-The parent session records the approval events and a compact plugin notice: an auto-approved action gets the `allowed` notice, and a request handed back to the user gets a notice that names the Reviewer's rationale for not approving it. The Reviewer child session uses an `_auto-approve:<callId>` label and contains its messages, investigation tool calls and results, final assessment, and turn end. Console logs contain identifiers, model route, step count, stop reason, risk, authorization, and outcome, but not full prompts or file contents.
+The parent session records the approval events and a compact plugin notice: an auto-approved action gets the `allowed` notice, and a request handed back to the user gets a notice that names the Reviewer's rationale for not approving it. The review itself leaves no child session behind: host logs record the route, risk, authorization and outcome for each review, but not full prompts or file contents.
 
 ## Panels: approval policy and approval timeline
 
@@ -92,16 +91,9 @@ The bundled defaults use `deepseek-official/deepseek-v4-flash` with `high` reaso
     reviewerModel: deepseek-v4-flash
     reviewerReasoningEffort: high
     timeoutMs: 90000
-    maxInvestigationSteps: 4
-    maxMessageTranscriptTokens: 4000
-    maxToolTranscriptTokens: 3000
-    maxMessageEntryTokens: 1000
-    maxToolEntryTokens: 512
-    maxSystemInstructionTokens: 6000
-    maxAgentInstructionTokens: 6000
-    maxRecentNonUserEntries: 20
+    maxEvidenceChars: 400
     maxActionChars: 16000
-    maxOutputTokens: 8192
+    maxOutputTokens: 2048
     maxRecords: 1000
     placement: all
     autoApproveAfter: 3

@@ -9,15 +9,36 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   apply,
   assessmentSchema,
-  buildReviewEvidence,
   buildReviewPrompt,
   createAutoApprovalHandler,
   enforceHostPolicy,
   exactAction,
+  exactRuleOf,
   parseAssessment,
+  parseJsonReply,
   resolveConfig,
   resolveReviewLanguage,
 } from '../src/index.js'
+
+// 单轮调用要用 DSH 的 llm 模块（消息构造器 + 流式装配器）。测试环境里没有这个包，
+// 用工厂 mock 顶掉：装配器只认本套测试产出的文本块。
+vi.mock('@deepseek-ai/dsh-llm', () => ({
+  createUserMessage: input => ({ role: 'user', ...input }),
+  BlockAssembler: class {
+    constructor() {
+      this.parts = []
+    }
+
+    push(chunk) {
+      if (typeof chunk === 'string') this.parts.push(chunk)
+      else if (chunk !== null && typeof chunk === 'object' && chunk.text !== undefined) this.parts.push(String(chunk.text))
+    }
+
+    blocks() {
+      return this.parts.length === 0 ? [] : [{ type: 'text', text: this.parts.join('') }]
+    }
+  },
+}))
 
 function event(type, data, seq) {
   return { type, data, seq, time: seq }
@@ -146,17 +167,45 @@ function reviewerRun(structured, overrides = {}) {
   }
 }
 
-function contextWith(runs) {
-  const queue = Array.isArray(runs) ? [...runs] : [runs]
-  return {
-    subagents: {
-      start: vi.fn().mockImplementation(() => Promise.resolve(queue.shift())),
+/** 把旧的 reviewerRun(...) 写法转成「模型回复 JSON」的取数函数。 */
+function toReply(item) {
+  if (typeof item === 'string' || item instanceof Error) return item
+  return async () => {
+    const result = await item.result
+    if (result?.stopReason !== undefined && result.stopReason !== 'completed') {
+      throw new Error('模型调用未正常结束：' + result.stopReason)
+    }
+    return JSON.stringify(result?.structured ?? {})
+  }
+}
+
+/**
+ * 假宿主：llm 服务按顺序吐出排练好的回复。
+ * 每个条目可以是字符串（模型回复）、Error（调用失败），或沿用旧的 reviewerRun(...)（转成 JSON 回复）。
+ */
+function contextWith(replies) {
+  const queue = (Array.isArray(replies) ? [...replies] : [replies]).map(toReply)
+  const calls = []
+  const llm = {
+    stream(options) {
+      calls.push(options)
+      const next = queue.length === 0 ? new Error('没有排练好的模型回复') : queue.shift()
+      return (async function* () {
+        const value = typeof next === 'function' ? await next() : next
+        if (value instanceof Error) throw value
+        yield { text: value }
+      })()
     },
-    get: vi.fn(name => name === 'sandboxPolicy'
-      ? { resolve: () => ({ mode: 'workspace-write' }) }
-      : name === 'approval'
-        ? { config: { policy: 'ask' }, overrideOf: () => undefined }
-        : undefined),
+  }
+  return {
+    llmCalls: calls,
+    get: vi.fn(name => name === 'llm'
+      ? llm
+      : name === 'sandboxPolicy'
+        ? { resolve: () => ({ mode: 'workspace-write' }) }
+        : name === 'approval'
+          ? { config: { policy: 'ask' }, overrideOf: () => undefined }
+          : undefined),
     logger: { info: vi.fn(), warn: vi.fn() },
   }
 }
@@ -224,12 +273,11 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     const outcome = await createAutoApprovalHandler(ctx, resolveConfig())(requestWith('workspace-write'), next)
     expect(outcome).toBe('allowed-once')
     expect(next).toHaveBeenCalledOnce()
-    expect(ctx.subagents.start).not.toHaveBeenCalled()
+    expect(ctx.llmCalls).toHaveLength(0)
   })
 
-  it('为一次审批启动一个受限 spawn Reviewer，并读取 structured 结果', async () => {
-    const run = reviewerRun(allow)
-    const ctx = contextWith(run)
+  it('单轮审查：一次 llm.stream 拿结论，不起子代理也不带转录', async () => {
+    const ctx = contextWith(JSON.stringify(allow))
     const request = requestWith()
     const config = resolveConfig({
       reviewerProvider: 'deepseek-official',
@@ -239,35 +287,29 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     const outcome = await createAutoApprovalHandler(ctx, config)(request, vi.fn())
 
     expect(outcome).toBe('allowed-once')
-    expect(ctx.subagents.start).toHaveBeenCalledOnce()
-    const [provider, start] = ctx.subagents.start.mock.calls[0]
-    expect(provider).toBe('spawn')
-    expect(start).toMatchObject({
-      label: '_auto-approve:call-1',
-      parent: request.agent,
-      agentOptions: {
-        provider: 'deepseek-official',
-        model: 'deepseek-v4-flash',
-        maxTokens: 8_192,
-      },
-      persona: expect.stringContaining('独立安全审批 Reviewer'),
-      // restrict 名单只能列端能力工具：run_code 是保留的 PTC 传输层，列进去会直接报错
-      toolFilter: { allow: ['read', 'glob', 'grep'] },
-      outputSchema: assessmentSchema,
-      maxDepth: 1,
+    expect(ctx.llmCalls).toHaveLength(1)
+    expect(ctx.llmCalls[0]).toMatchObject({
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-flash',
+      maxTokens: 2_048,
+      reasoningEffort: 'high',
+      sessionId: 'session-1',
+      purpose: 'auto-approve-review',
     })
-    expect(start.prompt[0].text).toContain('MAIN SYSTEM INSTRUCTIONS')
-    expect(start.prompt[0].text).toContain('Instructions from: AGENTS.md')
-    expect(start.prompt[0].text).toContain('justification')
-    expect(start.prompt[0].text).toContain('trusted_for_authorization')
-    expect(start.prompt[0].text).not.toContain('CACHEABLE')
-    expect(start.prompt[0].text).not.toContain('cacheable')
-    expect(start.prompt[0].text.indexOf('审查上下文'))
-      .toBeLessThan(start.prompt[0].text.indexOf('本次审批'))
-    expect(start.prompt[0].text.indexOf('MAIN SYSTEM INSTRUCTIONS'))
-      .toBeLessThan(start.prompt[0].text.indexOf('session-1'))
-    expect(start.persona).toContain('使用直接用户 prompt 的语言书写简短理由')
-    expect(run.dispose).toHaveBeenCalledOnce()
+    // 极简：只带动作 + 最后一条用户消息 + 最近一次人工回答，没有 system / AGENTS / 助手消息 / 工具流水
+    const prompt = ctx.llmCalls[0].messages[0].content[0].text
+    expect(prompt).toContain('npm test')
+    expect(prompt).toContain('请运行测试')
+    expect(prompt).toContain('允许')          // ask_user_question 的人工回答
+    expect(prompt).toContain('danger-full-access')
+    expect(prompt).not.toContain('MAIN SYSTEM INSTRUCTIONS')
+    expect(prompt).not.toContain('Instructions from: AGENTS.md')
+    expect(prompt).not.toContain('我会运行测试。')
+    expect(prompt).not.toContain('justification')
+    // 单轮审查的提示词本身也很小（历史上限：一次审查的输入控制在几百 token）
+    expect(prompt.length).toBeLessThan(1_500)
+    expect(ctx.llmCalls[0].system).toContain('权限审查器')
+    expect(ctx.llmCalls[0].system).toContain('中文')
     const notice = request.agent.inject.mock.calls.at(-1)[0]
     // 通知只占一行：会进模型上下文，Reviewer 会话等细节留在时间线与宿主日志里
     expect(notice.content).toHaveLength(1)
@@ -280,14 +322,14 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(notice.source).toMatchObject({ form: 'notice', summary: '[自动] 自动审批：允许' })
   })
 
-  it('Reviewer deny 时转交人工审批，且不再重复审查', async () => {
+  it('模型 deny 时转交人工审批', async () => {
     const ctx = contextWith(reviewerRun(deny))
     const next = vi.fn().mockResolvedValue('rejected')
     const request = requestWith()
     const outcome = await createAutoApprovalHandler(ctx, resolveConfig())(request, next)
 
     expect(outcome).toBe('rejected')
-    expect(ctx.subagents.start).toHaveBeenCalledOnce()
+    expect(ctx.llmCalls).toHaveLength(1)
     expect(next).toHaveBeenCalledOnce()
     expect(request.agent.cancel).not.toHaveBeenCalled()
     const notice = request.agent.inject.mock.calls.at(-1)[0]
@@ -306,10 +348,10 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     const failedNext = vi.fn().mockResolvedValue('allowed-once')
     const failedRequest = requestWith()
     expect(await createAutoApprovalHandler(ctx, resolveConfig())(failedRequest, failedNext)).toBe('allowed-once')
-    expect(ctx.subagents.start).toHaveBeenCalledOnce()
+    expect(ctx.llmCalls).toHaveLength(1)
     expect(failedNext).toHaveBeenCalledOnce()
     expect(failedRequest.agent.inject.mock.calls.at(-1)[0].content[0].text)
-      .toContain('Reviewer 子 Agent 未正常结束：error')
+      .toContain('自动审查未能完成，已转人工审批：模型调用未正常结束：error')
 
     const missing = requestWith('auto-approve', { callId: undefined })
     const missingNext = vi.fn().mockResolvedValue('rejected')
@@ -317,7 +359,8 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(missingNext).toHaveBeenCalledOnce()
     expect(missing.agent.inject.mock.calls.at(-1)[0].content[0].text)
       .toContain('理由：找不到待审批工具调用的精确参数。')
-    expect(ctx.subagents.start).toHaveBeenCalledOnce()
+    // 拿不到精确动作时不建签名、也不调模型：只消耗了一条排练回复（第一次审查用掉）
+    expect(ctx.llmCalls).toHaveLength(1)
   })
 
   it('自动放行的审批写入一条 allow 记录', async () => {
@@ -343,8 +386,7 @@ describe('Auto Approve Reviewer 子 Agent', () => {
       riskLevel: 'low',
       userAuthorization: 'high',
       rationale: allow.rationale,
-      reviewerSessionId: 'reviewer-session-1',
-      steps: 2,
+      steps: 0,
       route: { provider: 'reviewer', model: 'safe-model' },
       // 插件自己决定的：时间线与通知都显示「自动」
       decidedBy: 'auto',
@@ -383,7 +425,7 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     )
 
     expect(outcome).toBe('rejected')
-    expect(ctx.subagents.start).not.toHaveBeenCalled()
+    expect(ctx.llmCalls).toHaveLength(0)
     expect(records.add.mock.calls[0][0]).toMatchObject({ verdict: 'defer', outcome: 'rejected', steps: 0, decidedBy: 'human' })
   })
 
@@ -420,80 +462,19 @@ describe('Auto Approve Reviewer 子 Agent', () => {
   })
 })
 
-describe('Reviewer 创建期隔离', () => {
-  it('在首次请求前钉死只读沙箱、工具 guard、推理等级和 step 上限', async () => {
-    const listeners = new Map()
-    const ctx = {
-      logger: { info: vi.fn(), warn: vi.fn() },
-      on: vi.fn((name, listener) => {
-        listeners.set(name, listener)
-        return vi.fn()
-      }),
-      inject: vi.fn(),
-    }
-    apply(ctx, {
-      reviewerProvider: 'deepseek-official',
-      reviewerModel: 'deepseek-v4-flash',
-      reviewerReasoningEffort: 'high',
-      maxInvestigationSteps: 4,
-    })
-
-    const approval = contextWith(reviewerRun(allow))
-    const request = requestWith()
-    await createAutoApprovalHandler(approval, resolveConfig({ reviewerReasoningEffort: 'high' }))(request, vi.fn())
-    const start = approval.subagents.start.mock.calls[0][1]
-    const scopedListeners = new Map()
-    let guard
-    const reviewer = {
-      options: start.agentOptions,
-      session: { append: vi.fn() },
-      ctx: {
-        tools: { guard: vi.fn(candidate => { guard = candidate }) },
-        on: vi.fn((name, listener) => { scopedListeners.set(name, listener); return vi.fn() }),
-      },
-    }
-    listeners.get('agent/created')({ agent: reviewer })
-
-    expect(reviewer.session.append).toHaveBeenCalledWith('sandbox/mode', {
-      mode: 'read-only',
-      source: 'delegation',
-    })
-    expect(reviewer.session.append).toHaveBeenCalledWith('approval/policy', {
-      policy: 'never',
-      source: 'delegation',
-    })
-    expect(guard({ name: 'read', arguments: { file_path: 'src/index.js' } })).toBeUndefined()
-    expect(guard({ name: 'structured_output' })).toBeUndefined()
-    // ptc 档位下 run_code 是唯一入口：必须放行，否则 Reviewer 既查不了也交不了结论
-    expect(guard({ name: 'run_code', arguments: { code: 'await tools.read({ file_path: "a" })' } })).toBeUndefined()
-    expect(guard({ name: 'write' })).toMatch(/只允许只读/)
-    expect(guard({ name: 'bash' })).toMatch(/只允许只读/)
-    expect(guard({ name: 'read', arguments: { file_path: '.env' } })).toBeUndefined()
-    expect(guard({ name: 'grep', arguments: { pattern: 'token', path: '.ssh' } })).toBeUndefined()
-    expect(guard({ name: 'grep', arguments: { pattern: 'token', include: '*.ts' } })).toBeUndefined()
-    await expect(scopedListeners.get('agent/request')({}, () => Promise.resolve({ provider: 'p', model: 'm' })))
-      .resolves.toMatchObject({ reasoningEffort: 'high' })
-    await expect(scopedListeners.get('agent/pre-step')({ step: 5 }, () => Promise.resolve({ kind: 'enter' })))
-      .resolves.toEqual({ kind: 'enter' })
-    await expect(scopedListeners.get('agent/pre-step')({ step: 6 }, vi.fn()))
-      .resolves.toEqual({ kind: 'reject' })
-  })
-})
 
 describe('输入装配与配置', () => {
   it('默认总时限为 90 秒并校验正整数', () => {
     expect(resolveConfig()).toMatchObject({
       language: 'auto',
       timeoutMs: 90_000,
-      maxInvestigationSteps: 4,
-      maxMessageTranscriptTokens: 4_000,
-      maxToolTranscriptTokens: 3_000,
-      maxMessageEntryTokens: 1_000,
-      maxToolEntryTokens: 512,
-      maxSystemInstructionTokens: 6_000,
-      maxAgentInstructionTokens: 6_000,
-      maxRecentNonUserEntries: 20,
+      maxEvidenceChars: 400,
+      maxActionChars: 16_000,
+      maxOutputTokens: 2_048,
     })
+    // 单轮审查后不再需要转录/调查预算这些键；profile 里旧值原样传进来也不报错
+    expect(resolveConfig({ maxTranscriptTokens: 1, maxInvestigationSteps: 4 }))
+      .toMatchObject({ maxEvidenceChars: 400 })
     expect(() => resolveConfig({ maxActionChars: 0 })).toThrow(/正整数/)
     expect(resolveConfig()).not.toHaveProperty('maxConsecutiveDenials')
     expect(() => resolveConfig({ reviewerReasoningEffort: ' ' })).toThrow(/reviewerReasoningEffort/)
@@ -578,52 +559,57 @@ describe('输入装配与配置', () => {
     expect(exactAction({ ...request, toolName: 'bash' })).toBeUndefined()
   })
 
-  it('从原始 events 分离 system、AGENTS、消息、工具和当前权限', () => {
+  it('极简证据：只带最后一条用户消息与最近一次人工回答', () => {
     const request = requestWith()
-    const ctx = contextWith(reviewerRun(allow))
-    const evidence = buildReviewEvidence(ctx, request, exactAction(request), resolveConfig())
-    expect(evidence.reviewer_context.main_agent_instructions.system).toEqual({
-      trusted_for_policy: true,
-      trusted_for_authorization: true,
-      content: 'MAIN SYSTEM INSTRUCTIONS',
+    const prompt = buildReviewPrompt({
+      request,
+      action: exactAction(request),
+      signature: { toolName: 'bash', key: 'bash:npm test', text: 'bash · npm test', command: 'npm test', paths: [] },
+      config: resolveConfig(),
+      language: 'zh',
     })
-    expect(evidence.reviewer_context.main_agent_instructions).not.toHaveProperty('developer')
-    expect(evidence.reviewer_context.main_agent_instructions).not.toHaveProperty('developer_note')
-    expect(evidence.reviewer_context.main_agent_instructions.workspace_instructions.records[0])
-      .toContain('AGENTS.md')
-    expect(evidence.reviewer_context.main_agent_instructions.workspace_instructions.records[0])
-      .toContain('"trusted_for_authorization":true')
-    expect(evidence.approval_request.transcript.messages.records
-      .some(record => record.includes('trusted_for_authorization'))).toBe(true)
-    expect(evidence.approval_request.transcript.tools.records
-      .some(record => record.includes('tool_call'))).toBe(true)
-    expect(evidence.approval_request.transcript.tools.records.some(record => record.includes('ask-1')
-      && record.includes('"trusted_for_authorization":true'))).toBe(true)
-    expect(evidence.approval_request.current_permissions).toEqual({
-      permission_preset: 'auto-approve',
-      sandbox_mode: 'workspace-write',
-      approval_policy: 'ask',
-    })
-    expect(evidence.approval_request.reviewed_parent_session_id).toBe('session-1')
-    expect(evidence.approval_request.exact_action.callId).toBe('call-1')
+    expect(prompt).toContain('待执行的工具调用')
+    expect(prompt).toContain('npm test')
+    // 用户最后一条消息 + 最近一次 ask_user_question 的人工回答
+    expect(prompt).toContain('请运行测试')
+    expect(prompt).toContain('允许')
+    // 不带 system / AGENTS / 助手消息 / 工具流水 / 权限快照
+    expect(prompt).not.toContain('MAIN SYSTEM INSTRUCTIONS')
+    expect(prompt).not.toContain('Instructions from: AGENTS.md')
+    expect(prompt).not.toContain('我会运行测试。')
+    expect(prompt).not.toContain('trusted_for_authorization')
+    expect(prompt).not.toContain('justification')
+    expect(prompt.length).toBeLessThan(1_500)
   })
 
-  it('ptc 档位的内层调用同样进证据，内层 ask_user_question 仍算可信授权', () => {
+  it('证据按 maxEvidenceChars 截断', () => {
+    const request = requestWith('auto-approve', {
+      sessionOverrides: { directUserText: 'x'.repeat(1_000) },
+    })
+    const prompt = buildReviewPrompt({
+      request,
+      action: exactAction(request),
+      signature: { toolName: 'bash', key: 'k', text: 't' },
+      config: resolveConfig({ maxEvidenceChars: 50 }),
+      language: 'zh',
+    })
+    expect(prompt).toContain('x'.repeat(49) + '…')
+    expect(prompt.length).toBeLessThan(400)
+  })
+
+  it('ptc 档位：内层 ask_user_question 的人工回答仍然算授权证据', () => {
     const events = [
       event('user/message', { id: 'user-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '帮我跑测试' }] }, 0),
       event('tool/call', { turn: 1, step: 1, callId: 'call-parent', name: 'run_code', arguments: '{"code":"..."}' }, 1),
       event('tool/ptc-dispatch-start', {
         rootCallId: 'call-parent', parentCallId: 'call-parent', subCallId: 'call-parent:ptc:1',
-        name: 'pwsh', arguments: { command: 'npm test' },
+        name: 'pwsh', arguments: { command: 'git push' },
       }, 2),
       event('tool/ptc-dispatch', {
-        rootCallId: 'call-parent', parentCallId: 'call-parent', subCallId: 'call-parent:ptc:1',
-        name: 'pwsh', arguments: { command: 'npm test' }, isError: false, content: [{ type: 'text', text: 'ok' }],
-      }, 3),
-      event('tool/ptc-dispatch', {
         rootCallId: 'call-parent', parentCallId: 'call-parent', subCallId: 'call-parent:ptc:2',
-        name: 'ask_user_question', arguments: { questions: [] }, isError: false, content: [{ type: 'text', text: '{"answers":[]}' }],
-      }, 4),
+        name: 'ask_user_question', arguments: { questions: [] }, isError: false,
+        content: [{ type: 'text', text: '用户选了：可以推送' }],
+      }, 3),
     ]
     const session = {
       id: 'session-ptc',
@@ -634,34 +620,16 @@ describe('输入装配与配置', () => {
       requestHeader: () => ({ system: 'MAIN SYSTEM INSTRUCTIONS' }),
     }
     const request = { agent: { session }, toolName: 'pwsh', callId: 'call-parent:ptc:1', reason: 'escalate' }
-    const evidence = buildReviewEvidence(contextWith(reviewerRun(allow)), request, exactAction(request), resolveConfig())
-    const records = evidence.approval_request.transcript.tools.records
-    // 内层调用要作为真正的工具调用出现（否则 Reviewer 只看到一段 run_code 脚本）
-    expect(records.some(record => record.includes('call-parent:ptc:1') && record.includes('"via_ptc":true'))).toBe(true)
-    // 内层 ask_user_question 的回答是可信授权来源，ptc 档位下不能丢这个标记
-    const answer = records.find(record => record.includes('call-parent:ptc:2'))
-    expect(answer).toBeDefined()
-    expect(answer).toContain('"trusted_for_authorization":true')
-  })
-
-  it('把稳定指令放在动态审批数据之前，并使用两个独立 JSON 区段', () => {
-    const request = requestWith()
-    const evidence = buildReviewEvidence(
-      contextWith(reviewerRun(allow)),
+    const prompt = buildReviewPrompt({
       request,
-      exactAction(request),
-      resolveConfig(),
-    )
-    const prompt = buildReviewPrompt(evidence)
-    const contextIndex = prompt.indexOf('审查上下文')
-    const approvalIndex = prompt.indexOf('本次审批')
-
-    expect(prompt).not.toMatch(/cacheable|dynamic/i)
-    expect(contextIndex).toBeGreaterThanOrEqual(0)
-    expect(approvalIndex).toBeGreaterThan(contextIndex)
-    expect(prompt.indexOf('MAIN SYSTEM INSTRUCTIONS')).toBeLessThan(approvalIndex)
-    expect(prompt.indexOf('session-1')).toBeGreaterThan(approvalIndex)
-    expect(prompt.indexOf('call-1')).toBeGreaterThan(approvalIndex)
+      action: exactAction(request),
+      signature: { toolName: 'pwsh', key: 'pwsh:git push', text: 'pwsh · git push', command: 'git push' },
+      config: resolveConfig(),
+      language: 'zh',
+    })
+    expect(prompt).toContain('帮我跑测试')
+    expect(prompt).toContain('用户选了：可以推送')
+    expect(prompt).toContain('git push')
   })
 })
 
@@ -700,25 +668,19 @@ describe('审查语言自动选择', () => {
     expect(resolveReviewLanguage(languageSession(['请帮我运行全部测试']), 'en')).toBe('en')
   })
 
-  it('英文会话使用英文任务提示、通知、guard 和宿主失败理由', async () => {
-    const listeners = new Map()
-    apply({
-      logger: { info: vi.fn(), warn: vi.fn() },
-      on: vi.fn((name, listener) => { listeners.set(name, listener); return vi.fn() }),
-      inject: vi.fn(),
-    }, {})
-
+  it('英文会话使用英文提示、通知与转交理由', async () => {
     const ctx = contextWith(reviewerRun(allowEnglish))
     const request = requestWith('auto-approve', {
       sessionOverrides: { directUserText: 'Please run the tests' },
     })
     expect(await createAutoApprovalHandler(ctx, resolveConfig())(request, vi.fn())).toBe('allowed-once')
 
-    const start = ctx.subagents.start.mock.calls[0][1]
-    expect(start.persona).toContain('Write a concise rationale in the language used by the direct user prompt')
-    expect(start.persona).toContain('独立安全审批 Reviewer')
-    expect(start.prompt[0].text).toContain('Review context')
-    expect(start.prompt[0].text).not.toContain('审查上下文')
+    const call = ctx.llmCalls[0]
+    // 审查 system 模板固定是中文那份（语言只影响「理由用什么语言写」，在模板里替换）
+    expect(call.system).toContain('权限审查器')
+    expect(call.system).toContain('the language used by the direct user message')
+    expect(call.messages[0].content[0].text).toContain('The tool call awaiting approval')
+    expect(call.messages[0].content[0].text).not.toContain('待执行的工具调用')
     const notice = request.agent.inject.mock.calls.at(-1)[0]
     expect(notice.content[0].text.startsWith('[auto]')).toBe(true)
     expect(notice.content[0].text).toContain('Auto Approve allowed bash')
@@ -726,16 +688,6 @@ describe('审查语言自动选择', () => {
     expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).toContain('Rationale: The user explicitly requested')
     expect(notice.source.summary).toBe('[auto] Auto Approve: allowed')
-
-    let guard
-    listeners.get('agent/created')({
-      agent: {
-        options: start.agentOptions,
-        session: { append: vi.fn() },
-        ctx: { tools: { guard: vi.fn(candidate => { guard = candidate }) }, on: vi.fn(() => vi.fn()) },
-      },
-    })
-    expect(guard({ name: 'write' })).toMatch(/read-only investigation tools/)
 
     const failed = requestWith('auto-approve', {
       callId: undefined,

@@ -22,6 +22,38 @@ import {
 import { createPolicyStore } from '../src/policy.js'
 import { signatureOf } from '../src/policy.js'
 
+// 单轮调用要用 DSH 的 llm 模块（消息构造器 + 流式装配器）。测试环境里没有这个包，
+// 用工厂 mock 顶掉：装配器只认本套测试产出的文本块。
+vi.mock('@deepseek-ai/dsh-llm', () => ({
+  createUserMessage: input => ({ role: 'user', ...input }),
+  BlockAssembler: class {
+    constructor() {
+      this.parts = []
+    }
+
+    push(chunk) {
+      if (typeof chunk === 'string') this.parts.push(chunk)
+      else if (chunk !== null && typeof chunk === 'object' && chunk.text !== undefined) this.parts.push(String(chunk.text))
+    }
+
+    blocks() {
+      return this.parts.length === 0 ? [] : [{ type: 'text', text: this.parts.join('') }]
+    }
+  },
+}))
+
+/** 把 reviewerRun(...) 转成「模型回复」的取数函数（stopReason 不是 completed 就当调用失败）。 */
+function toReply(item) {
+  if (typeof item === 'string' || item instanceof Error) return item
+  return async () => {
+    const result = await item.result
+    if (result?.stopReason !== undefined && result.stopReason !== 'completed') {
+      throw new Error('模型调用未正常结束：' + result.stopReason)
+    }
+    return JSON.stringify(result?.structured ?? {})
+  }
+}
+
 const tempDirs = []
 
 function tempDir() {
@@ -79,15 +111,30 @@ function requestWith(options = {}) {
   }
 }
 
+/** 假宿主：llm 服务按顺序吐出排练好的回复（单轮审查 / 单轮规则优化共用）。 */
 function contextWith(runs = [], options = {}) {
-  const queue = [...runs]
+  const queue = [...runs].map(toReply)
+  const calls = []
+  const llm = {
+    stream(call) {
+      calls.push(call)
+      const next = queue.length === 0 ? new Error('没有排练好的模型回复') : queue.shift()
+      return (async function* () {
+        const value = typeof next === 'function' ? await next() : next
+        if (value instanceof Error) throw value
+        yield { text: value }
+      })()
+    },
+  }
   return {
-    subagents: { start: vi.fn().mockImplementation(() => Promise.resolve(queue.shift())) },
-    get: vi.fn(name => name === 'sandboxPolicy'
-      ? { resolve: () => ({ mode: 'workspace-write' }) }
-      : name === 'approval'
-        ? { config: { policy: 'ask' }, overrideOf: () => undefined }
-        : name === 'userQuestions' ? options.userQuestions : undefined),
+    llmCalls: calls,
+    get: vi.fn(name => name === 'llm'
+      ? llm
+      : name === 'sandboxPolicy'
+        ? { resolve: () => ({ mode: 'workspace-write' }) }
+        : name === 'approval'
+          ? { config: { policy: 'ask' }, overrideOf: () => undefined }
+          : name === 'userQuestions' ? options.userQuestions : undefined),
     logger: { info: vi.fn(), warn: vi.fn() },
   }
 }
@@ -108,14 +155,34 @@ function reviewerRun(structured) {
   }
 }
 
-/** Reviewer 判定放行。 */
-function allowRun() {
-  return reviewerRun({ risk_level: 'low', user_authorization: 'high', outcome: 'allow', rationale: '用户明确要求。' })
+/** 达到阈值后要写进名单的匹配条件：由审查那一次调用顺带给出（不再单独跑规则优化）。 */
+const RULE_SUGGESTION = Object.freeze({
+  tool: 'bash',
+  match_kind: 'command_prefix',
+  match_value: 'npm test',
+  label: 'npm 测试命令',
+})
+
+/** Reviewer 判定放行；可选带上一条建议规则。 */
+function allowRun(rule) {
+  return reviewerRun({
+    risk_level: 'low',
+    user_authorization: 'high',
+    outcome: 'allow',
+    rationale: '用户明确要求。',
+    ...(rule === undefined ? {} : { rule }),
+  })
 }
 
-/** Reviewer 判定拒绝。 */
-function denyRun() {
-  return reviewerRun({ risk_level: 'high', user_authorization: 'low', outcome: 'deny', rationale: '这条命令风险过高。' })
+/** Reviewer 判定拒绝；可选带上一条建议规则。 */
+function denyRun(rule) {
+  return reviewerRun({
+    risk_level: 'high',
+    user_authorization: 'low',
+    outcome: 'deny',
+    rationale: '这条命令风险过高。',
+    ...(rule === undefined ? {} : { rule }),
+  })
 }
 
 /** 规则优化调用：返回优化后的匹配条件（不是审查结论）。 */
@@ -165,7 +232,7 @@ describe('白名单与黑名单', () => {
 
     expect(outcome).toBe('allowed-once')
     expect(next).not.toHaveBeenCalled()
-    expect(ctx.subagents.start).not.toHaveBeenCalled()
+    expect(ctx.llmCalls).toHaveLength(0)
     // 通知的折叠标题与正文都带「名单·自动」标签
     const notice = request.agent.inject.mock.calls.at(-1)[0]
     expect(notice.source.summary).toContain('[白名单·自动]')
@@ -184,7 +251,7 @@ describe('白名单与黑名单', () => {
 
     expect(outcome).toBe('rejected')
     expect(next).toHaveBeenCalledOnce()
-    expect(ctx.subagents.start).not.toHaveBeenCalled()
+    expect(ctx.llmCalls).toHaveLength(0)
   })
 
   it('白名单命中的记录写清命中的是哪一侧与哪条规则（时间线据此显示白名单）', async () => {
@@ -249,7 +316,8 @@ describe('权限记忆（达阈值后询问用户）', () => {
     const policies = policyStore(root, 2)
     const asked = []
     // 两次审查 + 一次规则优化（队列顺序即调用顺序）：审查不放行名单，规则优化产出 command_prefix 条件
-    const ctx = contextWith([allowRun(), allowRun(), ruleRun()], {
+    // 达阈值后不再另起「规则优化」调用：直接用审查那次给出的建议规则问用户
+    const ctx = contextWith([allowRun(), allowRun(RULE_SUGGESTION)], {
       userQuestions: {
         ask: async request => {
           asked.push(request)
@@ -283,10 +351,11 @@ describe('权限记忆（达阈值后询问用户）', () => {
     expect(rules[0].source).toBe('model')
     expect(JSON.parse(readFileSync(join(projectDir, '.dsh-auto-pass', 'policy.json'), 'utf8')).rules.allow).toHaveLength(1)
 
-    // 第三次直接命中名单：连人工链都不用调
+    // 第三次直接命中名单：连人工链都不用调，模型也只被叫过两次（达阈值没有额外的固化调用）
     const third = vi.fn()
     expect(await handler(requestWith({ cwd: projectDir }), third)).toBe('allowed-once')
     expect(third).not.toHaveBeenCalled()
+    expect(ctx.llmCalls).toHaveLength(2)
   })
 
   it('人工拒绝打断连续计数', async () => {
@@ -317,7 +386,6 @@ describe('权限记忆（达阈值后询问用户）', () => {
         rationale: '用户明确要求。',
         rule: { tool: 'bash', match_kind: 'signature', match_value: signature.key, label: signature.text },
       }),
-      allowRun(),
     ], {
       userQuestions: {
         ask: async askRequest => {
@@ -347,7 +415,7 @@ describe('权限记忆（达阈值后询问用户）', () => {
     const projectDir = join(root, 'project')
     const policies = policyStore(root, 3)
     const asked = []
-    const ctx = contextWith([allowRun(), allowRun(), allowRun(), ruleRun()], {
+    const ctx = contextWith([allowRun(), allowRun(), allowRun(RULE_SUGGESTION)], {
       userQuestions: {
         ask: async askRequest => {
           asked.push(askRequest)
@@ -379,8 +447,8 @@ describe('权限记忆（达阈值后询问用户）', () => {
     const policies = policyStore(root, 3, 2)
     const signature = signatureOf(requestWith({ cwd: projectDir }), exactAction(requestWith({ cwd: projectDir })))
     const asked = []
-    // 两次审查都判定拒绝，第三次调用是规则优化
-    const ctx = contextWith([denyRun(), denyRun(), ruleRun()], {
+    // 两次审查都判定拒绝：第二条回复里带上建议的黑名单匹配条件（达阈值直接用它）
+    const ctx = contextWith([denyRun(), denyRun(RULE_SUGGESTION)], {
       userQuestions: {
         ask: async askRequest => {
           asked.push(askRequest)
@@ -405,8 +473,8 @@ describe('权限记忆（达阈值后询问用户）', () => {
     expect(signature2.key).toBe(signature.key)
     const next = vi.fn().mockResolvedValue('rejected')
     expect(await handler(requestWith({ cwd: projectDir }), next)).toBe('rejected')
-    // Reviewer 只在前两次调用时启动：命中黑名单后连模型都不叫
-    expect(ctx.subagents.start).toHaveBeenCalledTimes(3)
+    // 模型只被叫过两次：命中黑名单后连模型都不叫，达阈值也没有额外调用
+    expect(ctx.llmCalls).toHaveLength(2)
   })
 
   it('没有 userQuestions 服务时只记日志，不写任何规则', async () => {
@@ -507,9 +575,8 @@ describe('策略 HTTP 入口', () => {
         logger: { info: vi.fn(), warn: vi.fn() },
         on: () => () => {},
         effect: fn => fn(),
-        // 手动升级要现场起一次规则优化调用：这两个服务缺一就回落到精确签名
-        ...(options.subagents === undefined ? {} : { subagents: options.subagents }),
-        get: name => (name === 'agents' ? options.agents : undefined),
+        // 手动升级要现场起一次单轮规则优化调用：llm 缺失或调用失败就回落到精确签名
+        get: name => (name === 'llm' ? options.llm : undefined),
         inject: (names, callback) => {
           if (names.includes('webServer')) {
             callback({ effect: fn => fn(), webServer: { register: registration => { routes.push(registration); return () => {} } } })
@@ -655,17 +722,16 @@ describe('策略 HTTP 入口', () => {
       }],
     }), 'utf8')
 
-    const started = []
-    const subagents = {
-      start: vi.fn().mockImplementation((provider, options) => {
-        started.push(options)
-        return Promise.resolve(ruleRun('pnpm test'))
-      }),
+    const calls = []
+    const llm = {
+      stream(call) {
+        calls.push(call)
+        return (async function* () {
+          yield { text: JSON.stringify({ tool: 'pwsh', match_kind: 'command_prefix', match_value: 'pnpm test', label: 'pnpm 测试' }) }
+        })()
+      },
     }
-    const { ctx, routes } = fakeContext({
-      agents: { get: () => fakeAgent(), roots: () => [fakeAgent()] },
-      subagents,
-    })
+    const { ctx, routes } = fakeContext({ llm })
     apply(ctx, {
       logFile,
       policyFile: join(root, 'home', 'policy.json'),
@@ -679,16 +745,17 @@ describe('策略 HTTP 入口', () => {
     }))
     await routes[0].handler(promote.req, promote.res)
     const result = JSON.parse(promote.state.body)
-    expect(subagents.start).toHaveBeenCalledOnce()
-    // 两种档位都要能交结论：persona 与任务提示都必须写明 ptc 下经 run_code 提交 structured_output
-    expect(started[0].persona).toContain('run_code')
-    expect(started[0].prompt[0].text).toContain('structured_output')
+    // 单轮调用：一次 llm.stream，system 是规则模板，提示词里带这次的动作与目标名单
+    expect(calls).toHaveLength(1)
+    expect(calls[0].system).toContain('匹配条件')
+    expect(calls[0].messages[0].content[0].text).toContain('pnpm test')
+    expect(calls[0].messages[0].content[0].text).toContain('白名单')
     expect(result.optimizedBy).toBe('model')
     expect(result.rule.match).toEqual({ kind: 'command_prefix', value: 'pnpm test' })
     expect(result.rule.source).toBe('model')
   })
 
-  it('取不到在册 Agent 时如实回落到精确签名', async () => {
+  it('单轮优化失败（没有 llm 服务）时如实回落到精确签名', async () => {
     const root = tempDir()
     const logFile = join(root, 'approvals.json')
     writeFileSync(logFile, JSON.stringify({
