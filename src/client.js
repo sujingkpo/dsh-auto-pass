@@ -246,6 +246,58 @@ window.__ModuleLoader__.load({
     }
     const t = COPY[ZH ? 'zh' : 'en']
 
+    // ── 权限档位图标（盾牌 + A）──
+    // DSH 客户端把档位图标硬编码给 read-only / workspace-write / danger-full-access 三个 id
+    // （ui-conversation 的 permissionGlyphs，注释原话 host-configured names outside the design set
+    // get none），宿主 presets.<id> 的 schema 也只有 {sandbox, approval, name, description}，
+    // 所以自建档位拿不到矢量图标。这里用「给档位名所在的 span 打标记 + ::before + mask」补上：
+    // 不改 React 的 DOM 结构、不依赖 DSH 的哈希类名，颜色跟文字走（currentColor），与内置单色图标一致。
+    const PRESET_ICON_LABEL = '自动审批'
+    const PRESET_ICON_CLASS = 'ap-presetGlyph'
+    const PRESET_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none">'
+      + '<path d="M8.20554 0.899994L14.7901 3.36857V7.01026C14.7901 12 11.0466 14.2103 8.20554 15.3C5.36446 14.2103 1.62012 12 1.62012 7.01026V3.36857L8.20554 0.899994Z" stroke="#fff" stroke-width="1.31831" stroke-linejoin="round"/>'
+      + '<path d="M6.45 10.45 8.2 5.7 9.95 10.45" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>'
+      + '<path d="M7.2 8.75h2" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>'
+      + '</svg>'
+    // mask 走 data URI：encodeURIComponent 会连 # 与引号一起编码，避免 CSS 解析歧义
+    const PRESET_ICON_MASK = 'url("data:image/svg+xml;charset=utf-8,' + encodeURIComponent(PRESET_ICON_SVG) + '")'
+
+    /**
+     * 是否是承载档位名的元素：按文字精确匹配，不依赖 DSH 的哈希类名（客户端升级也不怕）。
+     * @param {*} node 待判定元素
+     * @param {string} label 档位显示名
+     * @returns {boolean} 命中则返回 true
+     */
+    function isPresetLabelNode(node, label) {
+      if (node === null || typeof node !== 'object') { return false }
+      if (node.tagName !== 'SPAN') { return false }
+      if (typeof node.textContent !== 'string' || node.textContent.trim() !== label) { return false }
+      // 只认「纯文字」span：里面有元素就不是档位名（例如我们自己面板里的文案）
+      if (node.children !== undefined && node.children !== null && node.children.length > 0) { return false }
+      if (node.classList === undefined || typeof node.classList.contains !== 'function') { return false }
+      return node.classList.contains(PRESET_ICON_CLASS) === false
+    }
+
+    /**
+     * 给权限档位名补图标：只在档位 chip 与下拉菜单项里找，DOM 变动时重扫（React 重建节点会丢标记）。
+     * @returns {void} 无返回值；浏览器环境缺失（测试/SSR）时直接退出
+     */
+    function installPresetIcon() {
+      if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') { return }
+      if (document.body === undefined || document.body === null) { return }
+      // 只扫两处：输入框的档位 chip（aria-haspopup=menu）与弹出的菜单项；全文档遍历 span 太贵
+      const selector = 'button[aria-haspopup="menu"] span,[role="menu"] span'
+      /** 给尚未打标记的档位名加上图标类。 */
+      const mark = () => {
+        for (const node of document.querySelectorAll(selector)) {
+          if (isPresetLabelNode(node, PRESET_ICON_LABEL)) { node.classList.add(PRESET_ICON_CLASS) }
+        }
+      }
+      mark()
+      // 只观察结构变化：加 class 不在观察范围内（未开 attributes），不会自激
+      new MutationObserver(mark).observe(document.body, { childList: true, subtree: true })
+    }
+
     // ── 幂等样式注入（带 id，卸载残留可重复注入）──
     if (typeof document !== 'undefined' && document.getElementById('dsh-auto-pass-style') === null) {
       const tag = document.createElement('style')
@@ -315,6 +367,8 @@ window.__ModuleLoader__.load({
         '.ap-ruleLabel{min-width:0;flex:auto;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere}',
         '.ap-input{appearance:none;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:0 0;color:inherit;font:inherit;font-size:12px;line-height:18px;padding:2px 8px;width:5em}',
         '.ap-row2{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+        // 档位 chip / 下拉项里的「盾牌 + A」图标（背景色跟文字走，形状由 mask 决定）
+        `.${PRESET_ICON_CLASS}::before{content:"";display:inline-block;flex:none;width:14px;height:14px;margin-right:4px;vertical-align:-2px;background-color:currentColor;-webkit-mask:${PRESET_ICON_MASK} center/14px 14px no-repeat;mask:${PRESET_ICON_MASK} center/14px 14px no-repeat}`,
       ].join('\n')
       ;(document.head || document.documentElement).appendChild(tag)
     }
@@ -943,6 +997,8 @@ window.__ModuleLoader__.load({
     /** 真正的挂载逻辑；外层包一层 try/catch 只为把失败上报成信标。 */
     function applyInner(ctx) {
       beacon('apply')
+      // 档位图标与 slots 无关，放在 slots 判空之前，没有面板时也照样补图标
+      installPresetIcon()
       clientCtx = ctx
       const slots = ctx.get('slots')
       if (slots === undefined) {

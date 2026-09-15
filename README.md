@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-`dsh-auto-pass` adds a `✓ 自动审批` (Auto Approve) permission preset to the DeepSeek Harness Web UI. Each action that requires approval is reviewed by a fresh, restricted DSH child Agent, and the plugin only auto-approves the requests that pass that review. A model denial, a host safety downgrade, and a failed review are all handed back to DSH's normal approval chain, so the user decides — the plugin never denies on the user's behalf.
+`dsh-auto-pass` adds a `自动审批` (Auto Approve) permission preset to the DeepSeek Harness Web UI. Each action that requires approval is reviewed by a fresh, restricted DSH child Agent, and the plugin only auto-approves the requests that pass that review. A model denial, a host safety downgrade, and a failed review are all handed back to DSH's normal approval chain, so the user decides — the plugin never denies on the user's behalf.
 
 On top of that sit two layers of *permission memory*: an **allowlist** (allowed directly from then on, with no model call) and a **denylist** (handed to you directly, with no model call), both at **project** and **global** scope. A rule comes from one of three places: your own promote/demote action in the timeline, the suggested rule the Reviewer returned with its review, or **the confirmation prompt that follows a threshold** — after the same permission in the same project has been approved (default 3 times; auto-approvals and your own approvals both count) or denied (default 3 times; model denials and your own rejections both count) in a row, the plugin **first has the DSH model turn the action into a match condition** and then asks whether to add it to the allowlist/denylist (this project / global / do not add). Nothing is written until you confirm, and answering "do not add" stops the plugin from asking about that action again.
 
@@ -10,7 +10,7 @@ The current release supports the Web UI only.
 
 ## Screenshots
 
-Select the `✓ 自动审批` permission preset (DSH 0.1.5-rc.1, English UI):
+Select the `自动审批` permission preset (DSH 0.1.5-rc.1, English UI):
 
 ![Auto Approve permission preset in the English UI](docs/images/auto-approve-permission.en.jpg)
 

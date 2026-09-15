@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-- `dsh-auto-pass`：给 DSH WebUI 增加 `✓ 自动审批` 权限档位（显示名在 `cordis.patch.yml` 的 `presets` 表里，预设 **id 固定为 `auto-approve`**，它是插件闸门）。入口 `src/index.js`，在 `approval/request` waterfall 上注册应答器。
+- `dsh-auto-pass`：给 DSH WebUI 增加 `自动审批` 权限档位（显示名在 `cordis.patch.yml` 的 `presets` 表里，预设 **id 固定为 `auto-approve`**，它是插件闸门）。入口 `src/index.js`，在 `approval/request` waterfall 上注册应答器。
 - **核心语义**：插件自身唯一会给出的结论是 `allowed-once`（只自动放行 Reviewer 判定 `outcome: allow` 的请求）；模型 deny、宿主安全降级（critical / high 授权不足）、审查失败（超时、无审查路由、拿不到精确动作、输出非法、子 Agent 异常）一律调用 `next()` 转回 DSH 原生人工审批链（ask），由用户决定。
 - 审查提示词与安全策略在 `prompts/policy-template.md`、`prompts/policy.md`（两种语言下策略正文都保持中文）。
 - **权限记忆（`src/policy.js`）**：白名单（直接放行）/黑名单（直接转人工）分项目与全局两级，命中名单**不启动 Reviewer**；同一项目同一签名连续放行（默认 3 次，自动放行与人工放行都算）或连续被拒（默认 3 次，模型 deny 与人工拒绝都算）达到阈值后，**先由 DSH 模型把这次动作优化成匹配条件，再用 `ctx.userQuestions.ask` 问用户是否加入名单**——用户确认才落盘，**不再静默升级**。匹配器只认三种闭集条件：`signature`（精确签名）/ `command_prefix` / `path_prefix`；时间线上的手动升级/降级仍优先采用 Reviewer 的 `rule` 建议。
@@ -12,7 +12,7 @@
 ## 命令（已验证）
 
 - 安装依赖：`pnpm install`（Node ≥ 22.19；`~/.npmrc` 的 registry 为 npmmirror，装 vitest 约 2 秒）。
-- 跑测试：`pnpm test`（= `vitest run`，当前 92 个用例全绿：`auto-approve` 24 + `records` 10 + `package` 4 + `policy` 28 + `policy-gate` 23 + `client` 3）。
+- 跑测试：`pnpm test`（= `vitest run`，当前 93 个用例全绿：`auto-approve` 24 + `records` 10 + `package` 4 + `policy` 28 + `policy-gate` 23 + `client` 4）。
 - **客户端半只有 `tests/client.spec.js` 覆盖**：它不进构建流水线。测试用假 `window.__ModuleLoader__` + 带「渲染帧」的假 react 加载 bundle，把组件**渲染到稳定状态**（反复求值 + 跑副作用 + 等微任务，直到没有新的 `setState`）——漏定义变量、漏闭合花括号、以及「异步拉到记录之后」那一轮渲染里的问题就靠它兜住（都真的漏过）。
 - `tests/auto-approve.spec.js` 文件名沿用权限档位名 `auto-approve`，与包名 `dsh-auto-pass` 不同，改名时不要误删。
 - **受限沙箱下 `pnpm test` 会 `spawn EPERM`**（vite 会 `exec("net use")`、vitest 默认 forks 池也要 spawn 子进程）；需要以更宽权限运行，否则测试跑不起来。
@@ -68,7 +68,7 @@
 
 - 依赖形态：`C:\Users\czy\.dsh\profiles\desktop\package.json` 里写 `"dsh-auto-pass": "link:D:/work/github/dsh-auto"`，`dsh.profile.bundles` 末位是 `dsh-auto-pass`；`node_modules\dsh-auto-pass` 是指向本仓库的**符号链接**（等价于 pnpm 对 `link:` 依赖的物化结果，参照同 profile 的 `dsh-change-review`）。`pnpm-lock.yaml` 的 importer 段已同步为 link 形式，旧的 `dsh-auto@github:...` 条目已删除。
 - `dsh plugin <args>`（= 在 profile 目录转发 pnpm）在本机**当前不可用**：不加 `-w` 报 `ERR_PNPM_ADDING_TO_ROOT`（profile 有 `pnpm-workspace.yaml`），加了 `-w` 报 `ERR_PNPM_VIRTUAL_STORE_DIR_MAX_LENGTH_DIFF`（`node_modules/.modules.yaml` 记录 `virtualStoreDirMaxLength: 60`，而 shim 的 pnpm 9.15.9 默认值不同）。要重建依赖需显式带上该配置值（未验证）。
-- **权限档位的图标是 DSH 客户端硬编码的，第 4 个档位拿不到（2026-09-15 查证）**：输入框上方档位 chip/菜单里的图标来自 `@deepseek-ai/dsh-client-ui-conversation` 的 `permissionGlyphs` —— 一个只含 `read-only` / `workspace-write` / `danger-full-access` 三个 **id** 的 `Map`（注释原话：host-configured names outside the design set get none）；设置页的权限菜单（`dsh-client-ui-permission-presets`）更只有纯文字 `{id,label}`。宿主 `presets.<id>` 的 schema 只有 `{sandbox, approval, name, description}`，**没有图标位**，所以自建档位只能靠 `name` 里放字符。用户已明确要求改掉彩色 🚦、名字换中文，最终选 `name: ✓ 自动审批`（U+2713 无彩色变体，跟文字同色）（非 kebab-case 的 name 会被两处客户端原样透传）。**不要为了图标去改 id**：`src/index.js` 的闸门是 `selectedPermissionPreset(session) !== 'auto-approve'`，且三个内置 id 各有语义不可顶替。
+- **权限档位的图标是 DSH 客户端硬编码的，第 4 个档位拿不到（2026-09-15 查证）**：输入框上方档位 chip/菜单里的图标来自 `@deepseek-ai/dsh-client-ui-conversation` 的 `permissionGlyphs` —— 一个只含 `read-only` / `workspace-write` / `danger-full-access` 三个 **id** 的 `Map`（注释原话：host-configured names outside the design set get none）；设置页的权限菜单（`dsh-client-ui-permission-presets`）更只有纯文字 `{id,label}`。宿主 `presets.<id>` 的 schema 只有 `{sandbox, approval, name, description}`，**没有图标位**（`name` 里的字符是唯一的可视抓手，彩色 emoji 又太扎眼），所以现在由插件自己画：`src/client.js` 的 `installPresetIcon()` 用 MutationObserver 在「档位 chip（`button[aria-haspopup="menu"]`）」与「下拉菜单项（`[role="menu"]`）」两处，找文字精确等于档位名的**纯文字** `<span>`（`isPresetLabelNode` 只认 textContent + 无子元素，因此不依赖 DSH 的哈希类名），打上 `ap-presetGlyph`；注入的 CSS 再用 `::before` + `mask`（内联「盾牌 + A」SVG，`background-color:currentColor`）画成与内置图标同色的单色图形（形状是先渲成 PNG 比对过 A/B/C 三版笔画粗细才定的 B 版）。React 重建节点会丢标记，所以靠 observer 重扫；`name` 因此保持纯中文 `自动审批`（非 kebab-case 的 name 会被两处客户端原样透传）。**不要为了图标去改 id**：`src/index.js` 的闸门是 `selectedPermissionPreset(session) !== 'auto-approve'`，且三个内置 id 各有语义不可顶替。
 - 本机默认 `reviewerProvider: deepseek-official` 无凭证，必须由 profile 的 `cordis.patch.yml` 用 `- id: dsh-auto-pass` 覆盖审查模型；profile 层按 id 覆盖会**整体替换** config，所以要重述全部键。
 - 改插件代码、`cordis.patch.yml` 或策略后必须重启 DSH Desktop 才生效（客户端半也要重启，HMR 只在 dev:web 下生效）。
 - profile 的 `cordis.patch.yml` 覆盖里没有新键（`maxRecords`/`placement`/`autoApproveAfter`/`policyFile`）也无需改：profile 按 id 覆盖时未列出的键回落到代码默认值。

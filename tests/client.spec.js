@@ -4,7 +4,8 @@
  *   未定义标识符、漏闭合花括号、以及「拉到记录后」那一轮渲染里的问题。
  * @author simon300000
  * @date 2026-09-15
- * @modify 2026-09-15 支持反复渲染（状态 + 副作用），覆盖时间线的审批意见与命中名单显示
+ * @modify 2026-09-15 支持反复渲染（状态 + 副作用），覆盖时间线的审批意见与命中名单显示；
+ *   加入 document 替身，覆盖权限档位「盾牌 + A」图标的注入与打标记
  */
 import { describe, expect, it, vi } from 'vitest'
 
@@ -92,6 +93,41 @@ function fakeReact() {
   }
 }
 
+/** 最近一次安装的 document 替身，供断言读取注入的样式与打标记结果。 */
+let domStub = null
+
+/**
+ * 极简 document 替身：捕获注入的样式文本，并按「档位名 span」的三种形态造候选节点
+ * （纯文字 / 名字更长 / 里面还有元素），用来验证图标只打在该打的那个上。
+ * @returns {{styled: string[], marked: object[], candidates: object[]}} 捕获到的数据
+ */
+function installDocumentStub() {
+  const styled = []
+  const marked = []
+  /** 造一个 span 替身；classList 只实现用到的部分。 */
+  const span = (text, children) => ({
+    tagName: 'SPAN',
+    textContent: text,
+    children,
+    classList: {
+      names: new Set(),
+      contains(name) { return this.names.has(name) },
+      add(name) { this.names.add(name); marked.push({ text, name }) },
+    },
+  })
+  const candidates = [span('自动审批', []), span('自动审批面板', []), span('自动审批', [{}])]
+  globalThis.document = {
+    getElementById: () => null,
+    createElement: () => ({ dataset: {}, textContent: '' }),
+    head: { appendChild: tag => styled.push(String(tag.textContent)) },
+    documentElement: { appendChild: () => {} },
+    body: {},
+    querySelectorAll: () => candidates,
+  }
+  globalThis.MutationObserver = class { observe() {} }
+  return { styled, marked, candidates }
+}
+
 /** 安装最小浏览器替身：fetch 与 localStorage 都返回可控的假结果，避免噪声。 */
 function installBrowserStubs() {
   const store = new Map()
@@ -100,6 +136,7 @@ function installBrowserStubs() {
     setItem: (key, value) => { store.set(key, String(value)) },
     removeItem: key => { store.delete(key) },
   }
+  domStub = installDocumentStub()
   globalThis.fetch = vi.fn(async url => {
     const target = String(url)
     if (target.includes('/policy')) {
@@ -259,6 +296,23 @@ describe('客户端半加载与注册', () => {
     expect(tabRegistrations[0].id).toBe('dsh-auto-pass')
     expect(tabRegistrations[0].title()).toBe('审批时间线')
     expect(typeof tabRegistrations[0].guide[0].icon).toBe('function')
+  })
+
+  it('给权限档位名补「盾牌 + A」图标：只认纯文字且完全匹配的 span', async () => {
+    const registration = await loadClient()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return fakeReact()
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx } = harness()
+    moduleExports.apply(ctx)
+
+    // DSH 只给三个内置 id 图标，我们的档位靠注入的这段 CSS（chip 与下拉项共用）
+    const css = domStub.styled.join('\n')
+    expect(css).toContain('.ap-presetGlyph::before')
+    expect(css).toContain('mask:url("data:image/svg+xml;charset=utf-8,')
+    // 「自动审批面板」名字更长、「自动审批」里还有子元素：都不该被打标记
+    expect(domStub.marked).toEqual([{ text: '自动审批', name: 'ap-presetGlyph' }])
   })
 
   it('三个面板都能渲染到稳定状态（抓到未定义标识符与异步渲染问题）', async () => {
