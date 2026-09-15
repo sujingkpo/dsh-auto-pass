@@ -1657,38 +1657,38 @@ function countReviewerSteps(agent) {
   return agent.session.snapshotEvents().filter(event => event.type === 'step/start').length
 }
 
+/** 通知正文压成一行：结论 + 工具 +（风险/授权 · 步数）+ 理由摘要。 */
+const MAX_NOTICE_LINE_CHARS = 240
+
 const NOTICE_LABELS = Object.freeze({
   zh: Object.freeze({
-    allowedHeadline: toolName => `Auto Approve 已自动批准这次 ${toolName} 操作。`,
-    deferredHeadline: toolName => `Auto Approve 未自动批准这次 ${toolName} 操作，已转交你审批。`,
+    allowedHeadline: toolName => `Auto Approve 已自动批准 ${toolName}`,
+    deferredHeadline: toolName => `Auto Approve 未自动批准 ${toolName}，已转交你审批`,
     summaryAllowed: 'Auto Approve：允许',
     summaryDeferred: 'Auto Approve：转交人工审批',
-    riskLevel: '风险等级：',
-    userAuthorization: '用户授权：',
-    reviewerModel: '审查模型：',
-    reviewerSession: 'Reviewer 会话：',
-    steps: '调查步骤：',
+    riskAuth: (risk, authorization) => `${risk}/${authorization}`,
+    steps: steps => `${steps} 步`,
     rationale: '理由：',
-    policy: '命中策略：',
-    suggestedRule: '建议规则（可在审批时间线一键升级/降级）：',
+    policy: '命中：',
   }),
   en: Object.freeze({
-    allowedHeadline: toolName => `Auto Approve automatically allowed this ${toolName} action.`,
-    deferredHeadline: toolName => `Auto Approve did not auto-approve this ${toolName} action; it has been handed to you to decide.`,
+    allowedHeadline: toolName => `Auto Approve allowed ${toolName}`,
+    deferredHeadline: toolName => `Auto Approve did not allow ${toolName}; handed to you`,
     summaryAllowed: 'Auto Approve: allowed',
     summaryDeferred: 'Auto Approve: deferred to the user',
-    riskLevel: 'Risk level: ',
-    userAuthorization: 'User authorization: ',
-    reviewerModel: 'Reviewer model: ',
-    reviewerSession: 'Reviewer session: ',
-    steps: 'Investigation steps: ',
+    riskAuth: (risk, authorization) => `${risk}/${authorization}`,
+    steps: steps => `${steps} steps`,
     rationale: 'Rationale: ',
-    policy: 'Policy: ',
-    suggestedRule: 'Suggested rule (promote/demote it from the approval timeline): ',
+    policy: 'Matched: ',
   }),
 })
 
-/** 把安全摘要加入父 Agent；完整调查过程保留在 Reviewer 子 session。 */
+/**
+ * 把安全摘要加入父 Agent；完整调查过程保留在 Reviewer 子 session。
+ *
+ * 正文**只有一行**：这条通知会真的进入模型上下文，所以只保留「结论 + 工具 + 风险/授权 + 步数 + 理由摘要」；
+ * Reviewer 会话、建议规则、命中规则全文都留在审批时间线与宿主日志里，不塞进上下文。
+ */
 function injectReviewNotice(ctx, request, review, language) {
   const labels = NOTICE_LABELS[language]
   // 只有 allow 是插件自己给出的结论，其余（deny / defer）都是转交用户处理。
@@ -1696,17 +1696,17 @@ function injectReviewNotice(ctx, request, review, language) {
   const rationale = review.rationale.length <= MAX_NOTICE_REASON_CHARS
     ? review.rationale
     : `${review.rationale.slice(0, MAX_NOTICE_REASON_CHARS - 1)}…`
-  const details = [
+  const parts = [
     allowed ? labels.allowedHeadline(request.toolName) : labels.deferredHeadline(request.toolName),
-    ...(review.policyHit === undefined ? [] : [labels.policy + review.policyHit.scope + '/' + review.policyHit.list + ' · ' + review.policyHit.label]),
-    ...(review.suggestedRule === undefined ? [] : [labels.suggestedRule + review.suggestedRule.label]),
-    ...(review.risk_level === undefined ? [] : [`${labels.riskLevel}${review.risk_level}`]),
-    ...(review.user_authorization === undefined ? [] : [`${labels.userAuthorization}${review.user_authorization}`]),
-    ...(review.route === undefined ? [] : [`${labels.reviewerModel}${review.route.provider}/${review.route.model}`]),
-    ...(review.reviewerSessionId === undefined ? [] : [`${labels.reviewerSession}${review.reviewerSessionId}`]),
-    `${labels.steps}${review.steps}`,
-    `${labels.rationale}${rationale}`,
+    ...(review.policyHit === undefined
+      ? []
+      : [labels.policy + review.policyHit.list + ' · ' + String(review.policyHit.label ?? '')]),
+    ...(review.risk_level === undefined && review.user_authorization === undefined
+      ? []
+      : [labels.riskAuth(String(review.risk_level ?? '?'), String(review.user_authorization ?? '?'))]),
+    ...(review.steps === undefined ? [] : [labels.steps(review.steps)]),
   ]
+  const details = [truncateText(parts.join(' · ') + ' · ' + labels.rationale + rationale, MAX_NOTICE_LINE_CHARS)]
   try {
     request.agent.inject({
       id: randomUUID(),

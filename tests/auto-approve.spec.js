@@ -268,10 +268,14 @@ describe('Auto Approve Reviewer 子 Agent', () => {
       .toBeLessThan(start.prompt[0].text.indexOf('session-1'))
     expect(start.persona).toContain('使用直接用户 prompt 的语言书写简短理由')
     expect(run.dispose).toHaveBeenCalledOnce()
-    expect(request.agent.inject).toHaveBeenCalledWith(expect.objectContaining({
-      content: [{ type: 'text', text: expect.stringContaining('Reviewer 会话：reviewer-session-1') }],
-      source: expect.objectContaining({ summary: 'Auto Approve：允许' }),
-    }))
+    const notice = request.agent.inject.mock.calls.at(-1)[0]
+    // 通知只占一行：会进模型上下文，Reviewer 会话等细节留在时间线与宿主日志里
+    expect(notice.content).toHaveLength(1)
+    expect(notice.content[0].text).toContain('Auto Approve 已自动批准 bash')
+    expect(notice.content[0].text).toContain('low/high')
+    expect(notice.content[0].text).not.toContain('\n')
+    expect(notice.content[0].text).not.toContain('Reviewer 会话')
+    expect(notice.source).toMatchObject({ form: 'notice', summary: 'Auto Approve：允许' })
   })
 
   it('Reviewer deny 时转交人工审批，且不再重复审查', async () => {
@@ -285,7 +289,8 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(next).toHaveBeenCalledOnce()
     expect(request.agent.cancel).not.toHaveBeenCalled()
     const notice = request.agent.inject.mock.calls.at(-1)[0]
-    expect(notice.content[0].text).toContain('未自动批准这次 bash 操作，已转交你审批。')
+    expect(notice.content[0].text).toContain('Auto Approve 未自动批准 bash，已转交你审批')
+    expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).toContain('理由：提权范围超过运行测试所需。')
     expect(notice.source.summary).toBe('Auto Approve：转交人工审批')
   })
@@ -708,8 +713,9 @@ describe('审查语言自动选择', () => {
     expect(start.prompt[0].text).toContain('Review context')
     expect(start.prompt[0].text).not.toContain('审查上下文')
     const notice = request.agent.inject.mock.calls.at(-1)[0]
-    expect(notice.content[0].text).toContain('Auto Approve automatically allowed this bash action.')
-    expect(notice.content[0].text).toContain('Reviewer session: reviewer-session-1')
+    expect(notice.content[0].text).toContain('Auto Approve allowed bash')
+    expect(notice.content[0].text).not.toContain('Reviewer session')
+    expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).toContain('Rationale: The user explicitly requested')
     expect(notice.source.summary).toBe('Auto Approve: allowed')
 
@@ -733,7 +739,7 @@ describe('审查语言自动选择', () => {
     expect(failedNext).toHaveBeenCalledOnce()
     const deferredNotice = failed.agent.inject.mock.calls.at(-1)[0]
     expect(deferredNotice.content[0].text)
-      .toContain('Auto Approve did not auto-approve this bash action; it has been handed to you to decide.')
+      .toContain('Auto Approve did not allow bash; handed to you')
     expect(deferredNotice.content[0].text)
       .toContain('Rationale: The exact tool call awaiting approval could not be found.')
     expect(deferredNotice.source.summary).toBe('Auto Approve: deferred to the user')
