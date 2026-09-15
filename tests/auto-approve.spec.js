@@ -276,7 +276,8 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(notice.content[0].text).toContain('low/high')
     expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).not.toContain('Reviewer 会话')
-    expect(notice.source).toMatchObject({ form: 'notice', summary: 'Auto Approve：允许' })
+    // 折叠标题与正文用同一个标签
+    expect(notice.source).toMatchObject({ form: 'notice', summary: '[自动] Auto Approve：允许' })
   })
 
   it('Reviewer deny 时转交人工审批，且不再重复审查', async () => {
@@ -294,7 +295,7 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(notice.content[0].text).toContain('Auto Approve 未自动批准 bash，已转交你审批')
     expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).toContain('理由：提权范围超过运行测试所需。')
-    expect(notice.source.summary).toBe('Auto Approve：转交人工审批')
+    expect(notice.source.summary).toBe('[人工] Auto Approve：转交人工审批')
   })
 
   it('子 Agent 异常、无 structured 输出或缺少精确动作时一律转人工审批', async () => {
@@ -724,7 +725,7 @@ describe('审查语言自动选择', () => {
     expect(notice.content[0].text).not.toContain('Reviewer session')
     expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).toContain('Rationale: The user explicitly requested')
-    expect(notice.source.summary).toBe('Auto Approve: allowed')
+    expect(notice.source.summary).toBe('[auto] Auto Approve: allowed')
 
     let guard
     listeners.get('agent/created')({
@@ -750,7 +751,7 @@ describe('审查语言自动选择', () => {
       .toContain('Auto Approve did not allow bash; handed to you')
     expect(deferredNotice.content[0].text)
       .toContain('Rationale: The exact tool call awaiting approval could not be found.')
-    expect(deferredNotice.source.summary).toBe('Auto Approve: deferred to the user')
+    expect(deferredNotice.source.summary).toBe('[human] Auto Approve: deferred to the user')
 
     const denied = requestWith('auto-approve', {
       sessionOverrides: { directUserText: 'Please run the tests' },

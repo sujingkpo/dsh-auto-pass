@@ -166,6 +166,10 @@ describe('白名单与黑名单', () => {
     expect(outcome).toBe('allowed-once')
     expect(next).not.toHaveBeenCalled()
     expect(ctx.subagents.start).not.toHaveBeenCalled()
+    // 通知的折叠标题与正文都带「名单·自动」标签
+    const notice = request.agent.inject.mock.calls.at(-1)[0]
+    expect(notice.source.summary).toContain('[白名单·自动]')
+    expect(notice.content[0].text.startsWith('[白名单·自动]')).toBe(true)
   })
 
   it('黑名单命中直接转人工，且不启动 Reviewer', async () => {

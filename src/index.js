@@ -1684,8 +1684,10 @@ const NOTICE_LABELS = Object.freeze({
     steps: steps => `${steps} 步`,
     rationale: '理由：',
     policy: '命中：',
-    tagAuto: '[自动]',
-    tagHuman: '[人工]',
+    tagAuto: '自动',
+    tagHuman: '人工',
+    whitelist: '白名单',
+    denylist: '黑名单',
   }),
   en: Object.freeze({
     allowedHeadline: toolName => `Auto Approve allowed ${toolName}`,
@@ -1696,8 +1698,10 @@ const NOTICE_LABELS = Object.freeze({
     steps: steps => `${steps} steps`,
     rationale: 'Rationale: ',
     policy: 'Matched: ',
-    tagAuto: '[auto]',
-    tagHuman: '[human]',
+    tagAuto: 'auto',
+    tagHuman: 'human',
+    whitelist: 'allowlist',
+    denylist: 'denylist',
   }),
 })
 
@@ -1714,10 +1718,13 @@ function injectReviewNotice(ctx, request, review, language) {
   const rationale = review.rationale.length <= MAX_NOTICE_REASON_CHARS
     ? review.rationale
     : `${review.rationale.slice(0, MAX_NOTICE_REASON_CHARS - 1)}…`
+  // 一个标签同时用在正文与折叠标题上：命中名单时带上名单，再带决策来源（自动 / 人工）
+  const hitTag = review.policyHit === undefined
+    ? ''
+    : (review.policyHit.list === 'allow' ? labels.whitelist : labels.denylist) + '·'
+  const tag = '[' + hitTag + (allowed ? labels.tagAuto : labels.tagHuman) + ']'
   const parts = [
-    // 标签在最前：一眼看出这次是插件自动决定的，还是交回人工的
-    (allowed ? labels.tagAuto : labels.tagHuman)
-      + ' ' + (allowed ? labels.allowedHeadline(request.toolName) : labels.deferredHeadline(request.toolName)),
+    tag + ' ' + (allowed ? labels.allowedHeadline(request.toolName) : labels.deferredHeadline(request.toolName)),
     ...(review.policyHit === undefined
       ? []
       : [labels.policy + review.policyHit.list + ' · ' + String(review.policyHit.label ?? '')]),
@@ -1736,7 +1743,8 @@ function injectReviewNotice(ctx, request, review, language) {
         kind: 'plugin',
         plugin: 'dsh-auto-pass',
         form: 'notice',
-        summary: allowed ? labels.summaryAllowed : labels.summaryDeferred,
+        // 折叠标题也带同一个标签（用户要求两处一致）
+        summary: tag + ' ' + (allowed ? labels.summaryAllowed : labels.summaryDeferred),
       },
     })
   } catch (error) {
