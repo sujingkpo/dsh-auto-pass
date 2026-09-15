@@ -1,14 +1,17 @@
 {
   "name": "dsh-auto-pass",
-  "version": "0.2.0",
-  "description": "Model-reviewed Auto Approve permission preset: only review-passed actions are auto-approved, everything else is handed back to the user",
+  "version": "0.3.0",
+  "description": "Model-reviewed Auto Approve permission preset: only review-passed actions are auto-approved, everything else is handed back to the user, with an approval-log panel",
   "type": "module",
   "main": "src/index.js",
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./client": "./src/client.js"
   },
   "files": [
     "src/index.js",
+    "src/client.js",
+    "src/records.js",
     "prompts/*.md",
     "cordis.patch.yml",
     "README.md",
@@ -32,6 +35,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
     }
   },
   "devDependencies": {

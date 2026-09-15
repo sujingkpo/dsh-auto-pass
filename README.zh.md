@@ -39,6 +39,15 @@ flowchart TD
 
 主 session 会记录审批事件和简短插件通知：自动放行的动作给出 `允许` 通知，转交用户处理的请求给出说明「未自动批准」以及 Reviewer 理由的通知。Reviewer 子 session 使用 `_auto-approve:<callId>` label，并记录消息、调查工具调用与结果、最终 assessment 和 turn end。Console 只记录 session/call 标识、模型路由、步骤数、停止原因、风险、授权和结果，不默认输出完整 prompt 或文件内容。
 
+## 审批记录面板
+
+每次审批都会记一条记录，并以时间倒序的时间轴展示。宿主通过 `/api/dsh-auto-pass/log` 提供数据，由插件的客户端半渲染。
+
+- 放置位置沿用 [`dsh-context`](https://github.com/bowenliang123/dsh-context) 的模型：对话区里和「对话/轨迹」并排的标签页（`conversation.view`）、右侧栏标签页（`sidebarRightTabs`），或两处都放。`placement: auto`（默认）优先右侧栏，右侧栏座位不可用时退回对话标签页——因此不装任何第三方侧边栏插件也能用。
+- 设置页卡片（`settings.plugin.item`）可即时切换位置，选择存在 `localStorage`，优先于 `placement` 配置值。
+- 每行显示时间、工具名、结论（`自动批准` / `转人工` / `审查未完成`），转人工的还会显示你最终的选择；展开可见风险等级、用户授权、理由、审批原因、动作参数（裁剪到 500 字符）、耗时、Reviewer 会话与调查步数。
+- 记录以 JSON 落盘、跨重启保留：`$DSH_HOME/dsh-auto-pass/approvals.json`（默认 `~/.dsh/dsh-auto-pass/approvals.json`），只保留最新 1000 条，先写临时文件再改名。`logFile` 改路径，`maxRecords` 改上限。记录只存本地审批数据，并且只在 localhost 上提供。
+
 ## 安装
 
 包名为 `dsh-auto-pass`。从 GitHub 安装：
@@ -78,6 +87,8 @@ dsh plugin --profile web add link:/path/to/dsh-auto-pass
     maxRecentNonUserEntries: 20
     maxActionChars: 16000
     maxOutputTokens: 8192
+    maxRecords: 1000
+    placement: auto
 ```
 
 `language` 可设为 `auto`（默认）、`zh` 或 `en`；非法值会发出警告并回退为 `auto`。自动模式会累计当前 session 中由用户直接发送的消息所含汉字：达到 4 个时选择中文，否则选择英文；Agent 指令、助手消息和工具结果不参与判断。Reviewer 会被明确要求使用直接用户 prompt 的语言书写理由。为避免翻译改变审查语义，两种模式下安全策略正文都保持中文。

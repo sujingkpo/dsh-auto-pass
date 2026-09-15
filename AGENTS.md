@@ -11,8 +11,9 @@
 ## 命令（已验证）
 
 - 安装依赖：`pnpm install`（Node ≥ 22.19；`~/.npmrc` 的 registry 为 npmmirror，装 vitest 约 2 秒）。
-- 跑测试：`pnpm test`（= `vitest run`，当前 18 个用例全绿）。
-- 测试文件是 `tests/auto-approve.spec.js`：文件名沿用权限档位名 `auto-approve`，与包名 `dsh-auto-pass` 不同，改名时不要误删。
+- 跑测试：`pnpm test`（= `vitest run`，当前 29 个用例全绿：`tests/auto-approve.spec.js` 22 个 + `tests/records.spec.js` 7 个）。
+- `tests/auto-approve.spec.js` 文件名沿用权限档位名 `auto-approve`，与包名 `dsh-auto-pass` 不同，改名时不要误删。
+- **受限沙箱下 `pnpm test` 会 `spawn EPERM`**（vite 会 `exec("net use")`、vitest 默认 forks 池也要 spawn 子进程）；需要以更宽权限运行，否则测试跑不起来。
 
 ## 架构事实（读源码确认）
 
@@ -23,12 +24,24 @@
 - 通知通过 `agent.inject({ source: { kind: 'plugin', plugin: 'dsh-auto-pass', form: 'notice' } })` 写进父 session；allow 与转人工用不同 headline/summary。
 - `maxConsecutiveDenials` 与 turn 中断逻辑已删除：拒绝不再阻断，交给用户后可继续审批。
 
+## 客户端半与审批记录（读源码确认）
+
+- 客户端半是 `src/client.js`，由 `package.json` 的 `exports["./client"]` + `dsh.client = { platform: 'web', inject: [...] }` 声明；载体把它变成 `/plugins/dsh-auto-pass/client.js`，文件本身必须是 `window.__ModuleLoader__.load({ id, factory })` 形式（`id` 必须是包名），factory 里用 `require('react')` 取基座 React，导出 `inject` + `apply`。`dsh.client.inject` 列的是必须**先于**本插件加载的包（这里：`dsh-client-ui-conversation`、`dsh-client-ui-sidebar-right`，因为要用它们声明的槽）。
+- 两处放置位置（参照 dsh-context 0.52.1 的实现）：
+  - 对话标签页：`ctx.slots.inject('conversation.view', () => ctx.slots.register({ name:'conversation.view', id, order, label }, Cmp))`，出现位置就在「对话 / 轨迹」旁边。
+  - 右侧栏 tab：`ctx.inject(['sidebarRightTabs'], raw => ...)`（**延迟注入，座位按契约可选**）→ `raw.sidebarRightTabs.register({ id, kind, title, guide:[{ order, title, description, icon }] })` + `raw.slots.inject('sidebar.right.pane.tab', () => raw.slots.register({ name:'sidebar.right.pane.tab', key: id }, Cmp))`。`id` 同时是正文席位的 key；tab 一次都没打开过时它只出现在引导页/加号菜单里。
+  - `slots.inject` 返回**幂等 disposer（函数）**；cordis 的 `ctx.inject` 返回带 `.dispose()` 的 handle，两者的卸载方式不同。
+- 面板数据来自 host 的 `GET /api/dsh-auto-pass/log?session=&limit=`（记录，倒序）与 `/api/dsh-auto-pass/config`（`placement`）；客户端每 3 秒轮询一次。
+- 放置策略 `placement: auto | tab | sidebar | all`（默认 auto：`ctx.get('sidebarRightTabs')` 在就挂右侧栏，否则退回对话标签页）；设置页卡片写 `localStorage['dsh-auto-pass:placement']` 覆盖宿主配置并即时重挂。
+- 记录仓库在 `src/records.js`：内存列表 + JSON 原子落盘（`.tmp` + rename），默认 `$DSH_HOME/dsh-auto-pass/approvals.json`（无 `DSH_HOME` 时 `~/.dsh`），上限 `maxRecords`（默认 1000），`list({session})` 返回倒序。`createAutoApprovalHandler(ctx, config, records)` 的第三个参数默认 `noopRecordStore`；`finish()` 里对 `records.add` 做 try/catch，**写记录失败绝不影响审批结论**。
+
 ## 部署（本机 desktop profile）
 
 - 依赖形态：`C:\Users\czy\.dsh\profiles\desktop\package.json` 里写 `"dsh-auto-pass": "link:D:/work/github/dsh-auto"`，`dsh.profile.bundles` 末位是 `dsh-auto-pass`；`node_modules\dsh-auto-pass` 是指向本仓库的**符号链接**（等价于 pnpm 对 `link:` 依赖的物化结果，参照同 profile 的 `dsh-change-review`）。`pnpm-lock.yaml` 的 importer 段已同步为 link 形式，旧的 `dsh-auto@github:...` 条目已删除。
 - `dsh plugin <args>`（= 在 profile 目录转发 pnpm）在本机**当前不可用**：不加 `-w` 报 `ERR_PNPM_ADDING_TO_ROOT`（profile 有 `pnpm-workspace.yaml`），加了 `-w` 报 `ERR_PNPM_VIRTUAL_STORE_DIR_MAX_LENGTH_DIFF`（`node_modules/.modules.yaml` 记录 `virtualStoreDirMaxLength: 60`，而 shim 的 pnpm 9.15.9 默认值不同）。要重建依赖需显式带上该配置值（未验证）。
 - 本机默认 `reviewerProvider: deepseek-official` 无凭证，必须由 profile 的 `cordis.patch.yml` 用 `- id: dsh-auto-pass` 覆盖审查模型；profile 层按 id 覆盖会**整体替换** config，所以要重述全部键。
-- 改插件代码、`cordis.patch.yml` 或策略后必须重启 DSH Desktop 才生效。
+- 改插件代码、`cordis.patch.yml` 或策略后必须重启 DSH Desktop 才生效（客户端半也要重启，HMR 只在 dev:web 下生效）。
+- profile 的 `cordis.patch.yml` 覆盖里没有新键（`maxRecords`/`placement`）也无需改：profile 按 id 覆盖时未列出的键回落到代码默认值。
 - 回滚来源：`%APPDATA%\DSH Desktop\health-snapshots\<hash>\slot-N\` 保存了 profile 的副本（含 `pnpm-lock.yaml`、`package.json`）。
 
 ## 工具坑（本机实测）

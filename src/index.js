@@ -5,9 +5,17 @@
  * @author simon300000
  * @date 2026-08-14
  * @modify 2026-09-15 更名 dsh-auto-pass；拒绝与审查失败改为转人工审批，移除连续拒绝中断逻辑
+ * @modify 2026-09-15 增加审批记录：落盘 JSON，并经 /api/dsh-auto-pass 供右栏/对话标签页时间轴读取
  */
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import {
+  createRecordStore,
+  DEFAULT_MAX_RECORDS,
+  defaultLogFile,
+  MAX_RECORD_ACTION_CHARS,
+  noopRecordStore,
+} from './records.js'
 
 export const name = 'dsh-auto-pass'
 export const inject = ['approval', 'subagents', 'tools']
@@ -33,7 +41,19 @@ const DEFAULTS = Object.freeze({
   maxRecentNonUserEntries: 20,
   maxActionChars: 16_000,
   maxOutputTokens: 8_192,
+  logFile: '',
+  maxRecords: DEFAULT_MAX_RECORDS,
+  placement: 'auto',
 })
+
+/** 审批记录路由前缀（webServer kind: prefix）与两条查询路径。 */
+export const RECORD_ROUTE = '/api/dsh-auto-pass'
+export const RECORD_LOG_PATH = '/api/dsh-auto-pass/log'
+export const RECORD_CONFIG_PATH = '/api/dsh-auto-pass/config'
+/** 时间轴可选的放置位置；auto 表示优先右侧栏座位、没有座位时退回对话标签页。 */
+export const PLACEMENTS = Object.freeze(['auto', 'tab', 'sidebar', 'all'])
+/** 单次响应最多返回的记录条数，避免侧边栏一次拉取过多数据。 */
+const MAX_RECORDS_PER_RESPONSE = 500
 
 export const assessmentSchema = Object.freeze({
   type: 'object',
@@ -73,8 +93,75 @@ const guardianPrompts = Object.freeze({
  */
 export function apply(ctx, config) {
   const resolved = resolveConfig(config, message => ctx.logger.warn(message))
+  const records = createRecordStore({
+    file: resolved.logFile === '' ? defaultLogFile() : resolved.logFile,
+    limit: resolved.maxRecords,
+    warn: message => ctx.logger.warn(message),
+  })
   installReviewerIsolation(ctx)
-  ctx.on('approval/request', createAutoApprovalHandler(ctx, resolved), { prepend: true })
+  ctx.on('approval/request', createAutoApprovalHandler(ctx, resolved, records), { prepend: true })
+  installRecordRoute(ctx, records, resolved)
+  ctx.logger.info('dsh-auto-pass: 审批记录已就绪 file=' + records.file + ' maxRecords=' + String(records.limit))
+}
+
+/**
+ * 注册只读的记录查询路由。非 Web 载体没有 webServer 服务，此时静默跳过，
+ * 审批本身不受影响。
+ */
+function installRecordRoute(ctx, records, config) {
+  // 极简宿主或测试替身可能没有 inject：此时只是没有查询路由，审批照常工作。
+  if (typeof ctx.inject !== 'function') return
+  ctx.inject(['webServer'], serverCtx => {
+    serverCtx.effect(() => serverCtx.webServer.register({
+      kind: 'prefix',
+      path: RECORD_ROUTE,
+      handler: (req, res) => serveRecordRequest(req, res, records, config, ctx),
+    }), 'dsh-auto-pass: 审批记录路由')
+  })
+}
+
+/** 处理 `GET /api/dsh-auto-pass/log?session=&limit=` 与 `GET /api/dsh-auto-pass/config`。 */
+function serveRecordRequest(req, res, records, config, ctx) {
+  /** 统一的 JSON 响应；连接已断开时只告警，不再上抛。 */
+  const writeJson = (code, body) => {
+    try {
+      res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify(body))
+    } catch (error) {
+      ctx.logger.warn('dsh-auto-pass: 审批记录响应失败：' + errorMessage(error))
+    }
+  }
+  try {
+    const url = new URL(req.url ?? '/', 'http://dsh.local')
+    const pathname = url.pathname.replace(/\/+$/, '')
+    if (pathname !== RECORD_LOG_PATH && pathname !== RECORD_CONFIG_PATH) {
+      writeJson(404, { ok: false, error: 'not found' })
+      return
+    }
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      writeJson(405, { ok: false, error: 'method not allowed' })
+      return
+    }
+    if (pathname === RECORD_CONFIG_PATH) {
+      writeJson(200, { ok: true, placement: config.placement, maxRecords: config.maxRecords, file: records.file })
+      return
+    }
+    const session = url.searchParams.get('session') ?? ''
+    const requested = Number.parseInt(url.searchParams.get('limit') ?? '', 10)
+    const limit = Number.isSafeInteger(requested) && requested > 0
+      ? Math.min(requested, MAX_RECORDS_PER_RESPONSE)
+      : MAX_RECORDS_PER_RESPONSE
+    writeJson(200, {
+      ok: true,
+      file: records.file,
+      total: records.size(),
+      session,
+      records: records.list({ session }).slice(0, limit),
+    })
+  } catch (error) {
+    ctx.logger.warn('dsh-auto-pass: 审批记录路由失败：' + errorMessage(error))
+    writeJson(500, { ok: false, error: errorMessage(error) })
+  }
 }
 
 /** 对 loader 或测试传入的配置做运行时边界校验。 */
@@ -96,9 +183,16 @@ export function resolveConfig(config = {}, warn = message => console.warn(messag
     && (typeof resolved.reviewerReasoningEffort !== 'string' || resolved.reviewerReasoningEffort.trim() === '')) {
     throw new Error('dsh-auto-pass: reviewerReasoningEffort 必须是非空字符串')
   }
+  if (typeof resolved.logFile !== 'string') {
+    throw new Error('dsh-auto-pass: logFile 必须是字符串（空字符串表示使用默认路径）')
+  }
+  if (!PLACEMENTS.includes(resolved.placement)) {
+    throw new Error('dsh-auto-pass: placement 必须是 ' + PLACEMENTS.join(' / ') + ' 之一')
+  }
   for (const key of [
     'timeoutMs',
     'maxInvestigationSteps',
+    'maxRecords',
     'maxMessageTranscriptTokens',
     'maxToolTranscriptTokens',
     'maxMessageEntryTokens',
@@ -254,7 +348,7 @@ function isHanCharacter(codePoint) {
 }
 
 /** 创建可单测的 waterfall 监听器：插件只自动放行审查通过的请求。 */
-export function createAutoApprovalHandler(ctx, config) {
+export function createAutoApprovalHandler(ctx, config, records = noopRecordStore) {
   return async (request, next) => {
     if (selectedPermissionPreset(request.agent.session) !== 'auto-approve') {
       return next()
@@ -262,19 +356,32 @@ export function createAutoApprovalHandler(ctx, config) {
     if (request.signal?.aborted) return 'cancelled'
     const language = resolveReviewLanguage(request.agent.session, config.language)
     const messages = HOST_MESSAGES[language]
+    const startedAt = Date.now()
 
     const action = exactAction(request)
+    // 收尾：先拿到最终结论（插件自动放行，或人工审批链的答复），再落一条记录。
+    // 记录失败由仓库自己吞掉，绝不影响审批结果。
+    const finish = async (outcome, decision) => {
+      const settled = await outcome
+      try {
+        records.add(buildRecord(request, action, settled, decision, Date.now() - startedAt))
+      } catch (error) {
+        // 记录只是旁路：写失败也绝不能让已经做出的审批结论变形
+        ctx.logger.warn('dsh-auto-pass: 审批记录写入失败：' + errorMessage(error))
+      }
+      return settled
+    }
     if (action === undefined) {
-      return deferWithoutReview(ctx, request, messages.missingAction, next, language)
+      return deferWithoutReview(ctx, request, messages.missingAction, next, language, finish)
     }
     const actionJson = JSON.stringify(action)
     if (actionJson.length > config.maxActionChars) {
-      return deferWithoutReview(ctx, request, messages.actionTooLong(config.maxActionChars), next, language)
+      return deferWithoutReview(ctx, request, messages.actionTooLong(config.maxActionChars), next, language, finish)
     }
 
     const route = resolveRoute(request, config)
     if (route === undefined) {
-      return deferWithoutReview(ctx, request, messages.missingRoute, next, language)
+      return deferWithoutReview(ctx, request, messages.missingRoute, next, language, finish)
     }
 
     const timeoutSignal = AbortSignal.timeout(config.timeoutMs)
@@ -291,9 +398,10 @@ export function createAutoApprovalHandler(ctx, config) {
 
     let run
     let reviewerStopReason = '<not-started>'
-    // 只有完整通过审查协议且结论为 allow 时才自动放行；其余情况让 assessment
-    // 保持 undefined，统一落到函数末尾的转人工审批分支。
+    // 只有完整通过审查协议且结论为 allow 时才自动放行，其余情况统一落到函数
+    // 末尾的转人工审批分支；decision 描述本次结论，用于写入审批记录。
     let assessment
+    let decision
     try {
       run = await ctx.subagents.start('spawn', {
         label: `_auto-approve:${request.callId}`,
@@ -333,6 +441,15 @@ export function createAutoApprovalHandler(ctx, config) {
         + `language=${language} risk=${assessment.risk_level} `
         + `authorization=${assessment.user_authorization} outcome=${assessment.outcome}`,
       )
+      decision = {
+        verdict: assessment.outcome,
+        riskLevel: assessment.risk_level,
+        userAuthorization: assessment.user_authorization,
+        rationale: assessment.rationale,
+        reviewerSessionId: run.id,
+        steps,
+        route,
+      }
       injectReviewNotice(ctx, request, {
         ...assessment,
         route,
@@ -350,6 +467,13 @@ export function createAutoApprovalHandler(ctx, config) {
         + `reviewerSession=${run?.id ?? '<not-created>'} callId=${request.callId} `
         + `steps=${countReviewerSteps(run?.localAgent)} stopReason=${reviewerStopReason} reason=${safeLogValue(problem)}`,
       )
+      decision = {
+        verdict: 'defer',
+        rationale: messages.reviewFailed(problem),
+        reviewerSessionId: run?.id,
+        steps: countReviewerSteps(run?.localAgent),
+        route,
+      }
       injectReviewNotice(ctx, request, {
         outcome: 'defer',
         route,
@@ -371,19 +495,50 @@ export function createAutoApprovalHandler(ctx, config) {
 
     // 插件绝不代替用户拒绝：非 allow 的结论（模型 deny、宿主安全降级、审查
     // 失败）一律调用 next() 进入 DSH 原生人工审批链，把决定权交还用户。
-    return assessment?.outcome === 'allow' ? 'allowed-once' : next()
+    if (decision?.verdict === 'allow') return finish('allowed-once', decision)
+    return finish(next(), decision ?? { verdict: 'defer' })
   }
 }
 
 /** 不进入模型审查的请求：记录转交理由后直接交给后续人工审批器。 */
-function deferWithoutReview(ctx, request, reason, next, language) {
+function deferWithoutReview(ctx, request, reason, next, language, finish) {
   ctx.logger.warn(`dsh-auto-pass: ${reason} 已转人工审批`)
   injectReviewNotice(ctx, request, {
     outcome: 'defer',
     steps: 0,
     rationale: reason,
   }, language)
-  return next()
+  return finish(next(), { verdict: 'defer', rationale: reason, steps: 0 })
+}
+
+/** 组装一条审批记录：动作参数裁剪到上限，其余字段原样保留。 */
+function buildRecord(request, action, outcome, decision, latencyMs) {
+  const actionText = action === undefined ? undefined : JSON.stringify(action)
+  return Object.freeze({
+    id: randomUUID(),
+    time: new Date().toISOString(),
+    sessionId: request.agent.session.id,
+    callId: request.callId,
+    toolName: request.toolName,
+    turn: action?.turn,
+    cwd: action?.cwd,
+    reason: request.reason,
+    verdict: decision.verdict,
+    riskLevel: decision.riskLevel,
+    userAuthorization: decision.userAuthorization,
+    rationale: decision.rationale,
+    reviewerSessionId: decision.reviewerSessionId,
+    steps: decision.steps,
+    route: decision.route,
+    outcome: typeof outcome === 'string' ? outcome : String(outcome),
+    latencyMs,
+    ...(actionText === undefined ? {} : { action: truncateText(actionText, MAX_RECORD_ACTION_CHARS) }),
+  })
+}
+
+/** 裁剪过长文本，尾部加省略号。 */
+function truncateText(text, maxChars) {
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`
 }
 
 /** 提取与 callId 对应的原始工具参数；缺少关联参数时拒绝猜测。 */

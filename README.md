@@ -39,6 +39,15 @@ With `Auto Approve` selected, ordinary actions permitted by `workspace-write` ru
 
 The parent session records the approval events and a compact plugin notice: an auto-approved action gets the `allowed` notice, and a request handed back to the user gets a notice that names the Reviewer's rationale for not approving it. The Reviewer child session uses an `_auto-approve:<callId>` label and contains its messages, investigation tool calls and results, final assessment, and turn end. Console logs contain identifiers, model route, step count, stop reason, risk, authorization, and outcome, but not full prompts or file contents.
 
+## Approval log panel
+
+Every decision is recorded and shown as a reverse-chronological timeline. The host serves the records from `/api/dsh-auto-pass/log` and the plugin's client half renders them.
+
+- Placement follows [`dsh-context`](https://github.com/bowenliang123/dsh-context)'s model: a tab beside Chat/Trajectory in the conversation view (`conversation.view`), a tab in the right sidebar (`sidebarRightTabs`), or both. `placement: auto` (default) prefers the right sidebar and falls back to the conversation tab when the sidebar seat is unavailable — so the panel also works without any third-party sidebar plugin.
+- A settings card (`settings.plugin.item`) switches the placement at runtime; the choice lives in `localStorage` and overrides the `placement` config value.
+- Each row shows time, tool name, the verdict (`auto-approved` / `handed to user` / `review incomplete`) and, for a hand-off, how you answered; expanding it shows risk level, user authorization, rationale, approval reason, action arguments (truncated to 500 characters), latency, reviewer session, and step count.
+- Records persist as JSON and survive restarts: `$DSH_HOME/dsh-auto-pass/approvals.json` (default `~/.dsh/dsh-auto-pass/approvals.json`), newest 1000 kept, written atomically. `logFile` moves the file; `maxRecords` changes the cap. The log stores local approval data only and is served on localhost.
+
 ## Install
 
 The package name is `dsh-auto-pass`. Install it from GitHub:
@@ -78,6 +87,8 @@ The bundled defaults use `deepseek-official/deepseek-v4-flash` with `high` reaso
     maxRecentNonUserEntries: 20
     maxActionChars: 16000
     maxOutputTokens: 8192
+    maxRecords: 1000
+    placement: auto
 ```
 
 `language` accepts `auto` (default), `zh`, or `en`. An invalid value emits a warning and falls back to `auto`. In `auto` mode, the plugin counts Han characters across direct user messages in the session: four or more selects Chinese; otherwise it selects English. Agent instructions, assistant messages, and tool results do not affect detection. The Reviewer is instructed to write its rationale in the language of the direct user prompt. The security policy itself remains in Chinese in both modes to avoid changing review semantics through translation.

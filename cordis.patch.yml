@@ -39,3 +39,7 @@
         maxRecentNonUserEntries: 20
         maxActionChars: 16000
         maxOutputTokens: 8192
+        # 审批记录：落盘 JSON 的条数上限；placement=auto 优先右侧栏 tab，
+        # 没有右侧栏座位时退回对话区标签页
+        maxRecords: 1000
+        placement: auto

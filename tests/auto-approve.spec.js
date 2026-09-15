@@ -311,6 +311,84 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(ctx.subagents.start).toHaveBeenCalledOnce()
   })
 
+  it('自动放行的审批写入一条 allow 记录', async () => {
+    const ctx = contextWith(reviewerRun(allow))
+    const records = { add: vi.fn(), list: () => [], size: () => 0 }
+    const request = requestWith()
+    const outcome = await createAutoApprovalHandler(
+      ctx,
+      resolveConfig({ reviewerProvider: 'reviewer', reviewerModel: 'safe-model' }),
+      records,
+    )(request, vi.fn())
+
+    expect(outcome).toBe('allowed-once')
+    expect(records.add).toHaveBeenCalledOnce()
+    const entry = records.add.mock.calls[0][0]
+    expect(entry).toMatchObject({
+      sessionId: 'session-1',
+      toolName: 'bash',
+      callId: 'call-1',
+      reason: 'escalate sandbox to danger-full-access: 运行项目测试',
+      verdict: 'allow',
+      outcome: 'allowed-once',
+      riskLevel: 'low',
+      userAuthorization: 'high',
+      rationale: allow.rationale,
+      reviewerSessionId: 'reviewer-session-1',
+      steps: 2,
+      route: { provider: 'reviewer', model: 'safe-model' },
+    })
+    expect(typeof entry.latencyMs).toBe('number')
+    expect(entry.action).toContain('npm test')
+    expect(entry.time).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+  })
+
+  it('转人工的审批等人工答复后再记录，并带上人工侧结果', async () => {
+    const ctx = contextWith(reviewerRun(deny))
+    const records = { add: vi.fn(), list: () => [], size: () => 0 }
+    const next = vi.fn().mockResolvedValue('allowed-once')
+    const outcome = await createAutoApprovalHandler(ctx, resolveConfig(), records)(requestWith(), next)
+
+    expect(outcome).toBe('allowed-once')
+    expect(next).toHaveBeenCalledOnce()
+    expect(records.add).toHaveBeenCalledOnce()
+    expect(records.add.mock.calls[0][0]).toMatchObject({
+      verdict: 'deny',
+      outcome: 'allowed-once',
+      riskLevel: 'high',
+      userAuthorization: 'low',
+    })
+  })
+
+  it('拿不到精确动作时记 defer，人工结果原样返回', async () => {
+    const ctx = contextWith([])
+    const records = { add: vi.fn(), list: () => [], size: () => 0 }
+    const next = vi.fn().mockResolvedValue('rejected')
+    const outcome = await createAutoApprovalHandler(ctx, resolveConfig(), records)(
+      requestWith('auto-approve', { callId: undefined }),
+      next,
+    )
+
+    expect(outcome).toBe('rejected')
+    expect(ctx.subagents.start).not.toHaveBeenCalled()
+    expect(records.add.mock.calls[0][0]).toMatchObject({ verdict: 'defer', outcome: 'rejected', steps: 0 })
+  })
+
+  it('写入记录抛错也不改变审批结论', async () => {
+    const ctx = contextWith(reviewerRun(allow))
+    const records = {
+      add: vi.fn(() => { throw new Error('disk full') }),
+      list: () => [],
+      size: () => 0,
+    }
+    const request = requestWith()
+    const outcome = await createAutoApprovalHandler(ctx, resolveConfig(), records)(request, vi.fn())
+
+    expect(outcome).toBe('allowed-once')
+    expect(records.add).toHaveBeenCalledOnce()
+    expect(request.agent.inject).toHaveBeenCalled()
+  })
+
   it('连续多次 deny 不再中断 turn，每次都会转交人工审批', async () => {
     const runs = [reviewerRun(deny), reviewerRun(deny), reviewerRun(deny)]
     const ctx = contextWith(runs)
@@ -333,10 +411,12 @@ describe('Reviewer 创建期隔离', () => {
   it('在首次请求前钉死只读沙箱、工具 guard、推理等级和 step 上限', async () => {
     const listeners = new Map()
     const ctx = {
+      logger: { info: vi.fn(), warn: vi.fn() },
       on: vi.fn((name, listener) => {
         listeners.set(name, listener)
         return vi.fn()
       }),
+      inject: vi.fn(),
     }
     apply(ctx, {
       reviewerProvider: 'deepseek-official',
@@ -405,7 +485,11 @@ describe('输入装配与配置', () => {
     expect(resolveConfig({ language: 'ja' }, warn).language).toBe('auto')
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/language=ja.*auto/))
 
-    const ctx = { logger: { warn: vi.fn() }, on: vi.fn(() => vi.fn()) }
+    const ctx = {
+      logger: { info: vi.fn(), warn: vi.fn() },
+      on: vi.fn(() => vi.fn()),
+      inject: vi.fn(),
+    }
     apply(ctx, { language: 'invalid' })
     expect(ctx.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/language=invalid.*auto/))
   })
@@ -510,7 +594,11 @@ describe('审查语言自动选择', () => {
 
   it('英文会话使用英文任务提示、通知、guard 和宿主失败理由', async () => {
     const listeners = new Map()
-    apply({ on: vi.fn((name, listener) => { listeners.set(name, listener); return vi.fn() }) }, {})
+    apply({
+      logger: { info: vi.fn(), warn: vi.fn() },
+      on: vi.fn((name, listener) => { listeners.set(name, listener); return vi.fn() }),
+      inject: vi.fn(),
+    }, {})
 
     const ctx = contextWith(reviewerRun(allowEnglish))
     const request = requestWith('auto-approve', {
