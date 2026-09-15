@@ -92,7 +92,7 @@ function installBrowserStubs() {
   globalThis.fetch = vi.fn(async url => {
     const target = String(url)
     if (target.includes('/policy')) {
-      return { json: async () => ({ ok: true, threshold: 3, global: { allow: [], deny: [] }, project: { allow: [], deny: [] } }) }
+      return { json: async () => ({ ok: true, thresholds: { allow: 3, deny: 3 }, global: { allow: [], deny: [] }, project: { allow: [], deny: [] } }) }
     }
     if (target.includes('/log')) return { json: async () => ({ ok: true, records: sampleRecords() }) }
     return { json: async () => ({ ok: true, placement: 'all', writable: true }) }
@@ -256,13 +256,14 @@ describe('客户端半加载与注册', () => {
     for (const cleanup of cleanups) cleanup()
 
     // 对话区标签页只放审批设置：有阈值输入，没有时间线的「本次会话/全部会话」切换
-    expect(trees[0].includes('连续人工放行阈值')).toBe(true)
+    expect(trees[0].includes('连续放行阈值')).toBe(true)
+    expect(trees[0].includes('连续被拒阈值')).toBe(true)
     expect(trees[0].includes('黑名单 · 直接转人工')).toBe(true)
     expect(trees[0].includes('本次会话')).toBe(false)
     // 右侧栏是审批时间线：有会话范围切换，没有阈值输入
     expect(trees[1].includes('审批时间线')).toBe(true)
     expect(trees[1].includes('本次会话')).toBe(true)
-    expect(trees[1].includes('连续人工放行阈值')).toBe(false)
+    expect(trees[1].includes('连续放行阈值')).toBe(false)
     // 时间线行内要能看见审批意见，以及命中的是白名单还是黑名单（含规则标签）
     expect(trees[1].includes('用户明确要求运行测试。')).toBe(true)
     expect(trees[1].includes('白名单')).toBe(true)

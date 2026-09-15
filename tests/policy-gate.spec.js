@@ -79,7 +79,7 @@ function requestWith(options = {}) {
   }
 }
 
-function contextWith(runs = []) {
+function contextWith(runs = [], options = {}) {
   const queue = [...runs]
   return {
     subagents: { start: vi.fn().mockImplementation(() => Promise.resolve(queue.shift())) },
@@ -87,8 +87,15 @@ function contextWith(runs = []) {
       ? { resolve: () => ({ mode: 'workspace-write' }) }
       : name === 'approval'
         ? { config: { policy: 'ask' }, overrideOf: () => undefined }
-        : undefined),
+        : name === 'userQuestions' ? options.userQuestions : undefined),
     logger: { info: vi.fn(), warn: vi.fn() },
+  }
+}
+
+/** 规则询问是旁路的：等它走完再断言（真实运行时它不阻塞审批结论）。 */
+async function flush(times = 4) {
+  for (let index = 0; index < times; index += 1) {
+    await new Promise(resolve => setTimeout(resolve, 0))
   }
 }
 
@@ -101,8 +108,23 @@ function reviewerRun(structured) {
   }
 }
 
-function policyStore(root, autoApproveAfter) {
-  return createPolicyStore({ globalFile: join(root, 'home', 'policy.json'), autoApproveAfter, warn: () => {} })
+/** Reviewer 判定放行。 */
+function allowRun() {
+  return reviewerRun({ risk_level: 'low', user_authorization: 'high', outcome: 'allow', rationale: '用户明确要求。' })
+}
+
+/** Reviewer 判定拒绝。 */
+function denyRun() {
+  return reviewerRun({ risk_level: 'high', user_authorization: 'low', outcome: 'deny', rationale: '这条命令风险过高。' })
+}
+
+/** 规则优化调用：返回优化后的匹配条件（不是审查结论）。 */
+function ruleRun(matchValue = 'npm test') {
+  return reviewerRun({ tool: 'bash', match_kind: 'command_prefix', match_value: matchValue, label: 'npm 测试命令' })
+}
+
+function policyStore(root, autoApproveAfter, autoDenyAfter) {
+  return createPolicyStore({ globalFile: join(root, 'home', 'policy.json'), autoApproveAfter, autoDenyAfter, warn: () => {} })
 }
 
 /** 用插件自己的归一化生成「精确签名规则」，保证测试和实现同源。 */
@@ -214,29 +236,48 @@ describe('白名单与黑名单', () => {
   })
 })
 
-describe('权限记忆（连续人工放行自动升级）', () => {
-  it('连续两次人工放行后自动升级，第三次起不再打扰用户', async () => {
+describe('权限记忆（达阈值后询问用户）', () => {
+  it('连续放行达到阈值后询问用户，同意才写入白名单', async () => {
     const root = tempDir()
     const projectDir = join(root, 'project')
     const policies = policyStore(root, 2)
-    const handler = createAutoApprovalHandler(contextWith(), resolveConfig(), undefined, policies)
+    const asked = []
+    // 两次审查 + 一次规则优化（队列顺序即调用顺序）：审查不放行名单，规则优化产出 command_prefix 条件
+    const ctx = contextWith([allowRun(), allowRun(), ruleRun()], {
+      userQuestions: {
+        ask: async request => {
+          asked.push(request)
+          return { answers: [{ id: 'dsh-auto-pass:allow', selected: ['加入白名单（本项目）'] }] }
+        },
+      },
+    })
+    const config = resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' })
+    const handler = createAutoApprovalHandler(ctx, config, undefined, policies)
 
-    const first = vi.fn().mockResolvedValue('allowed-once')
-    expect(await handler(requestWith({ cwd: projectDir }), first)).toBe('allowed-once')
-    expect(first).toHaveBeenCalledOnce()
+    // 第一次只是计数：没有询问，也没有规则
+    expect(await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('allowed-once'))).toBe('allowed-once')
+    await flush()
+    expect(asked).toHaveLength(0)
     expect(policies.snapshot(projectDir).project.allow).toHaveLength(0)
 
-    const second = vi.fn().mockResolvedValue('allowed-once')
-    expect(await handler(requestWith({ cwd: projectDir }), second)).toBe('allowed-once')
-    expect(second).toHaveBeenCalledOnce()
-
-    // 达到阈值：已写入项目级免审查规则
+    // 第二次达到阈值：审批结论照常返回，询问在旁路进行
+    expect(await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('allowed-once'))).toBe('allowed-once')
+    await flush()
+    expect(asked).toHaveLength(1)
+    expect(asked[0].questions[0].options.map(option => option.label)).toEqual([
+      '加入白名单（本项目）',
+      '加入白名单（全局）',
+      '不加入（以后不再询问这类动作）',
+    ])
+    expect(asked[0].questions[0].question).toContain('npm test')
+    // 落盘的是模型优化后的条件（不是精确签名）
     const rules = policies.snapshot(projectDir).project.allow
     expect(rules).toHaveLength(1)
-    expect(rules[0].source).toBe('memory')
+    expect(rules[0].match).toEqual({ kind: 'command_prefix', value: 'npm test' })
+    expect(rules[0].source).toBe('model')
     expect(JSON.parse(readFileSync(join(projectDir, '.dsh-auto-pass', 'policy.json'), 'utf8')).rules.allow).toHaveLength(1)
 
-    // 第三次直接命中名单：不调用人工链
+    // 第三次直接命中名单：连人工链都不用调
     const third = vi.fn()
     expect(await handler(requestWith({ cwd: projectDir }), third)).toBe('allowed-once')
     expect(third).not.toHaveBeenCalled()
@@ -254,24 +295,93 @@ describe('权限记忆（连续人工放行自动升级）', () => {
     expect(policies.snapshot(projectDir).project.allow).toHaveLength(0)
   })
 
-  it('插件自己审查通过放行的请求不计数', async () => {
+  it('插件自动放行同样计数：达到阈值一样询问，选「不加入」后不再打扰', async () => {
     const root = tempDir()
     const projectDir = join(root, 'project')
     const policies = policyStore(root, 1)
-    const ctx = contextWith([reviewerRun({
-      risk_level: 'low',
-      user_authorization: 'high',
-      outcome: 'allow',
-      rationale: '用户明确要求。',
-    })])
+    const request = requestWith({ cwd: projectDir })
+    const signature = signatureOf(request, exactAction(request))
+    const asked = []
+    // 第一次审查已经给出结构化建议 → 直接沿用它，不必再单独跑一次规则优化调用
+    const ctx = contextWith([
+      reviewerRun({
+        risk_level: 'low',
+        user_authorization: 'high',
+        outcome: 'allow',
+        rationale: '用户明确要求。',
+        rule: { tool: 'bash', match_kind: 'signature', match_value: signature.key, label: signature.text },
+      }),
+      allowRun(),
+    ], {
+      userQuestions: {
+        ask: async askRequest => {
+          asked.push(askRequest)
+          return { answers: [{ id: 'dsh-auto-pass:allow', selected: ['不加入（以后不再询问这类动作）'] }] }
+        },
+      },
+    })
     const config = resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' })
-    const outcome = await createAutoApprovalHandler(ctx, config, undefined, policies)(requestWith({ cwd: projectDir }), vi.fn())
+    const handler = createAutoApprovalHandler(ctx, config, undefined, policies)
 
-    expect(outcome).toBe('allowed-once')
+    expect(await handler(request, vi.fn())).toBe('allowed-once')
+    await flush()
+    expect(asked).toHaveLength(1)
+    // 选「不加入」：没有规则写进任何名单
     expect(policies.snapshot(projectDir).project.allow ?? []).toHaveLength(0)
-    // 没有计数就不该落盘：既没有全局策略文件，也没有项目策略目录
-    expect(existsSync(join(root, 'home', 'policy.json'))).toBe(false)
-    expect(existsSync(join(projectDir, '.dsh-auto-pass', 'policy.json'))).toBe(false)
+    expect(policies.snapshot(projectDir).global.allow).toHaveLength(0)
+
+    // 再连续放行也不会再问：同一个动作已经被用户明确拒绝过一次
+    expect(await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('allowed-once'))).toBe('allowed-once')
+    await flush()
+    expect(asked).toHaveLength(1)
+  })
+
+  it('连续被拒达到阈值后询问是否加入黑名单', async () => {
+    const root = tempDir()
+    const projectDir = join(root, 'project')
+    const policies = policyStore(root, 3, 2)
+    const signature = signatureOf(requestWith({ cwd: projectDir }), exactAction(requestWith({ cwd: projectDir })))
+    const asked = []
+    // 两次审查都判定拒绝，第三次调用是规则优化
+    const ctx = contextWith([denyRun(), denyRun(), ruleRun()], {
+      userQuestions: {
+        ask: async askRequest => {
+          asked.push(askRequest)
+          return { answers: [{ id: 'dsh-auto-pass:deny', selected: ['加入黑名单（全局）'] }] }
+        },
+      },
+    })
+    const config = resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' })
+    const handler = createAutoApprovalHandler(ctx, config, undefined, policies)
+
+    // 两次被拒（人工拒绝）后触发询问；被拒的动作本身不进人工链以外的任何名单
+    await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('rejected'))
+    await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('rejected'))
+    await flush()
+    expect(asked).toHaveLength(1)
+    expect(asked[0].questions[0].options.map(option => option.label)).toContain('加入黑名单（全局）')
+    const rules = policies.snapshot(projectDir).global.deny
+    expect(rules).toHaveLength(1)
+    expect(rules[0].match).toEqual({ kind: 'command_prefix', value: 'npm test' })
+    // 于是之后的同类动作直接转人工，连模型都不叫
+    const signature2 = signatureOf(requestWith({ cwd: projectDir }), exactAction(requestWith({ cwd: projectDir })))
+    expect(signature2.key).toBe(signature.key)
+    const next = vi.fn().mockResolvedValue('rejected')
+    expect(await handler(requestWith({ cwd: projectDir }), next)).toBe('rejected')
+    // Reviewer 只在前两次调用时启动：命中黑名单后连模型都不叫
+    expect(ctx.subagents.start).toHaveBeenCalledTimes(3)
+  })
+
+  it('没有 userQuestions 服务时只记日志，不写任何规则', async () => {
+    const root = tempDir()
+    const projectDir = join(root, 'project')
+    const policies = policyStore(root, 1)
+    const ctx = contextWith([allowRun()])
+    const config = resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' })
+    expect(await createAutoApprovalHandler(ctx, config, undefined, policies)(requestWith({ cwd: projectDir }), vi.fn())).toBe('allowed-once')
+    await flush()
+    expect(policies.snapshot(projectDir).project.allow ?? []).toHaveLength(0)
+    expect(policies.snapshot(projectDir).global.allow).toHaveLength(0)
   })
 
   it('拿不到精确动作时不建立签名，不会被记忆升级', async () => {
@@ -399,13 +509,16 @@ describe('策略 HTTP 入口', () => {
     const initial = fakeHttp('GET', POLICY_PATH + '?cwd=' + encodeURIComponent(projectDir))
     await handler(initial.req, initial.res)
     const snapshot = JSON.parse(initial.state.body)
-    expect(snapshot.threshold).toBe(4)
+    expect(snapshot.thresholds).toEqual({ allow: 4, deny: 3 })
     expect(snapshot.global.allow).toEqual([])
     expect(snapshot.projectFile).toContain('.dsh-auto-pass')
 
     const threshold = fakeHttp('POST', POLICY_PATH, JSON.stringify({ op: 'threshold', threshold: 5 }))
     await handler(threshold.req, threshold.res)
     expect(JSON.parse(threshold.state.body).threshold).toBe(5)
+    const denyThreshold = fakeHttp('POST', POLICY_PATH, JSON.stringify({ op: 'threshold', list: 'deny', threshold: 6 }))
+    await handler(denyThreshold.req, denyThreshold.res)
+    expect(JSON.parse(denyThreshold.state.body)).toMatchObject({ threshold: 6, list: 'deny' })
 
     const add = fakeHttp('POST', POLICY_PATH, JSON.stringify({
       op: 'add',

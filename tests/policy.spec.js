@@ -206,16 +206,26 @@ describe('policy store', () => {
     expect(instance.snapshot(blocker).global.allow).toHaveLength(1)
   })
 
-  it('阈值可读写，非法值被忽略', () => {
-    const instance = store()
+  it('两侧阈值可读写，非法值被忽略', () => {
+    const file = join(root, 'home', 'policy.json')
+    const instance = createPolicyStore({ globalFile: file, warn: () => {}, autoApproveAfter: 3, autoDenyAfter: 3 })
     expect(instance.threshold()).toBe(3)
+    expect(instance.threshold('deny')).toBe(3)
     expect(instance.setThreshold(5)).toBe(5)
-    expect(store().threshold()).toBe(5)
+    expect(instance.setThreshold(4, 'deny')).toBe(4)
+    // 阈值是用户偏好：重启后从全局文件读回
+    const reopened = createPolicyStore({ globalFile: file, warn: () => {} })
+    expect(reopened.threshold()).toBe(5)
+    expect(reopened.threshold('deny')).toBe(4)
     expect(instance.setThreshold(0)).toBe(5)
+    expect(instance.setThreshold(0, 'deny')).toBe(4)
+    // 早期版本只有一个 threshold 字段，按白名单阈值兼容读取
+    writeFileSync(file, JSON.stringify({ version: 1, rules: { allow: [], deny: [] }, counters: {}, threshold: 7 }), 'utf8')
+    expect(createPolicyStore({ globalFile: file, warn: () => {} }).threshold()).toBe(7)
   })
 })
 
-describe('observe（记忆与自动升级）', () => {
+describe('observe（连续计数与升级建议）', () => {
   let root
   let cwd
   let signature
@@ -226,51 +236,71 @@ describe('observe（记忆与自动升级）', () => {
     signature = pwshSignature('git status')
   })
 
-  function store(threshold = 3) {
-    return createPolicyStore({ globalFile: join(root, 'home', 'policy.json'), warn: () => {}, autoApproveAfter: threshold })
+  function store(threshold = 3, denyThreshold = 3) {
+    return createPolicyStore({
+      globalFile: join(root, 'home', 'policy.json'),
+      warn: () => {},
+      autoApproveAfter: threshold,
+      autoDenyAfter: denyThreshold,
+    })
   }
 
-  it('连续人工放行达到阈值后升级为项目级免审查规则', () => {
+  it('连续放行达到阈值时只给出建议，不落任何规则', () => {
     const instance = store(3)
     for (let index = 0; index < 2; index += 1) {
-      const seen = instance.observe({ signature, cwd, outcome: 'allowed-once', fromHuman: true })
-      expect(seen.promoted).toBeNull()
+      const seen = instance.observe({ signature, cwd, signal: 'pass' })
+      expect(seen.suggestion).toBeNull()
       expect(seen.approvals).toBe(index + 1)
     }
-    const promoted = instance.observe({ signature, cwd, outcome: 'allowed-once', fromHuman: true })
-    expect(promoted.promoted).not.toBeNull()
-    expect(promoted.promoted.source).toBe('memory')
-    expect(promoted.promoted.match.kind).toBe('signature')
-    expect(instance.match({ signature, cwd }).scope).toBe('project')
-    // 升级后计数清零：再放行一次要重新从 1 开始
-    expect(instance.observe({ signature, cwd, outcome: 'allowed-once', fromHuman: true }).approvals).toBe(1)
-  })
-
-  it('人工拒绝把连续计数清零', () => {
-    const instance = store(3)
-    instance.observe({ signature, cwd, outcome: 'allowed-once', fromHuman: true })
-    instance.observe({ signature, cwd, outcome: 'allowed-once', fromHuman: true })
-    expect(instance.observe({ signature, cwd, outcome: 'rejected', fromHuman: true }).approvals).toBe(0)
-    expect(instance.observe({ signature, cwd, outcome: 'allowed-once', fromHuman: true }).approvals).toBe(1)
-  })
-
-  it('插件自己的自动放行（fromHuman=false）不计数', () => {
-    const instance = store(2)
-    expect(instance.observe({ signature, cwd, outcome: 'allowed-once', fromHuman: false }).approvals).toBe(0)
+    const triggered = instance.observe({ signature, cwd, signal: 'pass' })
+    expect(triggered.suggestion).toEqual({ list: 'allow', count: 3 })
+    // 关键性质：建议不是规则——没有经过模型优化与用户确认，绝不落盘
     expect(instance.snapshot(cwd).global.allow).toHaveLength(0)
+    expect(instance.match({ signature, cwd })).toBeUndefined()
+    // 触发后计数清零：同一次累积不会被重复触发
+    expect(instance.observe({ signature, cwd, signal: 'pass' }).approvals).toBe(1)
+  })
+
+  it('连续被拒达到阈值时给出黑名单建议', () => {
+    const instance = store(3, 2)
+    expect(instance.observe({ signature, cwd, signal: 'reject' }).denials).toBe(1)
+    const triggered = instance.observe({ signature, cwd, signal: 'reject' })
+    expect(triggered.suggestion).toEqual({ list: 'deny', count: 2 })
+  })
+
+  it('相反信号打断另一侧的连续', () => {
+    const instance = store(3)
+    instance.observe({ signature, cwd, signal: 'pass' })
+    instance.observe({ signature, cwd, signal: 'pass' })
+    const rejected = instance.observe({ signature, cwd, signal: 'reject' })
+    expect(rejected.approvals).toBe(0)
+    expect(rejected.denials).toBe(1)
+    expect(instance.observe({ signature, cwd, signal: 'pass' }).approvals).toBe(1)
+  })
+
+  it('dismiss 之后既不再计数，也不再给出建议', () => {
+    const instance = store(1)
+    expect(instance.observe({ signature, cwd, signal: 'pass' }).suggestion.list).toBe('allow')
+    expect(instance.dismiss({ signature, cwd, list: 'allow' })).toBe(true)
+    const seen = instance.observe({ signature, cwd, signal: 'pass' })
+    expect(seen.approvals).toBe(0)
+    expect(seen.suggestion).toBeNull()
+    // 另一侧不受影响
+    expect(instance.observe({ signature, cwd, signal: 'reject' }).suggestion).toBeNull()
+  })
+
+  it('没有签名或没有信号时不计数', () => {
+    const instance = store(5)
+    expect(instance.observe({ signature: undefined, cwd, signal: 'pass' }).suggestion).toBeNull()
+    expect(instance.observe({ signature, cwd, signal: undefined }).suggestion).toBeNull()
+    expect(instance.observe({ signature, cwd, signal: 'pass' }).approvals).toBe(1)
   })
 
   it('不同项目各自计数，互不影响', () => {
     const instance = store(2)
     const other = join(root, 'other')
-    instance.observe({ signature, cwd, outcome: 'allowed-once', fromHuman: true })
-    expect(instance.observe({ signature, cwd: other, outcome: 'allowed-once', fromHuman: true }).promoted).toBeNull()
-    expect(instance.observe({ signature, cwd, outcome: 'allowed-once', fromHuman: true }).promoted).not.toBeNull()
-  })
-
-  it('没有工作目录时升级为全局规则', () => {
-    const instance = store(1)
-    const promoted = instance.observe({ signature, cwd: undefined, outcome: 'allowed-once', fromHuman: true })
-    expect(promoted.promoted.scope).toBe('global')
+    instance.observe({ signature, cwd, signal: 'pass' })
+    expect(instance.observe({ signature, cwd: other, signal: 'pass' }).suggestion).toBeNull()
+    expect(instance.observe({ signature, cwd, signal: 'pass' }).suggestion).not.toBeNull()
   })
 })

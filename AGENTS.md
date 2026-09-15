@@ -7,12 +7,12 @@
 - `dsh-auto-pass`：给 DSH WebUI 增加 `🚦 Auto Approve` 权限档位。入口 `src/index.js`，在 `approval/request` waterfall 上注册应答器。
 - **核心语义**：插件自身唯一会给出的结论是 `allowed-once`（只自动放行 Reviewer 判定 `outcome: allow` 的请求）；模型 deny、宿主安全降级（critical / high 授权不足）、审查失败（超时、无审查路由、拿不到精确动作、输出非法、子 Agent 异常）一律调用 `next()` 转回 DSH 原生人工审批链（ask），由用户决定。
 - 审查提示词与安全策略在 `prompts/policy-template.md`、`prompts/policy.md`（两种语言下策略正文都保持中文）。
-- **权限记忆（`src/policy.js`）**：白名单（直接放行）/黑名单（直接转人工）分项目与全局两级，命中名单**不启动 Reviewer**；同一项目同一签名连续人工放行达到阈值（默认 3，可在面板改）后自动升级为免审查规则。匹配器只认三种闭集条件：`signature`（精确签名）/ `command_prefix` / `path_prefix`。规则文本由 Reviewer 模型在可选字段 `rule` 里给出（**不会**自动生效），用户在时间线上点升级/降级才落盘；没有模型建议时精确回落到该次签名。
+- **权限记忆（`src/policy.js`）**：白名单（直接放行）/黑名单（直接转人工）分项目与全局两级，命中名单**不启动 Reviewer**；同一项目同一签名连续放行（默认 3 次，自动放行与人工放行都算）或连续被拒（默认 3 次，模型 deny 与人工拒绝都算）达到阈值后，**先由 DSH 模型把这次动作优化成匹配条件，再用 `ctx.userQuestions.ask` 问用户是否加入名单**——用户确认才落盘，**不再静默升级**。匹配器只认三种闭集条件：`signature`（精确签名）/ `command_prefix` / `path_prefix`；时间线上的手动升级/降级仍优先采用 Reviewer 的 `rule` 建议。
 
 ## 命令（已验证）
 
 - 安装依赖：`pnpm install`（Node ≥ 22.19；`~/.npmrc` 的 registry 为 npmmirror，装 vitest 约 2 秒）。
-- 跑测试：`pnpm test`（= `vitest run`，当前 83 个用例全绿：`auto-approve` 23 + `records` 10 + `package` 4 + `policy` 25 + `policy-gate` 18 + `client` 3）。
+- 跑测试：`pnpm test`（= `vitest run`，当前 86 个用例全绿：`auto-approve` 23 + `records` 10 + `package` 4 + `policy` 26 + `policy-gate` 20 + `client` 3）。
 - **客户端半只有 `tests/client.spec.js` 覆盖**：它不进构建流水线。测试用假 `window.__ModuleLoader__` + 带「渲染帧」的假 react 加载 bundle，把组件**渲染到稳定状态**（反复求值 + 跑副作用 + 等微任务，直到没有新的 `setState`）——漏定义变量、漏闭合花括号、以及「异步拉到记录之后」那一轮渲染里的问题就靠它兜住（都真的漏过）。
 - `tests/auto-approve.spec.js` 文件名沿用权限档位名 `auto-approve`，与包名 `dsh-auto-pass` 不同，改名时不要误删。
 - **受限沙箱下 `pnpm test` 会 `spawn EPERM`**（vite 会 `exec("net use")`、vitest 默认 forks 池也要 spawn 子进程）；需要以更宽权限运行，否则测试跑不起来。
@@ -28,7 +28,10 @@
 - 通知通过 `agent.inject({ source: { kind: 'plugin', plugin: 'dsh-auto-pass', form: 'notice' } })` 写进父 session；allow 与转人工用不同 headline/summary。
 - `maxConsecutiveDenials` 与 turn 中断逻辑已删除：拒绝不再阻断，交给用户后可继续审批。
 - **审批前的判定顺序（`createAutoApprovalHandler`）**：`action === undefined` → 直接转人工（且**不建立签名**）；否则先查名单，`deny` 命中直接 `next()`、`allow` 命中直接 `allowed-once`（两者都不建 Reviewer）；都没命中才走模型审查；`tests/policy-gate.spec.js` 用「`ctx.subagents.start` 一次都没被调用」把这一点钉死，并要求记录里带上 `policy.{list,scope,label}`（时间线据此显示命中名单）。
-- **签名的三条安全性质（防过的坑）**：① `action` 拿不到时不建签名——否则所有解析不出参数的请求塌缩成同一个空签名，会被一起自动放行；② 计数只认 `fromHuman`（插件自己放行不算）**且** `decision.policyHit === undefined`（刚被黑名单拦下的动作，用户这一次放行是单次决定，不该长成记忆规则）；③ 记忆规则只写 `signature`（精确）条件，只有用户手动升级才可能带 `command_prefix`/`path_prefix`。黑名单永远压过白名单。
+- **达阈值后的升级建议（`observeDecision` → `proposeRule`）**：`policy.observe` 只返回 `{approvals, denials, suggestion}`，**不再自行落规则**；`finish()` 拿到 `suggestion` 后立刻 `void proposeRule(...)`——**旁路异步**执行，既不改变已经确定的审批结论，也不阻塞这次工具调用（同一签名同一名单同时只挂一个问题）。proposeRule 先取规则：本次审查的 `suggestedRule`，没有就起一次只读的 `optimizeRule` 子 Agent（persona 来自 `prompts/rule-template.md`，输出 `ruleSuggestionSchema`）；再 `ctx.userQuestions.ask({ questions, agent })` 问「加入白名单/黑名单（本项目/全局）/ 不加入」；同意则 `addRule({ source: model })` 并回写记录的 `ruleApplied`，选「不加入」则 `dismiss`（该签名该名单从此不再计数、不再询问）。
+- **ask 的三个前提与失败姿态**：① `ctx.get(userQuestions)` 不存在（没人应答）→ 只记日志、不写规则；② `agent` 必须是在册的 runtime root，子 Agent 的审批会抛 `DELEGATED_CALLER` → 同样只记日志（触发时计数已清零，下次再攒够阈值会重问）；③ 回答按我们自己生成的选项 label 精确匹配，认不出来一律按「不加入」处理。三者都只影响「规则有没有被写入」，绝不影响审批结论。
+- **两侧计数与阈值**：计数键是 `<cwd>` + NUL + `<signatureKey>`，同一条目里 allow / deny 两侧各自累计，相反信号把另一侧清零；阈值按名单分开存（`thresholds.allow` / `thresholds.deny`，HTTP `op=threshold` 带 `list`），旧文件里的单个 `threshold` 字段按白名单阈值兼容读取。
+- **签名的三条安全性质（防过的坑）**：① `action` 拿不到时不建签名——否则所有解析不出参数的请求塌缩成同一个空签名，会被一起计数、一起触发询问；② 命中名单的那一次不计数（`decision.policyHit !== undefined`）：用户刚把这类动作写成规则，这一次的放行/拒绝是**单次**决定，不该继续滚成记忆；③ 达到阈值只产生**建议**：规则一律经「模型优化 → 用户确认」才落盘，选过「不加入」的动作记进 `dismissed` 不再询问。黑名单永远压过白名单。
 - `signatureOf` 会把字符串形态的 `arguments` 解析一层：`tool/call` 事件里 `arguments` 时而对象时而 JSON 字符串，字符串若不解析会退化成空参数签名，等于把一条规则放大到整个工具。
 - 策略文件：全局 `$DSH_HOME/dsh-auto-pass/policy.json`（阈值 + 全局名单 + 计数），项目 `<cwd>/.dsh-auto-pass/policy.json`（项目名单）。计数统一放全局文件、键带 `cwd` 前缀，所以项目目录只在真的写了项目规则时才多出 `.dsh-auto-pass/`。项目写盘失败自动降级写全局；策略 IO 失败只告警，绝不影响审批结论。
 - HTTP：`GET/POST /api/dsh-auto-pass/policy`（快照 / `op=threshold|add|remove`）、`POST /api/dsh-auto-pass/rule {recordId, scope, list}`（由记录一键升级/降级，并回写记录的 `ruleApplied`）。
@@ -38,7 +41,8 @@
 - 客户端半是 `src/client.js`，由 `package.json` 的 `exports["./client"]` + `dsh.client = { platform: 'web', inject: [...] }` 声明；载体把它变成 `/plugins/dsh-auto-pass/client.js`，文件本身必须是 `window.__ModuleLoader__.load({ id, factory })` 形式（`id` 必须是包名），factory 里用 `require('react')` 取基座 React，导出 `inject` + `apply`。`dsh.client.inject` 列的是必须**先于**本插件加载的包（这里：`dsh-api-remotes`、`dsh-client-ui-conversation`、`dsh-client-ui-sidebar-right`——后两个提供我们要用的槽）。
 - **必须导出 `exports["./package.json"]`（踩过坑，代价是四次重启）**：合成器 `dsh-client-modules` 的 `locatePkgJson` 在拿不到 loader `internal.resolveSync` 时走回退分支 `createRequire(baseUrl).resolve('<pkg>/package.json')`；本机 loader 恰好走的就是这条。`exports` 一旦是受限白名单（只有 `.` 与 `./client`），该调用抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`，被 `catch { return }` 吞掉 → `pkgMeta` 缓存 `null` → **本插件静默不入图：不报错、宿主日志无任何 warn、渲染器也不报 boot failed**，表现就是「各入口完全不存在」。已核对：图里 66 个 row 的第三方插件（dsh-context / dsh-todo-guard / dsh-change-review / dsh-better-sidebar / dsh-notify-me …）**全部**导出了 `./package.json`。`tests/package.spec.js` 把它钉成断言。
 - 排查「为什么不入图」的判定链（可复用）：宿主日志 probe 报 `graphEntries=66 graphHas=false` 且**无** client-modules 报错 → 不是 throw（throw 会 FATAL 掉整个 clientModules 服务，graphEntries 会变 0），只能是 `resolveMeta` 静默返回 `null`；再比对渲染器缓存里的 boot 清单（`__DSH_BOOT__` 内联在首屏 HTML 里，落在 `%APPDATA%\DSH Desktop\Partitions\dsh-desktop-renderer\Cache\Cache_Data`）确认 row 真的不在图里，而不是加载后才掉队。
-- **两个面板刻意分开**：对话区标签页 = 「审批设置」（阈值 + 项目/全局 × 白/黑名单），右侧栏 tab = 「审批时间线」（倒序记录 + 每条可升级/降级）。`placement` 的 `tab`/`sidebar` 现在各只留一处；`all` 两处都注册；`auto` 优先右侧栏、无座位退回对话区。
+- **两个面板刻意分开**：对话区标签页 = 「审批设置」（**两侧**阈值输入 + 项目/全局 × 白/黑名单），右侧栏 tab = 「审批时间线」（倒序记录 + 每条可升级/降级）。`placement` 的 `tab`/`sidebar` 现在各只留一处；`all` 两处都注册；`auto` 优先右侧栏、无座位退回对话区。
+- 面板数据形状：`/policy` 快照返回 `thresholds.{allow,deny}`（不再是单个 `threshold`），保存阈值用 `{ op: threshold, list, threshold }`；记录里除 `approvals` 外还有 `denials`，以及规则询问的结果 `ruleApplied` / `ruleDeclined`（时间线显示「已询问，未加入」）。
 - **布局要与对话等宽（读源码确认）**：对话区面板 = `.ap-frame`（`padding:16px calc(var(--dsh-composer-side-clearance,16px) + 16px) 24px`、`align-items:center`）里的 `.ap-col`（`width:100%;max-width:var(--dsh-chat-content-width,748px)`），再往里是一张张 `.ap-card`。这两个变量由会话根元素 `._0cyzDW_root` 下发（`publishWidths` 用 ResizeObserver 写 `--dsh-conversation-column-width`，`--dsh-chat-content-width = clamp(680px, column*0.64, 920px)`）；`conversation.view` 的内容渲染在 `._0cyzDW_viewArea` 里、是该根元素的后代，所以变量能继承到。官方插件 `dsh-client-ui-approval` / `dsh-client-ui-user-questions` 用的是同一套写法（照抄它们的对齐方式，别自己拍宽度）。
 - **设置页卡片必须渲染 `<li>`（踩过坑）**：`settings.plugin.item` 的宿主容器是 `ul.JMEyFa_cards`（外层 section `max-width:760px`），**整张卡片由插件自己拥有**。早期用 `<div>` + 内联 style，卡片样式一条都没生效，表现就是「设置里只有一段裸文字」。现在用 `card('li', …)` 复刻内置插件卡 `.TKtcza_card` 的外观（`.5px` 描边 `--dsw-alias-border-l4`、底色 `--dsw-alias-bg-layer-3`、16px 圆角、标题 15px/600 + 13px 说明）。
 - **时间线行内展示**：折叠态除时间/工具/结论外，还显示**审批意见**（`record.rationale`，CSS 两行截断）与**命中名单**徽标（`record.policy.list` → 白名单/黑名单 + 作用域 + 规则标签），所以命中名单时不展开也能看出为什么放行或转人工。

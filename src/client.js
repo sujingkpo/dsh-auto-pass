@@ -103,7 +103,10 @@ window.__ModuleLoader__.load({
         hitDeny: '黑名单',
         promoted: '已自动升级',
         applied: '已应用',
-        approvals: '连续人工放行',
+        approvals: '连续放行',
+        denials: '连续被拒',
+        ruleAsk: '规则询问',
+        ruleDeclined: '已询问，未加入',
         promote: '升级为白名单',
         demote: '降级为黑名单',
         scopeProject: '本项目',
@@ -116,9 +119,13 @@ window.__ModuleLoader__.load({
         kindCommandPrefix: '命令前缀',
         kindPathPrefix: '路径前缀',
         settingsTitle: '审批设置',
-        settingsDesc: '连续人工放行达到阈值后，该权限会被自动升级为免审查规则（以后直接放行）。',
-        thresholdLabel: '连续人工放行阈值',
+        settingsDesc: '连续通过或连续被拒达到阈值后，插件会先让 DSH 模型把这次动作优化成一条匹配条件，再询问你是否加入白名单/黑名单——你确认了才会写入。',
+        thresholdLabel: '连续放行阈值',
+        thresholdLabelDeny: '连续被拒阈值',
+        thresholdHintAllow: '达到后询问是否加入白名单',
+        thresholdHintDeny: '达到后询问是否加入黑名单',
         thresholdUnit: '次',
+        ruleAskNote: '自动审批与你本人的放行都计入「连续放行」；模型判定拒绝或你选择了拒绝都计入「连续被拒」。问过一次并选择「不加入」后，这个动作不会再被询问。',
         save: '保存',
         saved: '已保存',
         globalScope: '全局（所有项目）',
@@ -169,7 +176,10 @@ window.__ModuleLoader__.load({
         hitDeny: 'Denylist',
         promoted: 'Auto-promoted',
         applied: 'Applied',
-        approvals: 'Consecutive manual approvals',
+        approvals: 'Consecutive approvals',
+        denials: 'Consecutive denials',
+        ruleAsk: 'Rule prompt',
+        ruleDeclined: 'Asked, not added',
         promote: 'Promote to allowlist',
         demote: 'Demote to denylist',
         scopeProject: 'This project',
@@ -182,9 +192,13 @@ window.__ModuleLoader__.load({
         kindCommandPrefix: 'command prefix',
         kindPathPrefix: 'path prefix',
         settingsTitle: 'Approval policy',
-        settingsDesc: 'After this many consecutive manual approvals the permission is promoted to a rule that needs no review.',
+        settingsDesc: 'After this many consecutive approvals or denials the plugin first has the DSH model turn the action into a match condition, then asks whether to add it to the allowlist/denylist — nothing is written until you confirm.',
         thresholdLabel: 'Consecutive approval threshold',
+        thresholdLabelDeny: 'Consecutive denial threshold',
+        thresholdHintAllow: 'ask to allowlist after this many',
+        thresholdHintDeny: 'ask to denylist after this many',
         thresholdUnit: 'times',
+        ruleAskNote: 'Auto-approved and user-approved calls both count as approvals; a model deny and your own rejection both count as denials. After you answer "do not add" once, that action is never asked about again.',
         save: 'Save',
         saved: 'Saved',
         globalScope: 'Global (all projects)',
@@ -520,6 +534,10 @@ window.__ModuleLoader__.load({
         ? undefined
         : record.policy.list === 'allow' ? t.hitAllow : t.hitDeny
       const hitClass = record.policy?.list === 'allow' ? 'ap-badgeOk' : 'ap-badgeWarn'
+      const declined = record.ruleDeclined === undefined
+        ? undefined
+        : t.ruleDeclined + ' · ' + (record.ruleDeclined.list === 'allow' ? t.allowList : t.denyList)
+          + ' · ' + String(record.ruleDeclined.label ?? '')
       const approvals = typeof record.approvals === 'number' && record.approvals > 0
         ? String(record.approvals)
         : undefined
@@ -556,6 +574,8 @@ window.__ModuleLoader__.load({
           react.createElement(Field, { label: t.applied, value: applied }),
           react.createElement(Field, { label: t.promoted, value: promoted }),
           react.createElement(Field, { label: t.approvals, value: approvals }),
+          react.createElement(Field, { label: t.denials, value: record.denials === undefined || record.denials === 0 ? undefined : String(record.denials) }),
+          react.createElement(Field, { label: t.ruleAsk, value: declined }),
           react.createElement(Field, { label: t.latency, value: record.latencyMs === undefined ? undefined : String(record.latencyMs) + ' ms' }),
           react.createElement(Field, { label: t.reviewer, value: [record.reviewerSessionId, record.steps === undefined ? undefined : record.steps + ' steps'].filter(Boolean).join(' · ') }),
           react.createElement(Field, { label: t.time, value: record.time }),
@@ -642,7 +662,7 @@ window.__ModuleLoader__.load({
       const [cwd, setCwd] = react.useState(() => workspaceOf(sessionId))
       const [error, setError] = react.useState('')
       const [saved, setSaved] = react.useState(false)
-      const [threshold, setThreshold] = react.useState('')
+      const [thresholdDraft, setThresholdDraft] = react.useState({})
       const [revision, setRevision] = react.useState(0)
 
       react.useEffect(() => policyStore.subscribe(() => setRevision(value => value + 1)), [])
@@ -676,14 +696,25 @@ window.__ModuleLoader__.load({
       const snapshot = policyStore.value
       const globalRules = snapshot?.global ?? { allow: [], deny: [] }
       const projectRules = snapshot?.project
-      const shownThreshold = threshold === '' ? String(snapshot?.threshold ?? '') : threshold
+      // 阈值分两侧：allow=连续放行后询问是否加入白名单，deny=连续被拒后询问是否加入黑名单。
+      const thresholds = snapshot?.thresholds ?? { allow: snapshot?.threshold }
+      const shownThreshold = list => thresholdDraft[list] === undefined
+        ? String(thresholds[list] ?? '')
+        : thresholdDraft[list]
+      const editThreshold = (list, value) => {
+        setThresholdDraft(previous => ({ ...previous, [list]: value }))
+        setSaved(false)
+      }
 
       const save = () => {
-        const value = Number.parseInt(shownThreshold, 10)
         setError('')
         setSaved(false)
-        policyStore.post({ op: 'threshold', threshold: value })
-          .then(() => { setSaved(true); setThreshold('') })
+        // 只提交合法值：数字框里留空或写脏值时，那一侧保持原样
+        const writes = ['allow', 'deny']
+          .map(list => ({ list, value: Number.parseInt(shownThreshold(list), 10) }))
+          .filter(entry => Number.isSafeInteger(entry.value) && entry.value >= 1)
+        Promise.all(writes.map(entry => policyStore.post({ op: 'threshold', list: entry.list, threshold: entry.value })))
+          .then(() => { setSaved(true); setThresholdDraft({}) })
           .catch(cause => setError(String(cause?.message ?? cause)))
       }
       const remove = (scope, list, id) => {
@@ -696,19 +727,24 @@ window.__ModuleLoader__.load({
       return react.createElement('div', { className: 'ap-root' },
         react.createElement('div', { className: 'ap-frame' },
           react.createElement('div', { className: 'ap-col' },
-            card('section', t.settingsTitle, t.settingsDesc,
+            card('section', t.settingsTitle, t.settingsDesc, [
+              [['allow', t.thresholdLabel, t.thresholdHintAllow], ['deny', t.thresholdLabelDeny, t.thresholdHintDeny]]
+                .map(([list, label, hint]) => react.createElement('div', { className: 'ap-row2', key: list },
+                  react.createElement('span', { className: 'ap-fieldKey' }, label),
+                  react.createElement('input', {
+                    className: 'ap-input',
+                    type: 'number',
+                    min: '1',
+                    value: shownThreshold(list),
+                    onChange: event => editThreshold(list, event.target.value),
+                  }),
+                  react.createElement('span', { className: 'ap-note' }, t.thresholdUnit),
+                  react.createElement('span', { className: 'ap-note' }, hint))),
               react.createElement('div', { className: 'ap-row2' },
-                react.createElement('span', { className: 'ap-fieldKey' }, t.thresholdLabel),
-                react.createElement('input', {
-                  className: 'ap-input',
-                  type: 'number',
-                  min: '1',
-                  value: shownThreshold,
-                  onChange: event => { setThreshold(event.target.value); setSaved(false) },
-                }),
-                react.createElement('span', { className: 'ap-note' }, t.thresholdUnit),
                 react.createElement('button', { type: 'button', className: 'ap-btn', onClick: save }, t.save),
-                saved && react.createElement('span', { className: 'ap-note' }, t.saved))),
+                saved && react.createElement('span', { className: 'ap-note' }, t.saved)),
+              react.createElement('div', { className: 'ap-note' }, t.ruleAskNote),
+            ]),
             card('section', t.globalScope, undefined, [
               react.createElement(RuleList, { scope: 'global', list: 'allow', title: t.allowList, rules: globalRules.allow, onRemove: remove }),
               react.createElement(RuleList, { scope: 'global', list: 'deny', title: t.denyList, rules: globalRules.deny, onRemove: remove }),

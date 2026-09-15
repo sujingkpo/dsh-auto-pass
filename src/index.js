@@ -7,6 +7,7 @@
  * @modify 2026-09-15 更名 dsh-auto-pass；拒绝与审查失败改为转人工审批，移除连续拒绝中断逻辑
  * @modify 2026-09-15 增加审批记录：落盘 JSON，并经 /api/dsh-auto-pass 供右栏/对话标签页时间轴读取
  * @modify 2026-09-15 增加权限记忆与白/黑名单：命中名单直接放行或直接转人工，连续人工放行达阈值自动升级
+ * @modify 2026-09-15 达阈值不再静默升级：自动审批与人工放行合并计数，先由模型优化规则再 ask 询问用户
  */
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -20,6 +21,7 @@ import {
 import {
   createPolicyStore,
   DEFAULT_AUTO_APPROVE_AFTER,
+  DEFAULT_AUTO_DENY_AFTER,
   noopPolicyStore,
   signatureOf,
   validateRuleInput,
@@ -56,8 +58,10 @@ const DEFAULTS = Object.freeze({
   maxOutputTokens: 8_192,
   logFile: '',
   maxRecords: DEFAULT_MAX_RECORDS,
-  // 同一项目下同一权限签名连续人工放行多少次后，自动升级为免审查规则（策略文件里可覆盖）。
+  // 同一项目下同一权限签名连续放行多少次后，询问是否加入白名单（策略文件里可覆盖）。
   autoApproveAfter: DEFAULT_AUTO_APPROVE_AFTER,
+  // 同一项目下同一权限签名连续被拒多少次后，询问是否加入黑名单（策略文件里可覆盖）。
+  autoDenyAfter: DEFAULT_AUTO_DENY_AFTER,
   // 全局策略文件路径；空字符串表示用 $DSH_HOME/dsh-auto-pass/policy.json。
   policyFile: '',
   // 默认两处都注册（与 dsh-context 一致）：对话区标签页立刻可见，右侧栏 tab 也可用；
@@ -82,6 +86,19 @@ export const SETTINGS_NAMESPACE = 'dsh-auto-pass'
 /** 单次响应最多返回的记录条数，避免侧边栏一次拉取过多数据。 */
 const MAX_RECORDS_PER_RESPONSE = 500
 
+/** 规则匹配条件的结构化形状：Reviewer 的可选建议与规则优化调用共用它。 */
+export const ruleSuggestionSchema = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    tool: { type: 'string' },
+    match_kind: { type: 'string', enum: ['signature', 'command_prefix', 'path_prefix'] },
+    match_value: { type: 'string' },
+    label: { type: 'string' },
+  },
+  required: ['tool', 'match_kind', 'match_value', 'label'],
+})
+
 export const assessmentSchema = Object.freeze({
   type: 'object',
   additionalProperties: false,
@@ -91,17 +108,7 @@ export const assessmentSchema = Object.freeze({
     outcome: { type: 'string', enum: ['allow', 'deny'] },
     rationale: { type: 'string' },
     // 可选的「长期规则建议」：供用户在时间线上把这个动作一键升级为白名单或降级为黑名单。
-    rule: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        tool: { type: 'string' },
-        match_kind: { type: 'string', enum: ['signature', 'command_prefix', 'path_prefix'] },
-        match_value: { type: 'string' },
-        label: { type: 'string' },
-      },
-      required: ['tool', 'match_kind', 'match_value', 'label'],
-    },
+    rule: ruleSuggestionSchema,
   },
   required: ['outcome'],
 })
@@ -125,6 +132,25 @@ const guardianPrompts = Object.freeze({
   en: buildGuardianPrompt('en'),
 })
 
+const ruleTemplate = readFileSync(new URL('../prompts/rule-template.md', import.meta.url), 'utf8').trim()
+const RULE_LABEL_LANGUAGES = Object.freeze({
+  zh: '中文',
+  en: 'the language used by the direct user prompt',
+})
+
+/** 规则优化器的 persona：同一份模板，按名单与语言填充。 */
+function buildRulePersona(language, list) {
+  return ruleTemplate
+    .replace('{{ security_policy }}', securityPolicy)
+    .replace('{{ list_name }}', list === 'allow' ? '白名单（以后直接放行）' : '黑名单（以后直接转人工）')
+    .replace('{{ label_language }}', RULE_LABEL_LANGUAGES[language])
+}
+
+const rulePersonas = Object.freeze({
+  zh: list => buildRulePersona('zh', list),
+  en: list => buildRulePersona('en', list),
+})
+
 /**
  * 挂载自动审批编排器及 Reviewer 的同步创建期隔离。只有 `auto-approve`
  * 会话由模型审查：插件对审查通过的请求返回 `allowed-once`，其余结果一律调用
@@ -140,6 +166,7 @@ export function apply(ctx, config) {
   const policies = createPolicyStore({
     globalFile: resolved.policyFile === '' ? undefined : resolved.policyFile,
     autoApproveAfter: resolved.autoApproveAfter,
+    autoDenyAfter: resolved.autoDenyAfter,
     warn: message => ctx.logger.warn(message),
   })
   installReviewerIsolation(ctx)
@@ -149,7 +176,8 @@ export function apply(ctx, config) {
   installClientGraphProbe(ctx)
   ctx.logger.info('dsh-auto-pass: 审批记录已就绪 file=' + records.file + ' maxRecords=' + String(records.limit)
     + ' placement=' + effectivePlacement(ctx, resolved)
-    + ' autoApproveAfter=' + String(policies.threshold())
+    + ' autoApproveAfter=' + String(policies.threshold('allow'))
+    + ' autoDenyAfter=' + String(policies.threshold('deny'))
     + ' policy=' + String(policies.globalFile))
 }
 
@@ -354,8 +382,8 @@ async function readJsonBody(req) {
 
 /**
  * 策略读写：
- * - `GET /api/dsh-auto-pass/policy?cwd=` 返回阈值 + 全局/项目两级白黑名单快照
- * - `POST` `{ op: 'threshold' | 'add' | 'remove', ... }`
+ * - `GET /api/dsh-auto-pass/policy?cwd=` 返回两侧阈值 + 全局/项目两级白黑名单快照
+ * - `POST` `{ op: 'threshold' | 'add' | 'remove', ... }`（threshold 带 `list` 选择写哪一侧）
  */
 async function servePolicyRequest(req, url, writeJson, policies) {
   const cwd = url.searchParams.get('cwd') ?? undefined
@@ -375,11 +403,12 @@ async function servePolicyRequest(req, url, writeJson, policies) {
   const target = body.cwd ?? cwd
   if (body.op === 'threshold') {
     const value = Number.parseInt(String(body.threshold), 10)
+    const list = body.list === 'deny' ? 'deny' : 'allow'
     if (!Number.isSafeInteger(value) || value < 1) {
       writeJson(400, { ok: false, error: 'threshold must be a positive integer' })
       return
     }
-    writeJson(200, { ok: true, threshold: policies.setThreshold(value) })
+    writeJson(200, { ok: true, threshold: policies.setThreshold(value, list), list })
     return
   }
   if (body.op === 'remove') {
@@ -491,6 +520,7 @@ export function resolveConfig(config = {}, warn = message => console.warn(messag
     'maxInvestigationSteps',
     'maxRecords',
     'autoApproveAfter',
+    'autoDenyAfter',
     'maxMessageTranscriptTokens',
     'maxToolTranscriptTokens',
     'maxMessageEntryTokens',
@@ -564,6 +594,17 @@ const HOST_MESSAGES = Object.freeze({
     criticalDowngrade: '宿主安全下限要求 critical 风险动作必须转交用户决定。',
     whitelisted: hit => '命中' + (hit.scope === 'project' ? '项目' : '全局') + '白名单，已直接放行：' + hit.label,
     blacklisted: hit => '命中' + (hit.scope === 'project' ? '项目' : '全局') + '黑名单，已直接转人工审批：' + hit.label,
+    ruleQuestionHeader: '权限记忆',
+    ruleQuestion: parts => '这条权限已被连续' + (parts.list === 'allow' ? '通过' : '拒绝') + ' ' + String(parts.count)
+      + ' 次：' + parts.signature.text + '\n模型优化后的匹配条件：' + parts.ruleText
+      + '\n是否加入' + (parts.list === 'allow' ? '白名单' : '黑名单') + '？',
+    ruleOption: parts => '加入' + (parts.list === 'allow' ? '白名单' : '黑名单')
+      + (parts.scope === 'project' ? '（本项目）' : '（全局）'),
+    ruleOptionDetail: parts => (parts.scope === 'project' ? '只对当前项目生效：' : '对所有项目生效：') + parts.ruleText,
+    ruleOptionNo: '不加入（以后不再询问这类动作）',
+    ruleOptionNoDetail: '不再为这个动作计数，也不再询问；以后仍可在「审批设置」里手动加入，或在时间线上单条升级。',
+    ruleAdded: parts => '已加入' + (parts.list === 'allow' ? '白名单' : '黑名单') + '（'
+      + (parts.scope === 'project' ? '本项目' : '全局') + '）：' + parts.ruleText,
     highRiskDowngrade: '宿主安全下限要求 high 风险动作至少具有 medium 用户授权，本次已转交用户决定。',
   }),
   en: Object.freeze({
@@ -584,6 +625,18 @@ const HOST_MESSAGES = Object.freeze({
     criticalDowngrade: 'The host safety floor requires critical-risk actions to be decided by the user.',
     whitelisted: hit => 'Matched the ' + hit.scope + ' whitelist and was allowed directly: ' + hit.label,
     blacklisted: hit => 'Matched the ' + hit.scope + ' blacklist and was handed to the user: ' + hit.label,
+    ruleQuestionHeader: 'Permission memory',
+    ruleQuestion: parts => 'This permission was ' + (parts.list === 'allow' ? 'approved' : 'denied') + ' '
+      + String(parts.count) + ' times in a row: ' + parts.signature.text
+      + '\nModel-optimized match: ' + parts.ruleText
+      + '\nAdd it to the ' + (parts.list === 'allow' ? 'allowlist' : 'denylist') + '?',
+    ruleOption: parts => 'Add to ' + (parts.list === 'allow' ? 'allowlist' : 'denylist')
+      + (parts.scope === 'project' ? ' (this project)' : ' (global)'),
+    ruleOptionDetail: parts => (parts.scope === 'project' ? 'Applies to this project only: ' : 'Applies to every project: ') + parts.ruleText,
+    ruleOptionNo: 'Do not add (stop asking for this action)',
+    ruleOptionNoDetail: 'Stops counting and asking for this action; you can still add it manually from the policy panel or promote one record from the timeline.',
+    ruleAdded: parts => 'Added to the ' + (parts.list === 'allow' ? 'allowlist' : 'denylist') + ' ('
+      + (parts.scope === 'project' ? 'this project' : 'global') + '): ' + parts.ruleText,
     highRiskDowngrade: 'The host safety floor requires at least medium user authorization for high-risk actions; the request was handed to the user.',
   }),
 })
@@ -659,6 +712,8 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
     const language = resolveReviewLanguage(request.agent.session, config.language)
     const messages = HOST_MESSAGES[language]
     const startedAt = Date.now()
+    // 同一签名同一名单只挂一个问题：等待回答期间不再重复询问
+    const pendingSuggestions = new Set()
 
     const action = exactAction(request)
     // 权限签名：与调用 id、时间无关，是「相似权限」的判定单位，也是权限记忆的计数键。
@@ -671,11 +726,31 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
     const finish = async (outcome, decision) => {
       const settled = await outcome
       const observed = observeDecision(ctx, policies, { signature, cwd, settled, decision })
+      let record
       try {
-        records.add(buildRecord(request, action, settled, decision, Date.now() - startedAt, signature, observed))
+        record = records.add(buildRecord(request, action, settled, decision, Date.now() - startedAt, signature, observed))
       } catch (error) {
         // 记录只是旁路：写失败也绝不能让已经做出的审批结论变形
         ctx.logger.warn('dsh-auto-pass: 审批记录写入失败：' + errorMessage(error))
+      }
+      // 达到阈值 → 先让模型优化规则，再询问用户是否加入名单。整条流程是**旁路**：
+      // 在审批结论已经确定之后异步执行，既不改变结论，也不阻塞这次工具调用。
+      const suggestion = observed.suggestion
+      if (suggestion !== null && suggestion !== undefined) {
+        const pendingKey = suggestion.list + '\u0000' + String(signature?.key)
+        if (!pendingSuggestions.has(pendingKey)) {
+          pendingSuggestions.add(pendingKey)
+          void proposeRule(ctx, policies, records, request, {
+            config,
+            language,
+            cwd,
+            signature,
+            suggestion,
+            decision,
+            recordId: record?.id,
+          }).catch(error => ctx.logger.warn('dsh-auto-pass: 规则确认流程异常：' + errorMessage(error)))
+            .finally(() => pendingSuggestions.delete(pendingKey))
+        }
       }
       return settled
     }
@@ -836,28 +911,221 @@ function describeHit(hit) {
 }
 
 /**
- * 维护「连续人工放行」计数。只有用户亲自放行/拒绝（插件走的是 next() 分支）才计数：
- * - 插件自己作出的自动放行不计，否则一次自动放行就会把计数推满、把权限越滚越宽；
- * - 命中名单后的人工放行也不计：用户刚把这类动作列为黑名单，他这一次的放行是**单次**决定，
- *   不该被当成「连续授权」而在白名单里长出一条记忆规则。
+ * 把一次审批结果翻译成计数信号。模型判定 deny 与人工拒绝都算「拒绝」，最终获准执行才算
+ * 「通过」——插件自己放行的与用户放行的都算通过：两种路径都代表这次判断结果是「可以执行」。
+ * 其余结果（cancelled / unavailable）不参与计数。
+ */
+export function decisionSignal(settled, decision) {
+  if (decision?.verdict === 'deny') return 'reject'
+  if (settled === 'rejected') return 'reject'
+  if (settled === 'allowed-once') return 'pass'
+  return undefined
+}
+
+/**
+ * 维护「连续放行 / 连续被拒」计数。命中名单的这一次不计数：
+ * 用户刚把这类动作列为规则，他这一次的放行/拒绝是**单次**决定，不该继续滚成记忆规则。
  */
 function observeDecision(ctx, policies, { signature, cwd, settled, decision }) {
   try {
     const observed = policies.observe({
       signature,
       cwd,
-      outcome: settled,
-      fromHuman: decision?.verdict !== 'allow' && decision?.policyHit === undefined,
+      signal: decision?.policyHit === undefined ? decisionSignal(settled, decision) : undefined,
     })
-    if (observed.promoted !== null && observed.promoted !== undefined) {
-      ctx.logger.info('dsh-auto-pass: 连续人工放行达到阈值，已自动升级为免审查规则 label=' + observed.promoted.label
-        + ' scope=' + observed.promoted.scope + ' id=' + String(observed.promoted.id))
+    if (observed.suggestion !== null && observed.suggestion !== undefined) {
+      ctx.logger.info('dsh-auto-pass: 连续计数达到阈值 list=' + observed.suggestion.list
+        + ' count=' + String(observed.suggestion.count) + ' signature=' + safeLogValue(signature?.text))
     }
     return observed
   } catch (error) {
     ctx.logger.warn('dsh-auto-pass: 权限记忆更新失败：' + errorMessage(error))
-    return { approvals: 0, promoted: null }
+    return { approvals: 0, denials: 0, suggestion: null }
   }
+}
+
+/** 规则的可读描述（询问文案与日志共用）：标签 + 匹配条件。 */
+function describeRuleText(rule, language) {
+  const kinds = language === 'zh'
+    ? { signature: '精确签名', command_prefix: '命令前缀', path_prefix: '路径前缀' }
+    : { signature: 'exact signature', command_prefix: 'command prefix', path_prefix: 'path prefix' }
+  const kind = kinds[rule.match?.kind] ?? String(rule.match?.kind ?? '')
+  return rule.label + '（' + kind + '：' + String(rule.match?.value ?? '') + '）'
+}
+
+/**
+ * 规则优化调用的证据：这次要固化的动作，加上近期同一工具的记录，
+ * 让模型能看见「相似命令」到底长什么样，再决定匹配条件该窄到什么程度。
+ */
+function buildRulePrompt({ signature, list, records }) {
+  const recent = typeof records?.list === 'function'
+    ? records.list()
+      .filter(record => record.toolName === signature.toolName)
+      .slice(0, 8)
+      .map(record => ({
+        signature: record.signature?.text,
+        verdict: record.verdict,
+        outcome: record.outcome,
+        action: record.action,
+      }))
+    : []
+  return [
+    '这次要固化的动作（连续' + (list === 'allow' ? '放行' : '拒绝') + '达到阈值）：',
+    JSON.stringify({
+      tool: signature.toolName,
+      signature: {
+        key: signature.key,
+        text: signature.text,
+        command: signature.command,
+        paths: signature.paths,
+      },
+      target_list: list,
+      recent_same_tool: recent,
+    }, null, 2),
+    '请提交优化后的匹配条件。',
+  ].join('\n\n')
+}
+
+/**
+ * 单独起一次只读的模型调用，把这次动作优化成一条匹配条件。
+ * 复用 Reviewer 的隔离配置（read-only + approval=never + 只读工具），失败一律返回 undefined：
+ * 拿不到模型优化结果时宁可不写规则，也不写一条没经过优化的规则。
+ */
+async function optimizeRule(ctx, request, options) {
+  const { config, language, signature, list, records } = options
+  const route = resolveRoute(request, config)
+  if (route === undefined) return undefined
+  const signal = AbortSignal.timeout(config.timeoutMs)
+  let run
+  try {
+    run = await ctx.subagents.start('spawn', {
+      label: '_auto-approve-rule:' + String(request.callId ?? 'call'),
+      parent: request.agent,
+      signal,
+      prompt: [{ type: 'text', text: buildRulePrompt({ signature, list, records }) }],
+      agentOptions: {
+        provider: route.provider,
+        model: route.model,
+        maxTokens: config.maxOutputTokens,
+        [REVIEWER_OPTIONS]: {
+          language,
+          reasoningEffort: config.reviewerReasoningEffort,
+          maxInvestigationSteps: config.maxInvestigationSteps,
+        },
+      },
+      persona: rulePersonas[language](list),
+      toolFilter: { allow: REVIEWER_TOOLS },
+      outputSchema: ruleSuggestionSchema,
+      maxDepth: 1,
+    })
+    const result = await run.result
+    if (result.stopReason !== 'completed') return undefined
+    return parseSuggestedRule(result.structured)
+  } catch (error) {
+    ctx.logger.warn('dsh-auto-pass: 规则优化调用失败：' + safeLogValue(errorMessage(error)))
+    return undefined
+  } finally {
+    if (run !== undefined) {
+      try {
+        await run.dispose()
+      } catch (error) {
+        ctx.logger.warn('dsh-auto-pass: 规则优化子 Agent 释放失败 reviewerSession=' + run.id
+          + ' reason=' + safeLogValue(errorMessage(error)))
+      }
+    }
+  }
+}
+
+/** 把结果回写到记录：规则落盘与否都要在时间线上看得见；回写失败只丢一条展示信息。 */
+function updateRecord(ctx, records, recordId, patch) {
+  if (recordId === undefined) return
+  try {
+    if (typeof records.update === 'function') records.update(recordId, patch)
+  } catch (error) {
+    ctx.logger.warn('dsh-auto-pass: 审批记录回写失败：' + errorMessage(error))
+  }
+}
+
+/**
+ * 达到阈值后的升级建议：**先让 DSH 模型把这次动作优化成匹配条件**，再用 userQuestions
+ * 把优化结果连选项一起交给用户确认，用户同意才落盘。任何失败（没有 ask 通道、调用方是
+ * 子 Agent、模型优化失败、用户不答）都只导致「规则没被写入」，绝不改变任何审批结论。
+ */
+async function proposeRule(ctx, policies, records, request, options) {
+  const { config, language, signature, cwd, suggestion, decision, recordId } = options
+  const messages = HOST_MESSAGES[language]
+  const userQuestions = typeof ctx.get === 'function' ? ctx.get('userQuestions') : undefined
+  if (userQuestions === undefined || typeof userQuestions.ask !== 'function') {
+    ctx.logger.warn('dsh-auto-pass: 没有 userQuestions 服务，跳过规则确认 signature=' + safeLogValue(signature.text))
+    return
+  }
+  // 模型优化：本次审查已经给出结构化建议时直接沿用（同样是模型产出），否则单独起一次优化调用。
+  const rule = decision?.suggestedRule ?? await optimizeRule(ctx, request, {
+    config, language, signature, list: suggestion.list, records,
+  })
+  if (rule === undefined) {
+    ctx.logger.warn('dsh-auto-pass: 模型没有给出可用的匹配条件，跳过规则确认 signature=' + safeLogValue(signature.text))
+    return
+  }
+  const ruleText = describeRuleText(rule, language)
+  const scopes = typeof cwd === 'string' && cwd !== '' ? ['project', 'global'] : ['global']
+  const choices = scopes.map(scope => ({
+    scope,
+    label: messages.ruleOption({ list: suggestion.list, scope }),
+    description: messages.ruleOptionDetail({ scope, ruleText }),
+  }))
+  choices.push({
+    scope: undefined,
+    label: messages.ruleOptionNo,
+    description: messages.ruleOptionNoDetail,
+  })
+  let answer
+  try {
+    answer = await userQuestions.ask({
+      questions: [{
+        id: 'dsh-auto-pass:' + suggestion.list,
+        header: messages.ruleQuestionHeader,
+        question: messages.ruleQuestion({
+          list: suggestion.list,
+          count: suggestion.count,
+          signature,
+          ruleText,
+        }),
+        options: choices.map(choice => ({ label: choice.label, description: choice.description })),
+      }],
+      agent: request.agent,
+    })
+  } catch (error) {
+    // 子 Agent 的审批问不到人（DELEGATED_CALLER）、没有应答器（NO_PROVIDER）、调用已中止……
+    // 一律只记日志：计数在触发时已清零，下次再攒够阈值会重新询问。
+    ctx.logger.warn('dsh-auto-pass: 规则确认未能送达用户：' + safeLogValue(errorMessage(error)))
+    return
+  }
+  const selected = answer?.answers?.find(entry => entry.id === 'dsh-auto-pass:' + suggestion.list)?.selected ?? []
+  const chosen = choices.find(choice => selected.includes(choice.label))
+  if (chosen === undefined) {
+    ctx.logger.warn('dsh-auto-pass: 规则确认收到无法识别的答复，按「不加入」处理')
+  }
+  if (chosen?.scope === undefined) {
+    policies.dismiss({ signature, cwd, list: suggestion.list })
+    updateRecord(ctx, records, recordId, { ruleDeclined: { list: suggestion.list, label: rule.label } })
+    ctx.logger.info('dsh-auto-pass: 用户未加入名单 list=' + suggestion.list + ' label=' + safeLogValue(rule.label))
+    return
+  }
+  const added = policies.addRule({
+    scope: chosen.scope,
+    list: suggestion.list,
+    rule: { ...rule, source: 'model' },
+  }, cwd)
+  if (added.ok !== true) {
+    ctx.logger.warn('dsh-auto-pass: 询问后写入规则失败：' + safeLogValue(String(added.error)))
+    return
+  }
+  updateRecord(ctx, records, recordId, {
+    ruleApplied: { scope: added.scope, list: suggestion.list, label: rule.label, ruleId: added.rule.id },
+  })
+  ctx.logger.info('dsh-auto-pass: 用户确认后已写入规则 list=' + suggestion.list + ' scope=' + added.scope
+    + ' label=' + safeLogValue(rule.label))
 }
 
 /** 不进入模型审查的请求：记录转交理由后直接交给后续人工审批器。 */
@@ -899,7 +1167,7 @@ function buildRecord(request, action, outcome, decision, latencyMs, signature, o
     ...(observed?.promoted === null || observed?.promoted === undefined
       ? {}
       : { promotedRule: { id: observed.promoted.id, scope: observed.promoted.scope, list: observed.promoted.list, label: observed.promoted.label } }),
-    ...(observed === undefined ? {} : { approvals: observed.approvals }),
+    ...(observed === undefined ? {} : { approvals: observed.approvals, denials: observed.denials }),
   })
 }
 

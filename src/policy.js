@@ -1,11 +1,13 @@
 /**
  * @description 审批策略仓库（host 侧）。把「相似权限」归一化成**确定性签名**，维护项目级 /
- *   全局级两套白名单（放行）与黑名单（转人工）规则，并对每次「人工放行」计数：
- *   同一项目下同一签名连续人工放行达到阈值后，自动把该签名升级为免审查规则。
- *   匹配器只认三种闭集条件（精确签名 / 命令前缀 / 路径前缀），升级规则由 DSH 模型产出，
+ *   全局级两套白名单（放行）与黑名单（转人工）规则，并对每次审批结果计数：同一项目下
+ *   同一签名连续放行 / 连续被拒达到阈值时，**只返回一条升级建议**，由调用方走
+ *   「DSH 模型优化 → ask 询问用户 → 落盘」，绝不静默放宽或收紧权限。
+ *   匹配器只认三种闭集条件（精确签名 / 命令前缀 / 路径前缀），规则文本由 DSH 模型产出，
  *   插件只做确定性匹配；任何 IO 失败都只告警，绝不改变审批结论。
  * @author simon300000
  * @date 2026-09-15
+ * @modify 2026-09-15 计数分白/黑两侧、达阈值改为返回建议（不再自动落盘），新增 dismiss
  */
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -15,8 +17,11 @@ import { dirname, join } from 'node:path'
 /** 策略文件格式版本，便于以后迁移。 */
 export const POLICY_FILE_VERSION = 1
 
-/** 连续人工放行多少次后自动升级为免审查规则。 */
+/** 连续放行多少次后，询问是否加入白名单（默认值，策略文件里可覆盖）。 */
 export const DEFAULT_AUTO_APPROVE_AFTER = 3
+
+/** 连续被拒多少次后，询问是否加入黑名单（默认值，策略文件里可覆盖）。 */
+export const DEFAULT_AUTO_DENY_AFTER = 3
 
 /** 前缀类条件的最短长度：太短的前缀等于全放行，必须挡住。 */
 export const MIN_PREFIX_CHARS = 3
@@ -245,24 +250,25 @@ export function projectPolicyFile(cwd) {
 
 /** 空策略文档。counters 的键是 `<cwd>\u0000<signatureKey>`，计数始终落在全局文件里。 */
 function emptyDoc() {
-  return { version: POLICY_FILE_VERSION, rules: { allow: [], deny: [] }, counters: {} }
+  return { version: POLICY_FILE_VERSION, rules: { allow: [], deny: [] }, counters: {}, thresholds: {} }
 }
 
 /** 未启用策略能力时的替身：一律「没有命中」，写入静默失败。 */
 export const noopPolicyStore = Object.freeze({
   enabled: false,
   globalFile: undefined,
-  threshold: () => DEFAULT_AUTO_APPROVE_AFTER,
+  threshold: list => (list === 'deny' ? DEFAULT_AUTO_DENY_AFTER : DEFAULT_AUTO_APPROVE_AFTER),
   match: () => undefined,
-  observe: () => Object.freeze({ approvals: 0, promoted: null }),
+  observe: () => Object.freeze({ approvals: 0, denials: 0, suggestion: null }),
+  dismiss: () => false,
   snapshot: () => Object.freeze({
-    threshold: DEFAULT_AUTO_APPROVE_AFTER,
+    thresholds: Object.freeze({ allow: DEFAULT_AUTO_APPROVE_AFTER, deny: DEFAULT_AUTO_DENY_AFTER }),
     global: Object.freeze({ allow: [], deny: [] }),
     project: undefined,
   }),
   addRule: () => ({ ok: false, error: 'policy store disabled' }),
   removeRule: () => false,
-  setThreshold: () => DEFAULT_AUTO_APPROVE_AFTER,
+  setThreshold: (value, list = 'allow') => (list === 'deny' ? DEFAULT_AUTO_DENY_AFTER : DEFAULT_AUTO_APPROVE_AFTER),
 })
 
 /**
@@ -273,9 +279,14 @@ export const noopPolicyStore = Object.freeze({
  */
 export function createPolicyStore(options = {}) {
   const globalFile = options.globalFile ?? defaultPolicyFile()
-  const fallbackThreshold = Number.isSafeInteger(options.autoApproveAfter) && options.autoApproveAfter >= 1
-    ? options.autoApproveAfter
-    : DEFAULT_AUTO_APPROVE_AFTER
+  const fallbackThresholds = {
+    allow: Number.isSafeInteger(options.autoApproveAfter) && options.autoApproveAfter >= 1
+      ? options.autoApproveAfter
+      : DEFAULT_AUTO_APPROVE_AFTER,
+    deny: Number.isSafeInteger(options.autoDenyAfter) && options.autoDenyAfter >= 1
+      ? options.autoDenyAfter
+      : DEFAULT_AUTO_DENY_AFTER,
+  }
   const warn = typeof options.warn === 'function' ? options.warn : () => {}
   const docs = new Map([[globalFile, read(globalFile)]])
 
@@ -298,7 +309,11 @@ export function createPolicyStore(options = {}) {
           if (Array.isArray(rules)) doc.rules[list] = rules.filter(rule => rule !== null && typeof rule === 'object')
         }
         if (parsed.counters !== null && typeof parsed.counters === 'object') doc.counters = { ...parsed.counters }
-        if (Number.isSafeInteger(parsed.threshold) && parsed.threshold >= 1) doc.threshold = parsed.threshold
+        // 阈值按名单分开：allow=白名单（连续放行），deny=黑名单（连续被拒）。
+        // 早期版本只有一个 threshold 字段（白名单阈值），这里按白名单阈值兼容读取。
+        if (Number.isSafeInteger(parsed.thresholds?.allow) && parsed.thresholds.allow >= 1) doc.thresholds.allow = parsed.thresholds.allow
+        if (Number.isSafeInteger(parsed.thresholds?.deny) && parsed.thresholds.deny >= 1) doc.thresholds.deny = parsed.thresholds.deny
+        if (Number.isSafeInteger(parsed.threshold) && parsed.threshold >= 1) doc.thresholds.allow = parsed.threshold
       }
       return doc
     } catch (error) {
@@ -345,9 +360,21 @@ export function createPolicyStore(options = {}) {
     })
   }
 
-  function currentThreshold() {
-    const value = docs.get(globalFile)?.threshold
-    return Number.isSafeInteger(value) && value >= 1 ? value : fallbackThreshold
+  function currentThreshold(list = 'allow') {
+    const value = docs.get(globalFile)?.thresholds?.[list]
+    return Number.isSafeInteger(value) && value >= 1 ? value : fallbackThresholds[list]
+  }
+
+  /** 取计数条目；兼容早期 { count } 形态（当时只统计白名单一侧）。 */
+  function counterEntry(doc, key) {
+    const raw = doc.counters[key]
+    const entry = { allow: 0, deny: 0 }
+    if (raw === null || typeof raw !== 'object') return entry
+    if (Number.isSafeInteger(raw.count) && raw.count > 0) entry.allow = raw.count
+    if (Number.isSafeInteger(raw.allow) && raw.allow > 0) entry.allow = raw.allow
+    if (Number.isSafeInteger(raw.deny) && raw.deny > 0) entry.deny = raw.deny
+    if (raw.dismissed !== null && typeof raw.dismissed === 'object') entry.dismissed = { ...raw.dismissed }
+    return entry
   }
 
   /** 同一工具 + 同 kind + 同 value 视为同一条规则（重复升级只更新内容）。 */
@@ -414,19 +441,20 @@ export function createPolicyStore(options = {}) {
     enabled: true,
     globalFile,
     threshold: currentThreshold,
-    /** 阈值写入全局文件（阈值是跨项目的用户偏好）。 */
-    setThreshold(value) {
-      if (!Number.isSafeInteger(value) || value < 1) return currentThreshold()
+    /** 阈值写入全局文件（阈值是跨项目的用户偏好）。list 省略时写白名单阈值。 */
+    setThreshold(value, list = 'allow') {
+      if (!POLICY_LISTS.includes(list)) return currentThreshold('allow')
+      if (!Number.isSafeInteger(value) || value < 1) return currentThreshold(list)
       const doc = docs.get(globalFile)
-      doc.threshold = value
+      doc.thresholds = { ...(doc.thresholds ?? {}), [list]: value }
       write(globalFile, doc)
       return value
     },
-    /** 快照：阈值 + 全局/项目两级白黑名单与文件路径，供「审批设置」面板展示。 */
+    /** 快照：两侧阈值 + 全局/项目两级白黑名单与文件路径，供「审批设置」面板展示。 */
     snapshot(cwd) {
       const project = projectDoc(cwd)
       return {
-        threshold: currentThreshold(),
+        thresholds: { allow: currentThreshold('allow'), deny: currentThreshold('deny') },
         global: view(docs.get(globalFile)),
         ...(project === undefined ? {} : { project: view(project.doc) }),
         globalFile,
@@ -454,47 +482,49 @@ export function createPolicyStore(options = {}) {
       return find(['deny']) ?? find(['allow'])
     },
     /**
-     * 记录一次「人工放行/拒绝」并维护计数：
-     * - 人工放行 → 计数 +1；达到阈值就把该签名升级为免审查规则（项目作用域优先）。
-     * - 人工拒绝 → 计数清零（连续被打破）。
-     * 只有 fromHuman 为 true 才计数，插件自己的自动放行不计。
+     * 记录一次审批结果并维护两侧连续计数：
+     * - signal='pass'（最终放行：插件自动放行或人工放行）→ 白名单侧 +1；
+     * - signal='reject'（模型判定 deny 或人工拒绝）→ 黑名单侧 +1；
+     * 相反信号打断另一侧的「连续」。达到阈值时**不自行落规则**，只把建议返回给调用方，
+     * 由它走「模型优化 → ask 询问用户 → 落盘」：静默放宽权限正是要避免的事。
+     * 用户拒绝过的建议记进 dismissed，之后既不再计数也不再询问（避免反复打扰）。
      */
-    observe({ signature, cwd, outcome, fromHuman }) {
-      if (fromHuman !== true || signature === undefined || signature.key === undefined) {
-        return { approvals: 0, promoted: null }
-      }
+    observe({ signature, cwd, signal }) {
+      const steady = { approvals: 0, denials: 0, suggestion: null }
+      if (signature === undefined || signature.key === undefined) return steady
+      if (signal !== 'pass' && signal !== 'reject') return steady
       const doc = docs.get(globalFile)
       const counterKey = (cwd ?? '') + '\u0000' + signature.key
-      if (outcome === 'rejected') {
-        if (doc.counters[counterKey] !== undefined) {
-          delete doc.counters[counterKey]
-          write(globalFile, doc)
-        }
-        return { approvals: 0, promoted: null }
+      const entry = counterEntry(doc, counterKey)
+      const list = signal === 'pass' ? 'allow' : 'deny'
+      if (entry.dismissed?.[list] === true) {
+        return { approvals: entry.allow, denials: entry.deny, suggestion: null }
       }
-      if (outcome !== 'allowed-once') return { approvals: doc.counters[counterKey]?.count ?? 0, promoted: null }
-      const count = (doc.counters[counterKey]?.count ?? 0) + 1
-      const threshold = currentThreshold()
-      if (count < threshold) {
-        doc.counters[counterKey] = { count, updatedAt: new Date().toISOString() }
-        write(globalFile, doc)
-        return { approvals: count, promoted: null }
-      }
-      // 达到阈值：升级为项目级免审查规则（没有 cwd 时落全局），并把计数清零。
-      delete doc.counters[counterKey]
+      entry[signal === 'pass' ? 'deny' : 'allow'] = 0
+      entry[list] += 1
+      const threshold = currentThreshold(list)
+      const triggered = entry[list] >= threshold
+      // 触发后清零：无论用户是否同意，都不该由同一次累积重复触发
+      if (triggered) entry[list] = 0
+      doc.counters[counterKey] = entry
       write(globalFile, doc)
-      const added = addRule({
-        scope: typeof cwd === 'string' && cwd !== '' ? 'project' : 'global',
-        list: 'allow',
-        rule: {
-          tool: signature.toolName,
-          match: { kind: 'signature', value: signature.key },
-          label: signature.text,
-          source: 'memory',
-          note: '连续 ' + String(threshold) + ' 次人工放行后自动升级',
-        },
-      }, cwd)
-      return { approvals: count, promoted: added?.ok === true ? added.rule : null }
+      return {
+        approvals: entry.allow,
+        denials: entry.deny,
+        suggestion: triggered ? Object.freeze({ list, count: threshold }) : null,
+      }
+    },
+    /** 用户在询问里选了「不加入」：该签名该名单不再计数、不再询问。 */
+    dismiss({ signature, cwd, list }) {
+      if (signature === undefined || signature.key === undefined) return false
+      if (!POLICY_LISTS.includes(list)) return false
+      const doc = docs.get(globalFile)
+      const counterKey = (cwd ?? '') + '\u0000' + signature.key
+      const entry = counterEntry(doc, counterKey)
+      entry[list] = 0
+      entry.dismissed = { ...(entry.dismissed ?? {}), [list]: true }
+      doc.counters[counterKey] = entry
+      return write(globalFile, doc)
     },
   }
 }
