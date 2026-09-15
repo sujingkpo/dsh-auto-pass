@@ -97,25 +97,31 @@ function fakeReact() {
 let domStub = null
 
 /**
- * 极简 document 替身：捕获注入的样式文本，并按「档位名 span」的三种形态造候选节点
- * （纯文字 / 名字更长 / 里面还有元素），用来验证图标只打在该打的那个上。
+ * 极简 document 替身：捕获注入的样式文本，并按「档位名 span」的四种形态造候选节点
+ * （chip / 菜单项 / 名字更长 / 里面还有元素），用来验证图标只打在该打的那个上、且菜单项带菜单态。
  * @returns {{styled: string[], marked: object[], candidates: object[]}} 捕获到的数据
  */
 function installDocumentStub() {
   const styled = []
   const marked = []
-  /** 造一个 span 替身；classList 只实现用到的部分。 */
-  const span = (text, children) => ({
+  /** 造一个 span 替身；classList 与 closest 只实现用到的部分。 */
+  const span = (text, children, inMenu) => ({
     tagName: 'SPAN',
     textContent: text,
     children,
+    closest: () => (inMenu === true ? {} : null),
     classList: {
       names: new Set(),
       contains(name) { return this.names.has(name) },
-      add(name) { this.names.add(name); marked.push({ text, name }) },
+      add(name) { this.names.add(name); marked.push({ text, classes: [...this.names] }) },
     },
   })
-  const candidates = [span('自动审批', []), span('自动审批面板', []), span('自动审批', [{}])]
+  const candidates = [
+    span('自动审批', [], false),
+    span('自动审批', [], true),
+    span('自动审批面板', [], false),
+    span('自动审批', [{}], false),
+  ]
   globalThis.document = {
     getElementById: () => null,
     createElement: () => ({ dataset: {}, textContent: '' }),
@@ -307,12 +313,18 @@ describe('客户端半加载与注册', () => {
     const { ctx } = harness()
     moduleExports.apply(ctx)
 
-    // DSH 只给三个内置 id 图标，我们的档位靠注入的这段 CSS（chip 与下拉项共用）
+    // DSH 只给三个内置 id 图标，我们的档位靠注入的这两条 CSS：chip 14px，菜单项 16px + 三级色
     const css = domStub.styled.join('\n')
     expect(css).toContain('.ap-presetGlyph::before')
+    expect(css).toContain('.ap-presetGlyphMenu::before')
     expect(css).toContain('mask:url("data:image/svg+xml;charset=utf-8,')
-    // 「自动审批面板」名字更长、「自动审批」里还有子元素：都不该被打标记
-    expect(domStub.marked).toEqual([{ text: '自动审批', name: 'ap-presetGlyph' }])
+    expect(css).toContain('-webkit-mask-size:16px 16px')
+    // chip 只加基础类；菜单项再加菜单态；「自动审批面板」与带子元素的 span 都不该被打标记
+    expect(domStub.marked).toEqual([
+      { text: '自动审批', classes: ['ap-presetGlyph'] },
+      { text: '自动审批', classes: ['ap-presetGlyph'] },
+      { text: '自动审批', classes: ['ap-presetGlyph', 'ap-presetGlyphMenu'] },
+    ])
   })
 
   it('三个面板都能渲染到稳定状态（抓到未定义标识符与异步渲染问题）', async () => {
