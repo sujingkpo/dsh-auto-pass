@@ -5,16 +5,26 @@
  * @author simon300000
  * @date 2026-09-15
  * @modify 2026-09-15 支持反复渲染（状态 + 副作用），覆盖时间线的审批意见与命中名单显示；
- *   加入 document 替身，覆盖权限档位「盾牌 + A」图标的注入与打标记
+ *   加入 document 替身，覆盖权限档位「盾牌 + A」图标的注入与打标记；
+ *   加入会话列表快照替身，覆盖「全部会话」下每条记录底部的会话名（含不在快照时的 id 短名兜底）；
+ *   覆盖时间线快捷筛选（白名单 / 黑名单 / 自动 / 人工）的条数徽标、多选叠加与筛空空态
  */
 import { describe, expect, it, vi } from 'vitest'
 
-/** 时间线样例记录：一条白名单命中、一条黑名单命中，用来验证行内展示。 */
+/** 会话列表快照里存在的会话：底部小字应显示它的 displayTitle。 */
+const SESSION_KNOWN = 'session-1f3c9a2e-0000-4000-8000-000000000001'
+/** 不在快照里的会话（历史会话的真实情形）：底部小字退回 id 短名。 */
+const SESSION_UNKNOWN = 'session-2b7d4c11-0000-4000-8000-000000000002'
+/** 快捷筛选 chip 的 data-filter 顺序：全部 + 四个筛选键。 */
+const FILTER_CHIPS = ['all', 'allow', 'deny', 'auto', 'human']
+
+/** 时间线样例记录：白名单命中、黑名单命中、人工放行、模型自动放行各一条，用来验证行内展示与筛选口径。 */
 function sampleRecords() {
   return [
     {
       id: 'record-allow',
       time: '2026-09-15T04:00:00.000Z',
+      sessionId: SESSION_KNOWN,
       toolName: 'bash',
       verdict: 'allow',
       outcome: 'allowed-once',
@@ -29,21 +39,37 @@ function sampleRecords() {
     {
       id: 'record-deny',
       time: '2026-09-15T04:01:00.000Z',
+      sessionId: SESSION_UNKNOWN,
       toolName: 'bash',
       verdict: 'defer',
       outcome: 'rejected',
       rationale: '该命令已列入黑名单。',
       steps: 0,
+      // 人工拒绝后追问问到的理由：只在展开详情里显示
+      rejectReason: '这次不需要提权，先别动。',
       policy: { list: 'deny', scope: 'project', ruleId: 'rule-2', label: 'bash · rm -rf', kind: 'signature', source: 'user' },
     },
     {
       id: 'record-human',
       time: '2026-09-15T04:02:00.000Z',
+      sessionId: SESSION_KNOWN,
       toolName: 'write',
       verdict: 'defer',
       outcome: 'allowed-once',
       rationale: '已转交人工并由用户放行。',
       steps: 2,
+    },
+    {
+      id: 'record-model',
+      time: '2026-09-15T04:03:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'read',
+      verdict: 'allow',
+      outcome: 'allowed-once',
+      rationale: '模型判定为只读操作，直接放行。',
+      steps: 0,
+      decidedBy: 'auto',
+      signature: { toolName: 'read', key: 'read:package.json', text: 'read · package.json' },
     },
   ]
 }
@@ -95,6 +121,22 @@ function fakeReact() {
 
 /** 最近一次安装的 document 替身，供断言读取注入的样式与打标记结果。 */
 let domStub = null
+
+/**
+ * /log 的返回可被单个用例接管：自动打开时间线的观察器要「先给历史记录、再给一条新记录」，
+ * 用默认的样例记录表达不了这两个时刻。null = 用 sampleRecords()。
+ */
+let logResponder = null
+
+/** POST /rule 的回执同理可被单个用例接管（升级/降级的查重文案用例要用三种不同的回执）。 */
+let ruleResponder = null
+
+/** POST /rule/draft（换条件后让模型按该条件重新生成）的回执，同样可被单个用例接管。 */
+let draftResponder = null
+
+/** 渲染帧之间的「等一轮」：默认真时钟；观察器用例切到假时钟后必须改写，否则永远等不到。 */
+const defaultWaitTick = () => new Promise(resolve => setTimeout(resolve, 0))
+let waitTick = defaultWaitTick
 
 /**
  * 极简 document 替身：捕获注入的样式文本，并按「档位名 span」的四种形态造候选节点
@@ -150,6 +192,9 @@ function installDocumentStub() {
 
 /** 安装最小浏览器替身：fetch 与 localStorage 都返回可控的假结果，避免噪声。 */
 function installBrowserStubs() {
+  logResponder = null
+  ruleResponder = null
+  draftResponder = null
   const store = new Map()
   globalThis.localStorage = {
     getItem: key => (store.has(key) ? store.get(key) : null),
@@ -166,18 +211,41 @@ function installBrowserStubs() {
           ok: true,
           thresholds: { allow: 3, deny: 3 },
           global: {
-            allow: [{ id: 'rule-1', source: 'model', list: 'allow', scope: 'global', label: 'bash · npm test', match: { kind: 'signature', value: 'k' } }],
+            allow: [{ id: 'rule-1', source: 'model', list: 'allow', scope: 'global', tool: 'bash', label: 'bash · npm test', match: { kind: 'signature', value: 'k' } }],
             deny: [],
           },
           project: {
             allow: [],
-            deny: [{ id: 'rule-2', source: 'user', list: 'deny', scope: 'project', label: 'bash · rm -rf', match: { kind: 'signature', value: 'k2' } }],
+            deny: [{ id: 'rule-2', source: 'user', list: 'deny', scope: 'project', tool: 'bash', label: 'bash · rm -rf', match: { kind: 'signature', value: 'k2' } }],
           },
         }),
       }
     }
-    if (target.includes('/log')) return { json: async () => ({ ok: true, records: sampleRecords() }) }
-    return { json: async () => ({ ok: true, placement: 'all', writable: true }) }
+    if (target.includes('/log')) {
+      const records = typeof logResponder === 'function' ? logResponder(target) : sampleRecords()
+      return { json: async () => ({ ok: true, records }) }
+    }
+    // 换匹配条件时让模型按该条件重新生成（POST /rule/draft）：默认「生成不了」，
+    // 也就是保留客户端本地推导的值；要用例接管就塞 draftResponder
+    if (target.includes('/rule/draft')) {
+      const payload = typeof draftResponder === 'function'
+        ? draftResponder(target)
+        : { ok: false, error: 'no draft responder' }
+      return { json: async () => payload }
+    }
+    // 时间线的升级/降级 POST /rule：用例可以接管回执，验证「已更新 / 已被覆盖 / 已合并」三种文案
+    if (target.includes('/rule')) {
+      const payload = typeof ruleResponder === 'function' ? ruleResponder(target) : { ok: true }
+      return { json: async () => payload }
+    }
+    // 界面偏好：placement + 四个行为开关（notice / denyDirect / autoOpenTimeline / askRejectReason）
+    return {
+      json: async () => ({
+        ok: true,
+        settings: { placement: 'all', notice: true, denyDirect: false, autoOpenTimeline: true, askRejectReason: true },
+        writable: true,
+      }),
+    }
   })
 }
 
@@ -210,15 +278,32 @@ function harness() {
       return () => {}
     },
   }
+  // 会话列表快照替身：时间线在「全部会话」下靠它把 sessionId 翻成会话名（与 DSH 左侧列表同一份投影）；
+  // current 是「当前会话」，审批观察器靠它决定看哪个会话的记录
+  const sessions = {
+    list: {
+      getSnapshot: () => ({
+        current: SESSION_KNOWN,
+        byId: {
+          [SESSION_KNOWN]: { displayTitle: '审批面板改造', cwd: 'D:\\work\\github\\dsh-auto' },
+        },
+      }),
+    },
+  }
+  // 右侧栏导航面替身：自动打开时间线就是调它的 openTab(kind)
+  const openTabs = []
+  const sidebarRight = { openTab: kind => { openTabs.push(kind) } }
   const ctx = {
-    get: name => (name === 'slots' ? slots : undefined),
+    get: name => (name === 'slots' ? slots
+      : name === 'sessions' ? sessions
+        : name === 'sidebarRight' ? sidebarRight : undefined),
     inject: (names, callback) => {
       if (names.includes('sidebarRightTabs')) callback({ slots, sidebarRightTabs: sidebarTabs })
       return { dispose: () => {} }
     },
     effect: fn => fn(),
   }
-  return { ctx, slots, slotRegistrations, tabRegistrations }
+  return { ctx, slots, slotRegistrations, tabRegistrations, openTabs }
 }
 
 /**
@@ -246,7 +331,7 @@ function evaluate(element, depth = 0) {
  * 渲染一个面板到稳定状态：反复求值并跑副作用，直到没有新的 setState（最多 5 轮）。
  * 时间线的记录是异步拉回来的，不求到稳定状态就只会看到「加载中」。
  */
-async function renderStable(react, component, props) {
+async function renderStable(react, component, props, interact) {
   const frame = react.__pushFrame()
   let tree
   try {
@@ -254,6 +339,8 @@ async function renderStable(react, component, props) {
       frame.dirty = false
       react.__resetCursor()
       tree = evaluate(component(props))
+      // 每轮渲染后给用例一次驱动机会（例如点「全部会话」）：面板内部的 setState 只能这样触发
+      if (typeof interact === 'function') interact(tree)
       // 只跑本轮新注册的副作用（例如拉记录），重复渲染不会重复订阅
       for (let index = 0; index < frame.effects.length; index += 1) {
         if (frame.ran[index] === true) continue
@@ -261,13 +348,53 @@ async function renderStable(react, component, props) {
         const cleanup = frame.effects[index]()
         if (typeof cleanup === 'function') frame.cleanups.push(cleanup)
       }
-      await new Promise(resolve => setTimeout(resolve, 0))
+      await waitTick()
       if (frame.dirty !== true) break
     }
   } finally {
     react.__popFrame()
   }
   return { tree, cleanups: frame.cleanups }
+}
+
+/** 在求值后的元素树里按条件收集节点（组件已展开成字符串 type，直接遍历即可）。 */
+function findNodes(node, predicate, found = []) {
+  if (node === null || typeof node !== 'object') return found
+  if (Array.isArray(node)) {
+    for (const child of node) findNodes(child, predicate, found)
+    return found
+  }
+  if (predicate(node) === true) found.push(node)
+  findNodes(node.children, predicate, found)
+  return found
+}
+
+/** 找文案完全匹配的 button：用于点开「全部会话」。 */
+function findButton(node, label) {
+  return findNodes(node, candidate => candidate.type === 'button'
+    && Array.isArray(candidate.children)
+    && candidate.children.length === 1
+    && candidate.children[0] === label)[0]
+}
+
+/**
+ * 找快捷筛选 chip：chip 里除了文字还有一个条数 span，所以不能按 findButton 那套
+ * 「只有一个字符串子节点」来找，改用 data-filter 属性定位。
+ * @param {*} node 求值后的元素树
+ * @param {string} key 'all' | 'allow' | 'deny' | 'auto' | 'human'
+ * @returns {*} 找到的 chip 元素；没找到返回 undefined
+ */
+function findChip(node, key) {
+  return findNodes(node, candidate => candidate.type === 'button'
+    && candidate.props?.['data-filter'] === key)[0]
+}
+
+/** chip 上的条数（文本节点）；chip 不在时为 undefined。 */
+function chipCount(node, key) {
+  const chip = findChip(node, key)
+  if (chip === undefined) return undefined
+  const span = chip.children.find(child => child?.props?.className === 'ap-chipCount')
+  return span === undefined ? undefined : span.children[0]
 }
 
 /** 取出某个槽位注册项（def 是 register 的第一个参数，component 是第二个）。 */
@@ -405,8 +532,732 @@ describe('客户端半加载与注册', () => {
     expect(trees[1].includes('人工审批 · 已批准')).toBe(true)
     // 命中黑名单的那条：chip 与说明文字都在同一行
     expect(trees[1].includes('bash · rm -rf')).toBe(true)
-    // 设置页卡片是放置位置选择器
+    // 设置页卡片是放置位置选择器 + 四个行为开关（注入审批结果 / 黑名单直接拒绝 / 自动打开时间线 / 拒绝后追问理由）
     expect(trees[2].includes('面板显示位置')).toBe(true)
+    expect(trees[2].includes('注入审批结果到上下文')).toBe(true)
+    expect(trees[2].includes('黑名单直接拒绝')).toBe(true)
+    expect(trees[2].includes('自动打开审批时间线')).toBe(true)
+    expect(trees[2].includes('拒绝后追问理由')).toBe(true)
+    // 开关是真正的 switch（原生 checkbox 承载状态）：默认 notice 开、denyDirect 关、autoOpenTimeline / askRejectReason 开
+    const switches = findNodes(JSON.parse(trees[2]), node => node?.type === 'input' && node?.props?.type === 'checkbox')
+    expect(switches.map(node => node.props.checked)).toEqual([true, false, true, true])
+    // 「审批设置」面板里也要有同一组开关（用户要求两处都能改）
+    expect(trees[0].includes('注入审批结果到上下文')).toBe(true)
+    expect(trees[0].includes('黑名单直接拒绝')).toBe(true)
+    expect(trees[0].includes('自动打开审批时间线')).toBe(true)
+    expect(trees[0].includes('拒绝后追问理由')).toBe(true)
+    expect(findNodes(JSON.parse(trees[0]), node => node?.type === 'input' && node?.props?.type === 'checkbox')).toHaveLength(4)
+    // 默认「本次会话」视图不标会话名：每条都属于当前会话，写出来只是噪声
+    expect(trees[1].includes('ap-session')).toBe(false)
+  })
+
+  it('切到「全部会话」时，每条记录最下面用小字标出会话名', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    // 时间线的会话范围是内部 state：只能渲染一轮后点按钮切过去（只点一次，避免每轮重复触发）
+    let switched = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (switched) return
+      const button = findButton(tree, '全部会话')
+      if (button === undefined) return
+      switched = true
+      button.props.onClick()
+    })
+    expect(switched).toBe(true)
+    for (const cleanup of rendered.cleanups) cleanup()
+
+    const rows = findNodes(rendered.tree, node => node?.props?.className === 'ap-session')
+    // 四条记录各一行会话名：快照里有的用 displayTitle，不在快照里的退回 id 短名
+    expect(rows.map(row => row.children[0])).toEqual(['审批面板改造', '2b7d4c11', '审批面板改造', '审批面板改造'])
+    // 完整 sessionId 留在 title 里，小字只显示短名
+    expect(rows[1].props.title).toBe(SESSION_UNKNOWN)
+  })
+
+  it('快捷筛选：五个 chip 都带当前范围的条数，默认「全部」点亮', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN })
+    for (const cleanup of rendered.cleanups) cleanup()
+
+    // 样例四条记录：白名单 1、黑名单 1（没写 decidedBy，兜底算人工）、模型自动放行 1、人工放行 1
+    expect(FILTER_CHIPS.map(key => chipCount(rendered.tree, key))).toEqual(['4', '1', '1', '1', '1'])
+    // 四类互不重叠：四个 chip 的条数相加 = 总数（白名单那条 decidedBy 是 auto，但只算「白名单」）
+    const counts = FILTER_CHIPS.slice(1).map(key => Number(chipCount(rendered.tree, key)))
+    expect(Number(chipCount(rendered.tree, 'all'))).toBe(counts.reduce((sum, value) => sum + value, 0))
+    // 默认不筛选：「全部」点亮，另外四个都不亮，列表是完整三条
+    expect(findChip(rendered.tree, 'all').props['data-on']).toBe('1')
+    expect(FILTER_CHIPS.slice(1).map(key => findChip(rendered.tree, key).props['data-on'])).toEqual(['0', '0', '0', '0'])
+    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-row')).toHaveLength(4)
+  })
+
+  it('展开记录时能看到人工补的拒绝理由', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    // 只点一次：interact 每轮渲染都会被调用，不做标志会反复切换
+    let clicked = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (clicked) return
+      // 黑名单那条记录：折叠态里有它的命中规则文案，用它定位行头
+      const row = findNodes(tree, node => node?.props?.className === 'ap-row')
+        .find(candidate => JSON.stringify(candidate).includes('rm -rf'))
+      if (row === undefined) return
+      const head = findNodes(row, node => node?.props?.className === 'ap-rowHead')[0]
+      if (head === undefined) return
+      clicked = true
+      head.props.onClick()
+    })
+    expect(clicked).toBe(true)
+    for (const cleanup of rendered.cleanups) cleanup()
+
+    // 展开详情里多一行「人工拒绝理由」：追问卡的回答要能在时间线上核对
+    const dump = JSON.stringify(rendered.tree)
+    expect(dump).toContain('人工拒绝理由')
+    expect(dump).toContain('这次不需要提权，先别动。')
+  })
+
+  it('快捷筛选：点亮「白名单」后只剩命中白名单的那条', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    // 只点一次：interact 每轮渲染都会被调用，不做标志会反复切换
+    let clicked = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (clicked) return
+      const chip = findChip(tree, 'allow')
+      if (chip === undefined) return
+      clicked = true
+      chip.props.onClick()
+    })
+    expect(clicked).toBe(true)
+    for (const cleanup of rendered.cleanups) cleanup()
+
+    const rows = findNodes(rendered.tree, node => node?.props?.className === 'ap-row')
+    expect(rows).toHaveLength(1)
+    const dump = JSON.stringify(rendered.tree)
+    expect(dump).toContain('bash · npm test')
+    expect(dump).not.toContain('bash · rm -rf')
+    // 选中态转移：「白名单」亮、「全部」灭
+    expect(findChip(rendered.tree, 'allow').props['data-on']).toBe('1')
+    expect(findChip(rendered.tree, 'all').props['data-on']).toBe('0')
+  })
+
+  it('快捷筛选：「自动」只筛模型自动放行，不含命中白名单的那条', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let clicked = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (clicked) return
+      const chip = findChip(tree, 'auto')
+      if (chip === undefined) return
+      clicked = true
+      chip.props.onClick()
+    })
+    expect(clicked).toBe(true)
+    for (const cleanup of rendered.cleanups) cleanup()
+
+    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-row')).toHaveLength(1)
+    const dump = JSON.stringify(rendered.tree)
+    expect(dump).toContain('模型判定为只读操作')
+    // 命中白名单那条 decidedBy 也是 auto，但命中名单的记录只算「白名单」，不再落进「自动」
+    expect(dump).not.toContain('bash · npm test')
+  })
+
+  it('快捷筛选：多选叠加时显示并集（白名单 + 黑名单 = 两条）', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    // 两轮各点一个 chip：验证第二个是**叠加**而不是替换掉第一个
+    let step = 0
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      const key = step === 0 ? 'allow' : step === 1 ? 'deny' : undefined
+      if (key === undefined) return
+      const chip = findChip(tree, key)
+      if (chip === undefined) return
+      step += 1
+      chip.props.onClick()
+    })
+    expect(step).toBe(2)
+    for (const cleanup of rendered.cleanups) cleanup()
+
+    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-row')).toHaveLength(2)
+    expect(findChip(rendered.tree, 'allow').props['data-on']).toBe('1')
+    expect(findChip(rendered.tree, 'deny').props['data-on']).toBe('1')
+    expect(findChip(rendered.tree, 'auto').props['data-on']).toBe('0')
+  })
+
+  it('快捷筛选：筛空时提示筛选条件，而不是「还没有审批记录」', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    // 只返回那条白名单记录：点「黑名单」必然筛空
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async url => String(url).includes('/log')
+      ? { json: async () => ({ ok: true, records: [sampleRecords()[0]] }) }
+      : originalFetch(url)
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let clicked = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (clicked) return
+      const chip = findChip(tree, 'deny')
+      if (chip === undefined) return
+      clicked = true
+      chip.props.onClick()
+    })
+    expect(clicked).toBe(true)
+    for (const cleanup of rendered.cleanups) cleanup()
+
+    const dump = JSON.stringify(rendered.tree)
+    expect(dump).toContain('没有符合筛选条件的记录')
+    expect(dump).not.toContain('还没有审批记录')
+    // 条数徽标不受筛选影响：黑名单仍是 0 条，说明「点了也不会有结果」
+    expect(chipCount(rendered.tree, 'deny')).toBe('0')
+  })
+})
+
+describe('升级/降级的查重文案', () => {
+  /** 取出这一轮发给宿主的某个接口的请求体（按路径**精确**匹配，/rule 不会把 /rule/draft 也算进来）。 */
+  function bodiesOf(path) {
+    return globalThis.fetch.mock.calls
+      .filter(args => typeof args[1]?.body === 'string' && String(args[0]).split('?')[0].endsWith(path))
+      .map(args => JSON.parse(args[1].body))
+  }
+
+  it('「加入名单的规则」可以改：手填的匹配条件原样发给宿主', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    ruleResponder = () => ({ ok: true, optimizedBy: 'manual', rule: { label: '运行测试套件' } })
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let expanded = false
+    let edited = false
+    let clicked = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded === false) {
+        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+        if (head === undefined) return
+        expanded = true
+        head.props.onClick()
+        return
+      }
+      if (edited === false) {
+        // 这一条没有模型建议：草稿默认是本次精确签名；这里把条件改成命令前缀并填上值
+        // 匹配条件是我们自己的分段按钮（不用原生 <select>：它的弹层在深色主题下是白底）
+        const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
+        const value = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
+        if (kindButton === undefined || value === undefined) return
+        edited = true
+        kindButton.props.onClick()
+        value.props.onChange({ target: { value: 'npm test' } })
+        return
+      }
+      if (clicked) return
+      const actions = findNodes(tree, node => node?.props?.className === 'ap-actions')[0]
+      if (actions === undefined) return
+      const button = findNodes(actions, node => node?.type === 'button' && node.children?.[0] === '本项目')[0]
+      if (button === undefined) return
+      clicked = true
+      button.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    expect(clicked).toBe(true)
+
+    const posts = bodiesOf('/rule')
+    expect(posts).toHaveLength(1)
+    expect(posts[0].rule).toEqual({
+      tool: 'bash',
+      match: { kind: 'command_prefix', value: 'npm test' },
+      label: 'bash · npm test',
+    })
+    expect(JSON.stringify(rendered.tree)).toContain('已按你填写的条件加入')
+    // 前缀类条件至少 3 个字符：填太短时按钮直接禁用，不会发出请求
+    ruleResponder = null
+  })
+
+  it('切换匹配条件时：先按条件本地推导，再让模型按该条件重新生成（条件写进提示词）', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    const command = "pnpm vitest run tests/a.spec.js 2>&1 | Select-Object -Last 20"
+    logResponder = () => [{
+      id: 'record-cmd',
+      time: '2026-09-15T09:00:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'deny',
+      outcome: 'allowed-once',
+      decidedBy: 'human',
+      rationale: '这次先放行。',
+      signature: {
+        toolName: 'pwsh',
+        key: 'pwsh\u0000cmd:' + command + '\u0000x:{"sandbox_permissions":"danger-full-access"}',
+        text: 'pwsh: ' + command,
+        command,
+        paths: [],
+      },
+    }]
+    // 模型按用户选的条件重新生成：这里故意给一个与本地推导不同的值，验证最终生效的是模型结果
+    draftResponder = () => ({
+      ok: true,
+      rule: { tool: 'pwsh', match: { kind: 'command_prefix', value: 'pnpm vitest run' }, label: '模型给的前缀' },
+    })
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let expanded = false
+    let switched = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded === false) {
+        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+        if (head === undefined) return
+        expanded = true
+        head.props.onClick()
+        return
+      }
+      if (switched) return
+      const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
+      if (kindButton === undefined) return
+      switched = true
+      kindButton.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    expect(switched).toBe(true)
+
+    // 请求里带着用户选的条件与「本地先推导出来的值」（模型据此改写，提示词由宿主补全）
+    const drafts = bodiesOf('/rule/draft')
+    expect(drafts).toHaveLength(1)
+    expect(drafts[0]).toMatchObject({
+      recordId: 'record-cmd',
+      kind: 'command_prefix',
+      draft: { kind: 'command_prefix', value: 'pnpm vitest run tests/a.spec.js' },
+    })
+    // 模型回来后就以模型为准
+    const value = findNodes(rendered.tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
+    expect(value.props.value).toBe('pnpm vitest run')
+    const label = findNodes(rendered.tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '规则标签')[0]
+    expect(label.props.value).toBe('模型给的前缀')
+    expect(JSON.stringify(rendered.tree)).toContain('已让模型按所选条件重新生成')
+    draftResponder = null
+  })
+
+  it('模型没能重新生成时，保留本地按条件推导出来的值并如实提示', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    // 命令里带引号内的竖线（正则）：草稿按宿主的 firstPipeOutsideQuotes 口径只砍真管道与结尾重定向
+    const command = "rg 'a|b' src 2>&1 | Select-Object -Last 12"
+    logResponder = () => [{
+      id: 'record-fail',
+      time: '2026-09-15T09:05:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'deny',
+      outcome: 'allowed-once',
+      decidedBy: 'human',
+      rationale: '只读命令。',
+      signature: { toolName: 'pwsh', key: 'k', text: 'pwsh: ' + command, command, paths: [] },
+    }]
+    // 宿主回 503（例如没有可用路由）：客户端必须保留本地值，不能把输入框清空
+    draftResponder = () => ({ ok: false, error: 'rule regeneration unavailable' })
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let expanded = false
+    let switched = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded === false) {
+        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+        if (head === undefined) return
+        expanded = true
+        head.props.onClick()
+        return
+      }
+      if (switched) return
+      const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
+      if (kindButton === undefined) return
+      switched = true
+      kindButton.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    draftResponder = null
+    expect(switched).toBe(true)
+
+    const value = findNodes(rendered.tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
+    expect(value.props.value).toBe("rg 'a|b' src")
+    expect(JSON.stringify(rendered.tree)).toContain('模型这次没能生成')
+  })
+
+  it('路径前缀：提示单层通配口径；写 ** 时按钮禁用并说明原因', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let expanded = false
+    let edited = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded === false) {
+        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+        if (head === undefined) return
+        expanded = true
+        head.props.onClick()
+        return
+      }
+      if (edited) return
+      const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'path_prefix')[0]
+      const value = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
+      if (kindButton === undefined || value === undefined) return
+      edited = true
+      kindButton.props.onClick()
+      value.props.onChange({ target: { value: 'D:/repo/**/*.js' } })
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    expect(edited).toBe(true)
+
+    const dump = JSON.stringify(rendered.tree)
+    // 口径说明 + 拒绝原因都在，且写按钮被禁用（** 不会发出去）
+    expect(dump).toContain('路径前缀支持单层通配')
+    expect(dump).toContain('不支持 **')
+    const promote = findNodes(rendered.tree, node => node?.type === 'button' && node.children?.[0] === '本项目')[0]
+    expect(promote.props.disabled).toBe(true)
+  })
+
+  it('这次动作没有文件路径时，路径前缀按钮禁用并说明原因（免得生成命不中的规则）', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    // 一条带命令、但没有文件路径的记录（新记录一定带 paths 字段，这里是空数组）
+    logResponder = () => [{
+      id: 'record-cmd-only',
+      time: '2026-09-15T09:30:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'deny',
+      outcome: 'allowed-once',
+      decidedBy: 'human',
+      rationale: '跑测试。',
+      signature: { toolName: 'pwsh', key: 'k', text: 'pwsh: pnpm test', command: 'pnpm test', paths: [] },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let expanded = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded) return
+      const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+      if (head === undefined) return
+      expanded = true
+      head.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    expect(expanded).toBe(true)
+
+    const pathButton = findNodes(rendered.tree,
+      node => node?.type === 'button' && node?.props?.['data-kind'] === 'path_prefix')[0]
+    const commandButton = findNodes(rendered.tree,
+      node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
+    expect(pathButton.props.disabled).toBe(true)
+    expect(commandButton.props.disabled).toBeFalsy()
+    expect(JSON.stringify(rendered.tree)).toContain('路径前缀匹配不到这次动作')
+  })
+
+  it('命令前缀里写 * 会提示它是字面量（不会像 shell 那样展开）', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    const command = 'pnpm vitest run tests/policy.spec.js'
+    logResponder = () => [{
+      id: 'record-star',
+      time: '2026-09-15T09:40:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'deny',
+      outcome: 'allowed-once',
+      decidedBy: 'human',
+      rationale: '跑单测。',
+      signature: { toolName: 'pwsh', key: 'k', text: 'pwsh: ' + command, command, paths: [] },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let expanded = false
+    let edited = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded === false) {
+        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+        if (head === undefined) return
+        expanded = true
+        head.props.onClick()
+        return
+      }
+      if (edited) return
+      const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
+      const value = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
+      if (kindButton === undefined || value === undefined) return
+      edited = true
+      kindButton.props.onClick()
+      value.props.onChange({ target: { value: 'pnpm vitest run tests/*' } })
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    expect(edited).toBe(true)
+    expect(JSON.stringify(rendered.tree)).toContain('命令前缀里的 * 是字面量')
+  })
+
+  it('设置面板里能编辑已有规则，保存时按 id 发 op=update', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const view = slot(slotRegistrations, 'conversation.view', 'dsh-auto-pass')
+
+    let editing = false
+    let renamed = false
+    let saved = false
+    const rendered = await renderStable(react, view.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (editing === false) {
+        const button = findNodes(tree, node => node?.type === 'button' && node.children?.[0] === '编辑')[0]
+        if (button === undefined) return
+        editing = true
+        button.props.onClick()
+        return
+      }
+      if (renamed === false) {
+        const label = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '规则标签')[0]
+        if (label === undefined) return
+        renamed = true
+        label.props.onChange({ target: { value: '改过的标签' } })
+        return
+      }
+      if (saved) return
+      const save = findNodes(tree, node => node?.type === 'button' && node.children?.[0] === '保存修改')[0]
+      if (save === undefined) return
+      saved = true
+      save.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    expect(saved).toBe(true)
+
+    const posts = bodiesOf('/policy')
+    expect(posts).toHaveLength(1)
+    expect(posts[0]).toMatchObject({
+      op: 'update',
+      scope: 'global',
+      list: 'allow',
+      id: 'rule-1',
+      rule: { tool: 'bash', match: { kind: 'signature', value: 'k' }, label: '改过的标签' },
+    })
+  })
+
+  /**
+   * 渲染时间线 → 展开第一条记录 → 点一次「升级为白名单 · 本项目」，返回稳定后的元素树。
+   * 宿主 /rule 的回执由用例给定，用来验证三种查重结果各自的文案。
+   * @param react 假 react
+   * @param pane 时间线面板注册项
+   * @param reply 宿主 /rule 的回执（ok 由这里补）
+   * @returns {Promise<object>} 稳定后的元素树
+   */
+  async function promoteOnce(react, pane, reply) {
+    ruleResponder = () => ({ ok: true, ...reply })
+    let expanded = false
+    let clicked = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded === false) {
+        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+        if (head === undefined) return
+        expanded = true
+        head.props.onClick()
+        return
+      }
+      if (clicked) return
+      const actions = findNodes(tree, node => node?.props?.className === 'ap-actions')[0]
+      if (actions === undefined) return
+      const button = findNodes(actions, node => node?.type === 'button' && node.children?.[0] === '本项目')[0]
+      if (button === undefined) return
+      clicked = true
+      button.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    expect(clicked).toBe(true)
+    return rendered.tree
+  }
+
+  it('分别提示「已更新同名规则 / 已被已有规则覆盖 / 已合并窄规则」', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    // 同一「工具 + 匹配条件」已存在：这次是更新那条规则
+    const updated = JSON.stringify(await promoteOnce(react, pane, {
+      optimizedBy: 'model', replaced: true, covered: false, merged: 0, rule: { label: '跑测试' },
+    }))
+    expect(updated).toContain('已加入（模型优化）')
+    expect(updated).toContain('（已更新同名规则）')
+    expect(updated).toContain('：跑测试')
+
+    // 已有规则完整覆盖这次动作：没写新条目，如实说明
+    const coveredTree = JSON.stringify(await promoteOnce(react, pane, {
+      optimizedBy: 'record', replaced: false, covered: true, merged: 0, rule: { label: '跑测试（前缀）' },
+    }))
+    expect(coveredTree).toContain('（已有规则已覆盖这个动作，未重复添加）')
+    expect(coveredTree).toContain('跑测试（前缀）')
+    expect(coveredTree).not.toContain('（已更新同名规则）')
+
+    // 新规则顺带合并掉了更窄的旧规则：告诉用户名单为什么少了一条
+    const mergedTree = JSON.stringify(await promoteOnce(react, pane, {
+      optimizedBy: 'signature', replaced: false, covered: false, merged: 2, rule: { label: '跑测试（精确签名）' },
+    }))
+    expect(mergedTree).toContain('已加入（没有可用的模型建议，已回落到默认条件')
+    expect(mergedTree).toContain('（已合并 2 条被它覆盖的窄规则）')
+    ruleResponder = null
+  })
+})
+
+describe('审批触发后自动打开右侧栏时间线', () => {
+  /** 与客户端半的 POLL_MS 对齐：观察器每 3 秒看一次当前会话的最新记录。 */
+  const POLL = 3_000
+
+  it('首次观测只记基线；新审批出现且时间线没打开才展开；已打开则不抢焦点', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, slotRegistrations, openTabs } = harness()
+      /** 当前 /log 的返回：观察器只看第一条记录的 id。 */
+      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN }]
+      logResponder = () => records
+      moduleExports.apply(ctx)
+      /** 跑一轮定时器 + 排空微任务队列：观察器是 async 的（fetch → json → …），不等它走完就会误判。 */
+      const tick = async (ms) => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+
+      // 第一次观测：会话里本来就有历史记录（页面刚刷新）——只记基线，不该把时间线弹开
+      await tick(POLL)
+      expect(openTabs).toEqual([])
+
+      // 触发了一次审批（最新记录的 id 变了）→ 时间线没打开，于是自动展开
+      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log'])
+
+      // 时间线已经显示在眼前（面板挂载 + tab 可见）：再来一次审批也不抢焦点
+      const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+      const rendered = await renderStable(react, pane.component, {
+        sessionId: SESSION_KNOWN,
+        useTabInfo: () => ({ tab: { visible: true } }),
+      })
+      records = [{ id: 'record-newer', sessionId: SESSION_KNOWN }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log'])
+
+      // 侧栏被收起 / 切到了别的 tab（面板卸载）后，下一次审批会重新展开
+      for (const cleanup of rendered.cleanups) cleanup()
+      records = [{ id: 'record-latest', sessionId: SESSION_KNOWN }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log', 'dsh-auto-pass-log'])
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
   })
 })
 

@@ -8,20 +8,29 @@
  * @modify 2026-09-15 增加审批记录：落盘 JSON，并经 /api/dsh-auto-pass 供右栏/对话标签页时间轴读取
  * @modify 2026-09-15 增加权限记忆与白/黑名单：命中名单直接放行或直接转人工，连续人工放行达阈值自动升级
  * @modify 2026-09-15 达阈值不再静默升级：自动审批与人工放行合并计数，先由模型优化规则再 ask 询问用户
+ * @modify 2026-09-15 规则查重口径改为语义包含：/rule 与 /policy op=add 透传 replaced/covered/merged，并各写一行去重日志
+ * @modify 2026-09-15 decisionSignal 改为「最终结果优先」：人工点「允许一次」算连续放行，不再被模型的 deny 盖过去
+ * @modify 2026-09-15 规则可微调：/rule 接受手填的 rule（optimizedBy=manual、手填同样要覆盖本次动作）、/policy 支持 op=update；新增 suggestionUsable——模型建议必须覆盖本次动作，写成一句描述的假签名一律丢弃并回落到精确签名
+ * @modify 2026-09-15 条件必须配得上动作：signatureFromRecord 不再伪造空 paths、新增 kindApplicable、/rule/draft 对不搭的 kind 直接 400、提示词显式给出 command/paths
+ * @modify 2026-09-15 规则默认命令前缀：没有可用模型建议时用 defaultRuleOf（有命令就 command_prefix）；审批记录按工作区分文件
  */
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import {
   createRecordStore,
   DEFAULT_MAX_RECORDS,
-  defaultLogFile,
+  defaultRecordDir,
   MAX_RECORD_ACTION_CHARS,
   noopRecordStore,
 } from './records.js'
 import {
+  countingCommand,
   createPolicyStore,
   DEFAULT_AUTO_APPROVE_AFTER,
   DEFAULT_AUTO_DENY_AFTER,
+  MATCH_KINDS,
+  matchRule,
+  MIN_PREFIX_CHARS,
   noopPolicyStore,
   signatureOf,
   validateRuleInput,
@@ -33,6 +42,23 @@ export const inject = ['approval']
 const LANGUAGE_DETECTION_STATES = new WeakMap()
 const HAN_CHARACTER_THRESHOLD = 3
 const MAX_NOTICE_REASON_CHARS = 1_000
+/** 转人工时写进审批卡首行的审查意见长度上限（该行会自然折行，过长会淹没调用方给的原文）。 */
+const MAX_APPROVAL_NOTE_CHARS = 200
+/** 三种匹配条件的中文说法（提示词与日志共用，值与 policy.js 的 MATCH_KINDS 对齐）。 */
+const RULE_KIND_LABELS = Object.freeze({
+  signature: '精确签名（只匹配这一次动作）',
+  command_prefix: '命令前缀（匹配同一命令族的后续调用）',
+  path_prefix: '路径前缀（匹配这个目录下的读写）',
+})
+/** 记进审批记录的用量字段：DSH 的 TokenUsage 形状，只收有限数字，多的字段一律丢弃。 */
+const USAGE_FIELDS = Object.freeze([
+  'inputTokens',
+  'outputTokens',
+  'totalTokens',
+  'cacheReadTokens',
+  'cacheWriteTokens',
+  'reasoningTokens',
+])
 /** 单轮调用的 purpose（日志与归因用）。 */
 const REVIEW_PURPOSE = 'auto-approve-review'
 const RULE_PURPOSE = 'auto-approve-rule'
@@ -46,6 +72,8 @@ const DEFAULTS = Object.freeze({
   maxEvidenceChars: 400,
   maxActionChars: 16_000,
   maxOutputTokens: 2_048,
+  // 审批记录文件：留空 = 按工作区分文件（$DSH_HOME/dsh-auto-pass/records/<slug>.json）；
+  // 显式给路径 = 退回单文件模式（调试/兼容用，所有工作区写同一个文件）。
   logFile: '',
   maxRecords: DEFAULT_MAX_RECORDS,
   // 同一项目下同一权限签名连续放行多少次后，询问是否加入白名单（策略文件里可覆盖）。
@@ -57,6 +85,17 @@ const DEFAULTS = Object.freeze({
   // 默认两处都注册（与 dsh-context 一致）：对话区标签页立刻可见，右侧栏 tab 也可用；
   // 想只留一处就改成 tab / sidebar；auto 表示优先右侧栏、没有座位时退回对话标签页。
   placement: 'all',
+  // 是否把审批结果注入模型上下文（一行通知 / form=notice，会真的进模型上下文）。
+  // 关掉后模型完全看不到审批发生过什么；拿不到 settings 服务时按这个默认值走。
+  notice: true,
+  // 命中黑名单时直接返回 rejected（工具调用被判为拒绝、不弹人工审批卡）。
+  // 默认 false = 保持「命中黑名单直接转人工」，由用户在卡片上决定。
+  denyDirect: false,
+  // 本会话第一次产生审批记录时，客户端半自动展开右侧栏的审批时间线（纯界面行为，默认开）。
+  autoOpenTimeline: true,
+  // 人工拒绝后是否追问一句拒绝理由，并把理由作为一行通知注入模型上下文（默认开）。
+  // 与 notice 联动：notice 关掉时上下文里什么都不注入，那时也不追问。
+  askRejectReason: true,
 })
 
 /** 审批记录路由前缀（webServer kind: prefix）与两条查询路径。 */
@@ -69,6 +108,11 @@ export const RECORD_CONFIG_PATH = '/api/dsh-auto-pass/config'
 export const POLICY_PATH = '/api/dsh-auto-pass/policy'
 /** 由一条审批记录一键升级/降级：规则文本由 Reviewer 模型产出，缺省回落到精确签名。 */
 export const RULE_PATH = '/api/dsh-auto-pass/rule'
+/**
+ * 只生成不落盘：用户在时间线上换了匹配条件（命令前缀 / 精确签名 / 路径前缀）时，
+ * 让模型**按那个条件**重新生成一遍。用户选的条件会写进提示词，见 buildRulePrompt。
+ */
+export const RULE_DRAFT_PATH = '/api/dsh-auto-pass/rule/draft'
 /** 时间轴可选的放置位置；auto 表示优先右侧栏座位、没有座位时退回对话标签页。 */
 export const PLACEMENTS = Object.freeze(['auto', 'tab', 'sidebar', 'all'])
 /** 设置命名空间：宿主 settings 注册与浏览器端设置卡片靠这个名字对齐。 */
@@ -128,8 +172,9 @@ const reviewSystems = Object.freeze({
  */
 export function apply(ctx, config) {
   const resolved = resolveConfig(config, message => ctx.logger.warn(message))
+  // 默认按工作区分文件；显式配置 logFile 时退回单文件模式（老行为，便于对照排查）
   const records = createRecordStore({
-    file: resolved.logFile === '' ? defaultLogFile() : resolved.logFile,
+    ...(resolved.logFile === '' ? { dir: defaultRecordDir() } : { file: resolved.logFile }),
     limit: resolved.maxRecords,
     warn: message => ctx.logger.warn(message),
   })
@@ -143,7 +188,7 @@ export function apply(ctx, config) {
   installSettings(ctx)
   installRecordRoute(ctx, records, resolved, policies)
   installClientGraphProbe(ctx)
-  ctx.logger.info('dsh-auto-pass: 审批记录已就绪 file=' + records.file + ' maxRecords=' + String(records.limit)
+  ctx.logger.info('dsh-auto-pass: 审批记录已就绪 ' + (records.dir === undefined ? 'file=' + String(records.file) : 'dir=' + records.dir) + ' maxRecords=' + String(records.limit)
     + ' placement=' + effectivePlacement(ctx, resolved)
     + ' autoApproveAfter=' + String(policies.threshold('allow'))
     + ' autoDenyAfter=' + String(policies.threshold('deny'))
@@ -161,7 +206,15 @@ function installSettings(ctx) {
     // 解析失败时只是没有设置页卡片，审批主链路照常工作。
     void import('@deepseek-ai/schemastery').then(module => {
       const z = module.default ?? module
-      const schema = z.object({ placement: z.union([...PLACEMENTS]).default('all') })
+      // 五个键都是「用户偏好」：settings.get() 返回带 schema 默认值的解析结果，
+      // 所以设置页没写过的键也能拿到 DEFAULTS 里那套默认行为。
+      const schema = z.object({
+        placement: z.union([...PLACEMENTS]).default('all'),
+        notice: z.boolean().default(DEFAULTS.notice),
+        denyDirect: z.boolean().default(DEFAULTS.denyDirect),
+        autoOpenTimeline: z.boolean().default(DEFAULTS.autoOpenTimeline),
+        askRejectReason: z.boolean().default(DEFAULTS.askRejectReason),
+      })
       settingsCtx.settings.register(SETTINGS_NAMESPACE, schema)
     }).catch(error => {
       ctx.logger.warn('dsh-auto-pass: 注册设置命名空间失败：' + errorMessage(error))
@@ -171,16 +224,56 @@ function installSettings(ctx) {
 
 /** 生效的放置位置：设置页的值优先，其次插件 config 的值。 */
 function effectivePlacement(ctx, config) {
+  const value = readSetting(ctx, 'placement')
+  return PLACEMENTS.includes(value) ? value : config.placement
+}
+
+/**
+ * 读一处设置页偏好。设置命名空间没注册（没有 settings 服务、schemastery 缺失）时返回 undefined，
+ * 调用方一律回落到插件 config 的值——设置读不到只影响界面偏好，绝不影响审批结论。
+ * @param {object} ctx 宿主上下文
+ * @param {string} key 设置键（placement / notice / denyDirect）
+ * @returns {*} 设置值；读不到时 undefined
+ */
+function readSetting(ctx, key) {
   const settings = typeof ctx.get === 'function' ? ctx.get('settings') : undefined
-  if (settings !== undefined && typeof settings.get === 'function') {
-    try {
-      const value = settings.get(SETTINGS_NAMESPACE)?.placement
-      if (PLACEMENTS.includes(value)) return value
-    } catch (error) {
-      ctx.logger.warn('dsh-auto-pass: 读取设置失败，回退到插件配置：' + errorMessage(error))
-    }
+  if (settings === undefined || typeof settings.get !== 'function') return undefined
+  try {
+    return settings.get(SETTINGS_NAMESPACE)?.[key]
+  } catch (error) {
+    ctx.logger.warn('dsh-auto-pass: 读取设置 ' + key + ' 失败，回退到插件配置：' + errorMessage(error))
+    return undefined
   }
-  return config.placement
+}
+
+/**
+ * 布尔型界面与行为开关：设置页的值 -> 插件 config 的值 -> DEFAULTS。
+ * 只认真正的 boolean，读到别的类型（写坏的设置文件 / 字符串 "false"）一律往下一层回落，
+ * 避免「config 里写成字符串 → 开关静默失效」。设置读不到只影响界面偏好，绝不改变审批结论。
+ * @param {object} ctx 宿主上下文
+ * @param {object} config 插件配置
+ * @param {string} key 开关名（notice / denyDirect）
+ * @returns {boolean} 生效值
+ */
+function effectiveFlag(ctx, config, key) {
+  const fromSettings = readSetting(ctx, key)
+  if (typeof fromSettings === 'boolean') return fromSettings
+  return typeof config[key] === 'boolean' ? config[key] : DEFAULTS[key]
+}
+
+/** 是否把审批结果注入模型上下文（设置页开关优先，其次插件 config，最后默认开）。 */
+function effectiveNotice(ctx, config) {
+  return effectiveFlag(ctx, config, 'notice')
+}
+
+/** 命中黑名单时是否直接拒绝（设置页开关优先，其次插件 config，最后默认关）。 */
+function effectiveDenyDirect(ctx, config) {
+  return effectiveFlag(ctx, config, 'denyDirect')
+}
+
+/** 人工拒绝后是否追问一句拒绝理由（设置页开关优先，其次插件 config，最后默认开）。 */
+function effectiveAskRejectReason(ctx, config) {
+  return effectiveFlag(ctx, config, 'askRejectReason')
 }
 
 /**
@@ -245,7 +338,7 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
     const url = new URL(req.url ?? '/', 'http://dsh.local')
     const pathname = url.pathname.replace(/\/+$/, '')
     if (pathname !== RECORD_LOG_PATH && pathname !== RECORD_CONFIG_PATH && pathname !== RECORD_BEACON_PATH
-      && pathname !== POLICY_PATH && pathname !== RULE_PATH) {
+      && pathname !== POLICY_PATH && pathname !== RULE_PATH && pathname !== RULE_DRAFT_PATH) {
       writeJson(404, { ok: false, error: 'not found' })
       return
     }
@@ -262,7 +355,7 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
     }
     if (pathname === RECORD_CONFIG_PATH) {
       if (req.method === 'POST' || req.method === 'PUT') {
-        await updatePlacement(req, ctx, writeJson)
+        await updateConfig(req, ctx, writeJson)
         return
       }
       if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -270,17 +363,30 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
         return
       }
       const settings = typeof ctx.get === 'function' ? ctx.get('settings') : undefined
+      // 全部界面偏好一次给全：placement 决定面板挂哪，notice / denyDirect 是两个行为开关
       writeJson(200, {
         ok: true,
-        placement: effectivePlacement(ctx, config),
+        settings: {
+          placement: effectivePlacement(ctx, config),
+          notice: effectiveNotice(ctx, config),
+          denyDirect: effectiveDenyDirect(ctx, config),
+          autoOpenTimeline: effectiveFlag(ctx, config, 'autoOpenTimeline'),
+          askRejectReason: effectiveAskRejectReason(ctx, config),
+        },
         writable: settings !== undefined && typeof settings.update === 'function',
         maxRecords: config.maxRecords,
-        file: records.file,
+        // 目录形态给 dir、单文件形态给 file（客户端只是展示/排查用）
+        file: records.file ?? records.dir,
+        ...(records.dir === undefined ? {} : { dir: records.dir }),
       })
       return
     }
     if (pathname === POLICY_PATH) {
       await servePolicyRequest(req, url, writeJson, policies)
+      return
+    }
+    if (pathname === RULE_DRAFT_PATH) {
+      await serveRuleDraftRequest(ctx, req, writeJson, records, config)
       return
     }
     if (pathname === RULE_PATH) {
@@ -298,7 +404,7 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
       : MAX_RECORDS_PER_RESPONSE
     writeJson(200, {
       ok: true,
-      file: records.file,
+      file: records.file ?? records.dir,
       total: records.size(),
       session,
       records: records.list({ session }).slice(0, limit),
@@ -309,28 +415,51 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
   }
 }
 
-/** 读取请求体并写入设置命名空间；没有可写 settings 时返回 503。 */
-async function updatePlacement(req, ctx, writeJson) {
+/**
+ * 可写的界面偏好：键 -> { ok(value) 校验, label(value) 错误说明 }。
+ * 只有出现在这里的键才允许经 HTTP 写进设置命名空间，其余一律拒绝。
+ */
+const CONFIG_SETTINGS = Object.freeze({
+  placement: {
+    ok: value => PLACEMENTS.includes(value),
+    label: 'placement must be one of ' + PLACEMENTS.join('/'),
+  },
+  notice: { ok: value => typeof value === 'boolean', label: 'notice must be a boolean' },
+  denyDirect: { ok: value => typeof value === 'boolean', label: 'denyDirect must be a boolean' },
+  autoOpenTimeline: { ok: value => typeof value === 'boolean', label: 'autoOpenTimeline must be a boolean' },
+  askRejectReason: { ok: value => typeof value === 'boolean', label: 'askRejectReason must be a boolean' },
+})
+
+/**
+ * 写入设置页偏好（placement / notice / denyDirect）：请求体里的白名单键逐个校验后合并写进
+ * 设置命名空间（settings.update 是 patch 语义，未提到的键保持原值）。没有可写 settings 时返回 503。
+ */
+async function updateConfig(req, ctx, writeJson) {
   const settings = typeof ctx.get === 'function' ? ctx.get('settings') : undefined
   if (settings === undefined || typeof settings.update !== 'function') {
     writeJson(503, { ok: false, error: 'settings unavailable' })
     return
   }
-  let body = ''
-  for await (const chunk of req) body += chunk
-  let placement
-  try {
-    placement = JSON.parse(body === '' ? '{}' : body).placement
-  } catch (error) {
+  const body = await readJsonBody(req)
+  if (body === undefined) {
     writeJson(400, { ok: false, error: 'invalid json' })
     return
   }
-  if (!PLACEMENTS.includes(placement)) {
-    writeJson(400, { ok: false, error: 'placement must be one of ' + PLACEMENTS.join('/') })
+  const patch = {}
+  for (const key of Object.keys(CONFIG_SETTINGS)) {
+    if (body[key] === undefined) continue
+    if (!CONFIG_SETTINGS[key].ok(body[key])) {
+      writeJson(400, { ok: false, error: CONFIG_SETTINGS[key].label })
+      return
+    }
+    patch[key] = body[key]
+  }
+  if (Object.keys(patch).length === 0) {
+    writeJson(400, { ok: false, error: 'unknown setting' })
     return
   }
-  await settings.update(SETTINGS_NAMESPACE, { placement })
-  writeJson(200, { ok: true, placement })
+  await settings.update(SETTINGS_NAMESPACE, patch)
+  writeJson(200, { ok: true, settings: patch })
 }
 
 /** 读取请求体文本（超长请求由调用方的 try/catch 兜住）。 */
@@ -387,7 +516,14 @@ async function servePolicyRequest(req, url, writeJson, policies) {
   }
   if (body.op === 'add') {
     const added = policies.addRule({ scope: body.scope, list: body.list, rule: body.rule }, target)
+    // added 里带 replaced：同一条规则已存在时是更新，客户端据此提示「已更新」而不是「已加入」
     writeJson(added.ok === true ? 200 : 400, added)
+    return
+  }
+  if (body.op === 'update') {
+    // 面板里微调一条已有规则的匹配条件/标签：按 id 原地更新（id 不变，记录里的 ruleId 仍指得回来）
+    const updated = policies.updateRule({ scope: body.scope, list: body.list, id: body.id, rule: body.rule }, target)
+    writeJson(updated.ok === true ? 200 : 400, updated)
     return
   }
   writeJson(400, { ok: false, error: 'unknown op' })
@@ -399,9 +535,15 @@ async function servePolicyRequest(req, url, writeJson, policies) {
  * 单轮调用不需要父 Agent，所以「会话已不在册」不再导致优化失败。
  */
 async function chooseRecordRule(ctx, record, body, config, records) {
-  // 两条路都是模型产出，source 一律标 model（规则列表里能看出它不是用户手搓的）
-  if (record.suggestedRule !== undefined) return { rule: { ...record.suggestedRule, source: 'model' }, optimizedBy: 'record' }
   const signature = signatureFromRecord(record)
+  // 两条路都是模型产出，source 一律标 model（规则列表里能看出它不是用户手搓的）
+  if (record.suggestedRule !== undefined) {
+    if (suggestionUsable(record.suggestedRule, signature)) {
+      return { rule: { ...record.suggestedRule, source: 'model' }, optimizedBy: 'record' }
+    }
+    ctx.logger.warn('dsh-auto-pass: 模型建议规则不覆盖本次动作，已忽略 record=' + safeLogValue(String(record.id))
+      + ' kind=' + safeLogValue(String(record.suggestedRule.match?.kind)) + ' value=' + safeLogValue(String(record.suggestedRule.match?.value)))
+  }
   if (signature === undefined) return undefined
   const optimized = await optimizeRule(ctx, {
     request: { toolName: signature.toolName, callId: 'manual:' + String(record.id ?? ''), sessionId: record.sessionId },
@@ -414,7 +556,59 @@ async function chooseRecordRule(ctx, record, body, config, records) {
   return optimized === undefined ? undefined : { rule: { ...optimized, source: 'model' }, optimizedBy: 'model' }
 }
 
-/** 从审批记录里重建签名；老记录只有 toolName/key/text，缺 command/paths 时模型只能靠标签判断。 */
+/**
+ * 模型建议的规则能不能用：**它至少要覆盖「它被建议的那次动作」**。
+ *
+ * 踩过的坑（2026-09-15 真机记录）：模型把「精确签名」的 value 写成了一句描述——
+ * `{"kind":"signature","value":"danger-full-access"}`、`escalation:danger-full-access`、
+ * `escalation=danger-full-access` 三种变体都出现过。签名 key 是机器产出的
+ * （`tool\u0000cmd:…` / `args:…`），这种「签名」一个动作都匹配不到，可它会被写进名单，
+ * 让用户以为已经放行了。命令前缀/路径前缀同样要真的覆盖这次动作（模型可能给别的前缀）。
+ * @param rule 模型给出的建议规则
+ * @param signature 这次动作的签名（signatureOf / signatureFromRecord 的产物）
+ * @returns {boolean} 覆盖本次动作返回 true；没有签名可比对时按不可用处理
+ */
+export function kindApplicable(signature, kind) {
+  if (signature === undefined || signature === null) return false
+  // 新记录的签名一定带 paths（可能是空数组）：「这次动作有没有命令 / 文件路径」因此是可知的；
+  // 老记录（连 paths 都没有）判不了，一律按可用处理，不去打扰历史记录的手动升级。
+  const known = signature.paths !== undefined
+  if (kind === 'command_prefix') return known !== true || typeof signature.command === 'string'
+  if (kind === 'path_prefix') return known !== true || (Array.isArray(signature.paths) && signature.paths.length > 0)
+  return MATCH_KINDS.includes(kind)
+}
+
+export function suggestionUsable(rule, signature) {
+  if (rule === null || typeof rule !== 'object' || Array.isArray(rule)) return false
+  if (signature === undefined || signature === null) return false
+  const match = rule.match
+  if (match === null || typeof match !== 'object') return false
+  if (typeof rule.tool === 'string' && rule.tool !== signature.toolName) return false
+  // 精确签名：必须逐字等于本次签名。这条判定永远可做，也正是模型最常写错的地方
+  if (match.kind === 'signature') return match.value === signature.key
+  // 前缀类条件：**新记录的签名一定带 paths**（可能是空数组），所以「这次动作有没有命令/路径」
+  // 是可知的——可知却对不上，就说明这条规则永远命不中这次动作，直接判不可用。
+  // 只有老记录（连 paths 字段都没有）才属于判不了，那时先信模型，别凭空丢弃历史记录的建议。
+  // 踩过的坑（2026-09-15 真机）：一条 pwsh 命令记录（没有文件路径）被要求生成「路径前缀」，
+  // 模型给了 D:\work\github\dsh-auto 这种目录前缀——旧写法因为 paths 是空数组而「判不了→信任」，
+  // 于是写进了一条永远匹配不到任何动作的规则。
+  const known = signature.paths !== undefined
+  if (match.kind === 'command_prefix') {
+    if (typeof signature.command !== 'string' || signature.command === '') return known !== true
+    return matchRule({ tool: signature.toolName, match }, signature)
+  }
+  if (match.kind === 'path_prefix') {
+    if (!Array.isArray(signature.paths) || signature.paths.length === 0) return known !== true
+    return matchRule({ tool: signature.toolName, match }, signature)
+  }
+  return false
+}
+
+/**
+ * 从审批记录里重建签名。**保留「字段缺失」与「字段为空」的区别**（判规则覆盖度时要用）：
+ * 新记录一定带 `paths`（可能是空数组）、命令工具带 `command`；老记录只有 `toolName/key/text`，
+ * 这时 `paths` 保持 undefined 表示「不知道」，而不是「没有路径」。
+ */
 function signatureFromRecord(record) {
   const signature = record?.signature
   if (signature === undefined || typeof signature.key !== 'string' || signature.key === '') return undefined
@@ -424,8 +618,68 @@ function signatureFromRecord(record) {
     memoryKey: signature.memoryKey ?? signature.key,
     text: signature.text ?? String(record.toolName ?? ''),
     ...(signature.command === undefined ? {} : { command: signature.command }),
-    paths: Array.isArray(signature.paths) ? signature.paths : [],
+    ...(Array.isArray(signature.paths) ? { paths: signature.paths } : {}),
   }
+}
+
+/**
+ * 只生成不落盘：用户在时间线上换了匹配条件时，让模型**按那个条件**重新生成一条规则。
+ * 与 `/rule` 的区别是它不写任何名单，只把生成结果回给客户端填进草稿（用户可以接着改）。
+ * 提示词里会带上用户选的条件与当前草稿（`buildRulePrompt`），模型换 kind 或给出不覆盖
+ * 本次动作的条件都会被丢弃——那种时候客户端保留自己按条件推导的值。
+ * @param ctx 宿主上下文
+ * @param req HTTP 请求（POST，体：{recordId, kind, list?, draft?}）
+ * @param writeJson 统一的 JSON 响应器
+ * @param records 审批记录仓库
+ * @param config 插件配置（取审查模型路由与超时）
+ * @returns {Promise<void>} 无返回值
+ */
+async function serveRuleDraftRequest(ctx, req, writeJson, records, config) {
+  if (req.method !== 'POST' && req.method !== 'PUT') {
+    writeJson(405, { ok: false, error: 'method not allowed' })
+    return
+  }
+  const body = await readJsonBody(req)
+  if (body === undefined) {
+    writeJson(400, { ok: false, error: 'invalid json' })
+    return
+  }
+  if (!MATCH_KINDS.includes(body.kind)) {
+    writeJson(400, { ok: false, error: 'kind must be one of ' + MATCH_KINDS.join('/') })
+    return
+  }
+  const record = typeof records.get === 'function' ? records.get(body.recordId) : undefined
+  if (record === undefined || record === null) {
+    writeJson(404, { ok: false, error: 'approval record not found' })
+    return
+  }
+  const signature = signatureFromRecord(record)
+  if (signature === undefined) {
+    writeJson(400, { ok: false, error: 'approval record has no usable rule signature' })
+    return
+  }
+  // 这次动作本来就没有命令 / 文件路径时，那种条件永远命不中——直接拒绝，连模型都不叫（省一次调用）
+  if (kindApplicable(signature, body.kind) !== true) {
+    writeJson(400, { ok: false, error: 'kind is not applicable to this action', code: 'kind-not-applicable' })
+    return
+  }
+  const optimized = await optimizeRule(ctx, {
+    request: { toolName: signature.toolName, callId: 'draft:' + String(record.id ?? ''), sessionId: record.sessionId },
+    config,
+    language: config.language === 'en' ? 'en' : 'zh',
+    signature,
+    list: body.list === 'deny' ? 'deny' : 'allow',
+    records,
+    kind: body.kind,
+    draft: body.draft,
+  })
+  if (optimized === undefined) {
+    writeJson(503, { ok: false, error: 'rule regeneration unavailable' })
+    return
+  }
+  ctx.logger.info('dsh-auto-pass: 按条件重新生成规则 kind=' + String(body.kind)
+    + ' value=' + safeLogValue(String(optimized.match.value)) + ' label=' + safeLogValue(String(optimized.label)))
+  writeJson(200, { ok: true, rule: optimized, kind: body.kind })
 }
 
 /**
@@ -449,36 +703,77 @@ async function serveRuleRequest(ctx, req, writeJson, policies, records, config) 
     writeJson(404, { ok: false, error: 'approval record not found' })
     return
   }
-  const chosen = await chooseRecordRule(ctx, record, body, config, records)
+  // 用户在时间线上手改过匹配条件：以他填的为准（校验通过就原样写入，不再让模型改写）
+  const manual = body.rule === undefined ? undefined : validateRuleInput(body.rule)
+  if (body.rule !== undefined && manual.ok !== true) {
+    writeJson(400, { ok: false, error: manual.error })
+    return
+  }
+  // 手填的条件同样必须覆盖本次动作：否则会写进一条**永远匹配不到东西**的规则
+  // （模型写错过 danger-full-access 这种签名，人也会写错），当场 400 比事后自己发现好
+  if (manual?.ok === true && suggestionUsable(manual.rule, signatureFromRecord(record)) !== true) {
+    writeJson(400, { ok: false, error: 'rule does not cover this action', code: 'not-covering' })
+    return
+  }
+  const chosen = manual?.ok === true
+    ? {
+      rule: { ...manual.rule, source: 'user', note: '用户在时间线上手填的匹配条件' },
+      optimizedBy: 'manual',
+    }
+    : await chooseRecordRule(ctx, record, body, config, records)
   const rule = chosen?.rule ?? ruleFromRecord(record)
   if (rule === undefined) {
     writeJson(400, { ok: false, error: 'approval record has no usable rule signature' })
     return
   }
+
   const added = policies.addRule({ scope: body.scope, list: body.list, rule }, record.cwd)
   if (added.ok !== true) {
     writeJson(400, { ok: false, error: added.error ?? 'policy write failed' })
     return
   }
   if (typeof records.update === 'function') {
+    // optimizedBy 一起写进记录：时间线据此显示这条规则是模型给的、模型现场优化的、还是你手填的
     records.update(record.id, {
-      ruleApplied: { scope: added.scope, list: body.list, ruleId: added.rule.id, label: added.rule.label },
+      ruleApplied: {
+        scope: added.scope,
+        list: body.list,
+        ruleId: added.rule.id,
+        label: added.rule.label,
+        optimizedBy: chosen?.optimizedBy ?? 'signature',
+      },
     })
   }
+  // 查重结果如实回报：replaced=更新了同一条规则；covered=已有规则完整覆盖这次动作（没写新条目）；
+  // merged=这次写入顺带合并掉的更窄旧规则条数。日志里各留一行，方便事后核对名单为什么变/没变。
+  ctx.logger.info('dsh-auto-pass: 规则写入 list=' + String(body.list) + ' scope=' + String(added.scope)
+    + ' replaced=' + String(added.replaced === true) + ' covered=' + String(added.covered === true)
+    + ' merged=' + String(added.merged ?? 0) + ' label=' + safeLogValue(String(added.rule.label ?? '')))
   writeJson(200, {
     ok: true,
     rule: added.rule,
     scope: added.scope,
     file: added.file,
+    // 名单里已有同一「工具 + 匹配条件」时这次是更新既有规则（不会留下两条）
+    replaced: added.replaced === true,
+    // 已有规则覆盖了这次动作：没有写入新条目，rule 指向那条已有规则
+    covered: added.covered === true,
+    // 这次写入顺带合并掉的窄规则条数（同一名单里不再有互相覆盖的两条）
+    merged: added.merged ?? 0,
     // 客户端据此说明这条规则是「审查时的模型建议」「现场模型优化」还是「精确签名兜底」
     optimizedBy: chosen?.optimizedBy ?? 'signature',
   })
 }
 
-/** 由记录构造规则字段；模型建议优先，否则精确签名。 */
+/**
+ * 由记录构造规则字段；**能覆盖本次动作的**模型建议优先，否则精确签名。
+ * 模型建议不覆盖本次动作时（例如把「精确签名」写成一句描述）一律丢弃，回落到精确签名。
+ */
 export function ruleFromRecord(record) {
   const suggested = record?.suggestedRule
-  if (suggested !== null && typeof suggested === 'object' && typeof suggested.tool === 'string') {
+  const signature = signatureFromRecord(record)
+  if (suggested !== null && typeof suggested === 'object' && typeof suggested.tool === 'string'
+    && suggestionUsable(suggested, signature)) {
     return {
       tool: suggested.tool,
       match: suggested.match,
@@ -488,14 +783,15 @@ export function ruleFromRecord(record) {
       cwd: record.cwd,
     }
   }
-  const signature = record?.signature
-  if (signature === undefined || typeof signature.key !== 'string') return undefined
+  if (signature === undefined) return undefined
+  // 兜底默认用命令前缀（2026-09-15 用户要求）：精确签名换个参数就命不中，前缀才耐用
+  const fallback = defaultRuleOf(signature)
+  const reason = suggested === undefined || suggested === null
+    ? '这条记录没有模型建议规则'
+    : '模型建议规则不覆盖本次动作，已忽略'
   return {
-    tool: signature.toolName,
-    match: { kind: 'signature', value: signature.key },
-    label: signature.text ?? signature.key,
-    source: 'user',
-    note: '精确到本次动作签名（这条记录没有模型建议规则）',
+    ...fallback,
+    note: (fallback.match.kind === 'command_prefix' ? '默认为命令前缀（' : '精确到本次动作签名（') + reason + '）',
     cwd: record.cwd,
   }
 }
@@ -514,6 +810,39 @@ export function exactRuleOf(signature) {
     label: signature.text ?? signature.key,
     source: 'user',
     note: '精确到这次动作的签名（没有模型建议，直接固化这一次）',
+  }
+}
+
+/**
+ * 命令前缀兜底：取这次动作的命令里「真正决定授权范围」的那一段——砍掉管道之后
+ * （只决定怎么显示输出）与结尾的纯输出重定向（`2>&1`）。
+ * @param {object|undefined} signature 权限签名
+ * @returns {string|undefined} 前缀；没有命令、或短到挡不住误放行（< MIN_PREFIX_CHARS）时 undefined
+ */
+export function commandPrefixOfSignature(signature) {
+  if (signature === undefined || signature === null) return undefined
+  const command = typeof signature.command === 'string' ? countingCommand(signature.command) : ''
+  return command.length >= MIN_PREFIX_CHARS ? command : undefined
+}
+
+/**
+ * 没有模型建议时的兜底规则（用户要求 2026-09-15：**默认用命令前缀**）。
+ * 精确签名把整条命令逐字钉死（换个 `-Last 30` 就命不中），而命令前缀覆盖同一命令族；
+ * 兜底前缀一定覆盖本次动作（前缀按分隔符切出来），因此总能通过 addRule 的校验。
+ * 动作没有命令（write / edit 之类）时退回精确签名——那时前缀条件根本用不上。
+ * @param {object|undefined} signature 权限签名
+ * @returns {object|undefined} 规则输入；拿不到签名时返回 undefined
+ */
+export function defaultRuleOf(signature) {
+  if (signature === undefined || signature === null) return undefined
+  const prefix = commandPrefixOfSignature(signature)
+  if (prefix === undefined) return exactRuleOf(signature)
+  return {
+    tool: signature.toolName,
+    match: { kind: 'command_prefix', value: prefix },
+    label: signature.toolName + ': ' + prefix,
+    source: 'user',
+    note: '默认为命令前缀（这条记录没有可用的模型建议规则）',
   }
 }
 
@@ -580,6 +909,7 @@ const HOST_MESSAGES = Object.freeze({
     criticalDowngrade: '宿主安全下限要求 critical 风险动作必须转交用户决定。',
     whitelisted: hit => '命中' + (hit.scope === 'project' ? '项目' : '全局') + '白名单，已直接放行：' + hit.label,
     blacklisted: hit => '命中' + (hit.scope === 'project' ? '项目' : '全局') + '黑名单，已直接转人工审批：' + hit.label,
+    blacklistRejected: hit => '命中' + (hit.scope === 'project' ? '项目' : '全局') + '黑名单，已直接拒绝（设置里开启了「黑名单直接拒绝」）：' + hit.label,
     ruleQuestionHeader: '权限记忆',
     ruleQuestion: parts => '这条权限已被连续' + (parts.list === 'allow' ? '通过' : '拒绝') + ' ' + String(parts.count)
       + ' 次：' + parts.signature.text + '\n将按这个匹配条件加入：' + parts.ruleText
@@ -592,6 +922,14 @@ const HOST_MESSAGES = Object.freeze({
     ruleAdded: parts => '已加入' + (parts.list === 'allow' ? '白名单' : '黑名单') + '（'
       + (parts.scope === 'project' ? '本项目' : '全局') + '）：' + parts.ruleText,
     highRiskDowngrade: '宿主安全下限要求 high 风险动作至少具有 medium 用户授权，本次已转交用户决定。',
+    deferNoteLabel: '自动审批：',
+    modelNoteLabel: '模型审批意见：',
+    rejectReasonHeader: '拒绝理由',
+    rejectReasonQuestion: parts => '这次调用被拒绝了（' + parts.toolName + '）。要不要给模型补一句拒绝理由？它会作为一行通知注入模型上下文。',
+    rejectReasonUseModel: '采用模型意见',
+    rejectReasonUseModelDetail: reason => '把这句话原样当作拒绝理由注入上下文：' + reason,
+    rejectReasonSkip: '不留言',
+    rejectReasonSkipDetail: '模型只知道这次被拒绝，不知道原因。',
   }),
   en: Object.freeze({
     missingAction: 'The exact tool call awaiting approval could not be found.',
@@ -611,6 +949,7 @@ const HOST_MESSAGES = Object.freeze({
     criticalDowngrade: 'The host safety floor requires critical-risk actions to be decided by the user.',
     whitelisted: hit => 'Matched the ' + hit.scope + ' whitelist and was allowed directly: ' + hit.label,
     blacklisted: hit => 'Matched the ' + hit.scope + ' blacklist and was handed to the user: ' + hit.label,
+    blacklistRejected: hit => 'Matched the ' + hit.scope + ' blacklist and was rejected outright ("reject on denylist" is enabled in the settings): ' + hit.label,
     ruleQuestionHeader: 'Permission memory',
     ruleQuestion: parts => 'This permission was ' + (parts.list === 'allow' ? 'approved' : 'denied') + ' '
       + String(parts.count) + ' times in a row: ' + parts.signature.text
@@ -624,6 +963,14 @@ const HOST_MESSAGES = Object.freeze({
     ruleAdded: parts => 'Added to the ' + (parts.list === 'allow' ? 'allowlist' : 'denylist') + ' ('
       + (parts.scope === 'project' ? 'this project' : 'global') + '): ' + parts.ruleText,
     highRiskDowngrade: 'The host safety floor requires at least medium user authorization for high-risk actions; the request was handed to the user.',
+    deferNoteLabel: 'Auto Approve: ',
+    modelNoteLabel: 'Model review: ',
+    rejectReasonHeader: 'Rejection reason',
+    rejectReasonQuestion: parts => 'You rejected this call (' + parts.toolName + '). Add a reason for the model? It is injected into the model context as one notice line.',
+    rejectReasonUseModel: 'Use the model opinion',
+    rejectReasonUseModelDetail: reason => 'Inject this model review note verbatim as the rejection reason: ' + reason,
+    rejectReasonSkip: 'No comment',
+    rejectReasonSkipDetail: 'The model only learns that the call was rejected, not why.',
   }),
 })
 
@@ -688,9 +1035,20 @@ function isHanCharacter(codePoint) {
     || (codePoint >= 0x20000 && codePoint <= 0x323af)
 }
 
-/** 创建可单测的 waterfall 监听器：插件只自动放行审查通过的请求。 */
+/**
+ * 创建可单测的 waterfall 监听器：插件只自动放行审查通过的请求。
+ * 三个界面开关在这里生效：notice（是否把审批结果注入模型上下文）、
+ * denyDirect（命中黑名单时直接返回 rejected，而不是转人工）、
+ * askRejectReason（人工拒绝后追问一句拒绝理由）。
+ */
 export function createAutoApprovalHandler(ctx, config, records = noopRecordStore, policies = noopPolicyStore) {
   return async (request, next) => {
+    // 设置页的行为开关必须在**每次审批时**读取：① 用户在设置里一改就立刻生效，不需要重启；
+    // ② 绝不能提到 handler 外面求值——那是插件加载期，settings 服务往往还没就绪
+    // （`installSettings` 在 `apply()` 里排在本 handler 创建之后），开关会静默退回默认值。
+    const noticeEnabled = effectiveNotice(ctx, config)
+    const denyDirect = effectiveDenyDirect(ctx, config)
+    const askRejectReason = effectiveAskRejectReason(ctx, config)
     if (selectedPermissionPreset(request.agent.session) !== 'auto-approve') {
       return next()
     }
@@ -700,6 +1058,17 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
     const startedAt = Date.now()
     // 同一签名同一名单只挂一个问题：等待回答期间不再重复询问
     const pendingSuggestions = new Set()
+    // 追问理由与规则确认都要问用户，走同一个**串行队列**：一次只挂一张问题卡，
+    // 避免两张卡同时抢占输入框（用户要求「改成串行」）。队列只是旁路：
+    // 不 await、不影响审批结论，链上任何失败只记日志、不阻塞后面的问题。
+    let askQueue = Promise.resolve()
+    const enqueueAsk = (label, task) => {
+      const run = () => Promise.resolve().then(task)
+      askQueue = askQueue.then(run, run).then(undefined, error => {
+        ctx.logger.warn('dsh-auto-pass: ' + label + '流程异常：' + errorMessage(error))
+      })
+      return askQueue
+    }
 
     const action = exactAction(request)
     // 权限签名：与调用 id、时间无关，是「相似权限」的判定单位，也是权限记忆的计数键。
@@ -707,10 +1076,15 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
     // 一旦参与记忆，几次人工放行后就会把它们一起自动放行——宁可不记。
     const signature = action === undefined ? undefined : signatureOf(request, action)
     const cwd = action?.cwd
-    // 收尾：先拿到最终结论（插件自动放行，或人工审批链的答复），更新权限记忆，再落一条记录。
-    // 记忆与记录都只是旁路，任何失败都不影响已经做出的审批结论。
-    const finish = async (outcome, decision) => {
+    // 收尾：先拿到最终结论（插件自动放行，或人工审批链的答复），把审批结果注入上下文，
+    // 更新权限记忆，再落一条记录。注入由设置页的开关控制；记忆与记录只是旁路，任何失败都不影响结论。
+    const finish = async (outcome, decision, notice) => {
       const settled = await outcome
+      // 通知写在这里而不是决策点：转人工时此时才拿到人工链的最终结论（批准 / 拒绝 / 无人应答），
+      // 注入的正文才能带上「最终结果」；关掉开关就什么都不注入（模型完全看不到审批发生过）。
+      if (noticeEnabled === true && notice !== undefined) {
+        injectReviewNotice(ctx, request, { notice, settled, decision, language })
+      }
       const observed = observeDecision(ctx, policies, { signature, cwd, settled, decision })
       let record
       try {
@@ -719,14 +1093,28 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
         // 记录只是旁路：写失败也绝不能让已经做出的审批结论变形
         ctx.logger.warn('dsh-auto-pass: 审批记录写入失败：' + errorMessage(error))
       }
+      // 人工拒绝后追问一句拒绝理由（默认开，设置页可关）。结果那行**已经**注入过了，
+      // 这里只负责补第二行并把理由回写进记录；不 await，绝不拖住这次工具调用的结论。
+      // **只受 `askRejectReason` 控制、不被 `notice` 总开关连带**（用户 2026-09-15 明确要求）：
+      // 关掉「注入审批结果」时结果行不注入，但人工写的理由照问、照补一行。
+      if (askRejectReason === true
+        && settled === 'rejected' && decisionSource(settled, decision) === 'human') {
+        void enqueueAsk('追问拒绝理由', () => askRejectionReason(ctx, request, {
+          language,
+          decision,
+          recordId: record?.id,
+          records,
+        }))
+      }
       // 达到阈值 → 先让模型优化规则，再询问用户是否加入名单。整条流程是**旁路**：
       // 在审批结论已经确定之后异步执行，既不改变结论，也不阻塞这次工具调用。
+      // 它排在「拒绝理由追问」之后（同一个串行队列），两者不会同时弹卡。
       const suggestion = observed.suggestion
       if (suggestion !== null && suggestion !== undefined) {
         const pendingKey = suggestion.list + '\u0000' + String(signature?.key)
         if (!pendingSuggestions.has(pendingKey)) {
           pendingSuggestions.add(pendingKey)
-          void proposeRule(ctx, policies, records, request, {
+          void enqueueAsk('规则确认', () => proposeRule(ctx, policies, records, request, {
             config,
             language,
             cwd,
@@ -734,8 +1122,7 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
             suggestion,
             decision,
             recordId: record?.id,
-          }).catch(error => ctx.logger.warn('dsh-auto-pass: 规则确认流程异常：' + errorMessage(error)))
-            .finally(() => pendingSuggestions.delete(pendingKey))
+          })).finally(() => pendingSuggestions.delete(pendingKey))
         }
       }
       return settled
@@ -743,20 +1130,33 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
     if (action === undefined) {
       return deferWithoutReview(ctx, request, messages.missingAction, next, language, finish)
     }
-    // 名单优先于模型审查：黑名单直接交回人工审批链（不烧模型），白名单与记忆规则直接放行。
+    // 名单优先于模型审查：黑名单直接拒绝或交回人工审批链（不烧模型），白名单与记忆规则直接放行。
     const hit = policies.match({ signature, cwd })
     if (hit !== undefined) {
       ctx.logger.info('dsh-auto-pass: 策略命中 list=' + hit.list + ' scope=' + hit.scope
         + ' rule=' + String(hit.rule.id) + ' tool=' + request.toolName)
       const policyHit = describeHit(hit)
       if (hit.list === 'deny') {
+        // 设置页打开了「黑名单直接拒绝」：不给人工审批卡，直接把这次调用判为拒绝
+        if (denyDirect === true) {
+          const rationale = messages.blacklistRejected(policyHit)
+          ctx.logger.info('dsh-auto-pass: 黑名单直接拒绝（设置已开启）tool=' + request.toolName
+            + ' rule=' + String(hit.rule.id))
+          attachReviewNote(request, rationale, messages)
+          return finish('rejected',
+            { verdict: 'blacklist-reject', rationale, steps: 0, policyHit },
+            { outcome: 'defer', rejected: true, steps: 0, rationale, policyHit })
+        }
         const rationale = messages.blacklisted(policyHit)
-        injectReviewNotice(ctx, request, { outcome: 'defer', steps: 0, rationale, policyHit }, language)
-        return finish(next(), { verdict: 'defer', rationale, steps: 0, policyHit })
+        attachReviewNote(request, rationale, messages)
+        return finish(next(),
+          { verdict: 'defer', rationale, steps: 0, policyHit },
+          { outcome: 'defer', steps: 0, rationale, policyHit })
       }
       const rationale = messages.whitelisted(policyHit)
-      injectReviewNotice(ctx, request, { outcome: 'allow', steps: 0, rationale, policyHit }, language)
-      return finish('allowed-once', { verdict: 'allow', rationale, steps: 0, policyHit })
+      return finish('allowed-once',
+        { verdict: 'allow', rationale, steps: 0, policyHit },
+        { outcome: 'allow', steps: 0, rationale, policyHit })
     }
     const actionJson = JSON.stringify(action)
     if (actionJson.length > config.maxActionChars) {
@@ -783,8 +1183,14 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
     // 统一落到函数末尾的转人工审批分支。decision 描述本次结论，用于写入审批记录。
     let assessment
     let decision
+    // 要注入上下文的那条通知（审查结论 / 风险 / 理由 / 命中名单）：审批结束后才真正注入
+    let notice
+    // 模型用量提到 try 外面：回复解析失败时这次调用其实已经烧掉 token，记录里要留痕
+    let usage
+    // 转人工时意见那一段的标签：只有模型真给出了结论才叫「模型审批意见」
+    let reviewNoteLabel = messages.deferNoteLabel
     try {
-      const reply = await callModelOnce(ctx, {
+      const result = await callModelOnce(ctx, {
         route,
         system: reviewSystems[language],
         prompt,
@@ -794,14 +1200,16 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
         purpose: REVIEW_PURPOSE,
         signal,
       })
+      usage = result.usage
+      reviewNoteLabel = messages.modelNoteLabel
       signal.throwIfAborted()
-      assessment = enforceHostPolicy(parseAssessment(parseJsonReply(reply, language), language), language)
+      assessment = enforceHostPolicy(parseAssessment(parseJsonReply(result.text, language), language), language)
 
       ctx.logger.info(
         `dsh-auto-pass: 审查完成 parentSession=${request.agent.session.id} `
         + `callId=${request.callId} mode=single-shot language=${language} `
         + `risk=${assessment.risk_level} authorization=${assessment.user_authorization} `
-        + `outcome=${assessment.outcome}`,
+        + `outcome=${assessment.outcome} tokens=${describeUsage(usage)}`,
       )
       decision = {
         verdict: assessment.outcome,
@@ -810,9 +1218,17 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
         rationale: assessment.rationale,
         steps: 0,
         route,
+        ...(usage === undefined ? {} : { usage }),
         ...(assessment.suggestedRule === undefined ? {} : { suggestedRule: assessment.suggestedRule }),
       }
-      injectReviewNotice(ctx, request, { ...assessment, route, steps: 0 }, language)
+      notice = {
+        outcome: assessment.outcome,
+        risk_level: assessment.risk_level,
+        user_authorization: assessment.user_authorization,
+        rationale: assessment.rationale,
+        route,
+        steps: 0,
+      }
     } catch (error) {
       if (request.signal?.aborted) return 'cancelled'
       const problem = signal.aborted && timeoutSignal.aborted
@@ -820,26 +1236,25 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
         : error instanceof Error ? error.message : String(error)
       ctx.logger.warn(
         `dsh-auto-pass: 审查未完成并转人工审批 parentSession=${request.agent.session.id} `
-        + `callId=${request.callId} reason=${safeLogValue(problem)}`,
+        + `callId=${request.callId} reason=${safeLogValue(problem)} tokens=${describeUsage(usage)}`,
       )
+      const rationale = messages.reviewFailed(problem)
       decision = {
         verdict: 'defer',
-        rationale: messages.reviewFailed(problem),
+        rationale,
         steps: 0,
         route,
+        ...(usage === undefined ? {} : { usage }),
       }
-      injectReviewNotice(ctx, request, {
-        outcome: 'defer',
-        route,
-        steps: 0,
-        rationale: messages.reviewFailed(problem),
-      }, language)
+      notice = { outcome: 'defer', route, steps: 0, rationale }
     }
 
     // 插件绝不代替用户拒绝：非 allow 的结论（模型 deny、宿主安全降级、审查失败）
     // 一律调用 next() 进入 DSH 原生人工审批链，把决定权交还用户。
-    if (decision?.verdict === 'allow') return finish('allowed-once', decision)
-    return finish(next(), decision ?? { verdict: 'defer' })
+    if (decision?.verdict === 'allow') return finish('allowed-once', decision, notice)
+    // 转人工：把模型意见（审查失败时是失败原因）带到审批卡上，用户不用回时间线找理由
+    attachReviewNote(request, decision?.rationale, messages, reviewNoteLabel)
+    return finish(next(), decision ?? { verdict: 'defer' }, notice)
   }
 }
 
@@ -858,23 +1273,20 @@ function describeHit(hit) {
 }
 
 /**
- * 这次结论是谁给的：插件自己自动放行的记 'auto'，其余（转交人工后通过/拒绝/无人应答）一律记 'human'。
- * 时间线与注入通知都用它显示「自动 / 人工」标签。
- */
-export function decisionSource(settled, decision) {
-  const pluginDecided = decision?.verdict === 'allow' || decision?.policyHit?.list === 'allow'
-  return pluginDecided && settled === 'allowed-once' ? 'auto' : 'human'
-}
-
-/**
- * 把一次审批结果翻译成计数信号。模型判定 deny 与人工拒绝都算「拒绝」，最终获准执行才算
- * 「通过」——插件自己放行的与用户放行的都算通过：两种路径都代表这次判断结果是「可以执行」。
- * 其余结果（cancelled / unavailable）不参与计数。
+ * 把一次审批结果翻译成计数信号。**最终结果优先**：最终获准执行（无论插件放行还是你点了
+ * 「允许一次」）都算「通过」，最终未被批准算「拒绝」；模型自己的判定只在没人拍板时才作数。
+ * 其余结果（cancelled / unavailable 且模型没判过 deny）不参与计数。
+ *
+ * 2026-09-15 修正（真机踩到）：旧实现把 `verdict === 'deny'` 放在最前面，于是「模型判 deny →
+ * 转人工 → 你点允许一次」被计成**连续被拒**，与函数自身注释（用户放行算通过）相反——
+ * 用户连续人工放行反而在攒黑名单计数，白名单永远攒不到阈值。
  */
 export function decisionSignal(settled, decision) {
-  if (decision?.verdict === 'deny') return 'reject'
-  if (settled === 'rejected') return 'reject'
+  // 最终获准执行 = 通过：这条必须排在模型判定之前，人工放行要能盖过模型的 deny
   if (settled === 'allowed-once') return 'pass'
+  if (settled === 'rejected') return 'reject'
+  // 没人拍板（无人应答 / 已取消）：模型明确判过 deny 的算一次未获批准；审查失败等不计数
+  if (decision?.verdict === 'deny') return 'reject'
   return undefined
 }
 
@@ -913,7 +1325,7 @@ function describeRuleText(rule, language) {
  * 规则优化调用的证据：这次要固化的动作 + 少量同类记录，让模型看清「相似命令」长什么样。
  * 只带签名文本与命令，不带参数原文，控制 token。
  */
-function buildRulePrompt({ signature, list, records }) {
+function buildRulePrompt({ signature, list, records, kind, draft }) {
   const recent = typeof records?.list === 'function'
     ? records.list()
       .filter(record => record.toolName === signature.toolName)
@@ -921,15 +1333,35 @@ function buildRulePrompt({ signature, list, records }) {
       .map(record => record.signature?.text)
       .filter(text => typeof text === 'string' && text !== '')
     : []
+  const kindText = MATCH_KINDS.includes(kind)
+    ? (RULE_KIND_LABELS[kind] ?? kind)
+    : undefined
+  // 默认匹配条件：有命令就给命令前缀（用户要求 2026-09-15），让模型照着抄而不是自己发明
+  const defaultPrefix = commandPrefixOfSignature(signature)
   return [
     '目标名单：' + (list === 'allow' ? '白名单（命中后直接放行）' : '黑名单（命中后直接转人工）'),
+    // 命令与路径都**显式给出**（没有就是空/ null）：模型据此判断哪种条件根本用不上，
+    // 而不是想当然地给一条命不中的规则（真机踩过：pwsh 命令记录被要求生成路径前缀）
     '这次的动作：' + JSON.stringify({
       tool: signature.toolName,
       signature: signature.key,
       text: signature.text,
-      ...(signature.command === undefined ? {} : { command: signature.command }),
-      ...(Array.isArray(signature.paths) && signature.paths.length > 0 ? { paths: signature.paths } : {}),
+      command: typeof signature.command === 'string' ? signature.command : null,
+      paths: Array.isArray(signature.paths) ? signature.paths : null,
     }),
+    ...(defaultPrefix === undefined
+      ? []
+      : ['默认匹配条件：command_prefix = ' + defaultPrefix + '（有命令就用它，除非用户下文指定了别的）']),
+    ...(kindText === undefined
+      ? []
+      : ['用户指定的匹配条件：' + kindText + '（match_kind 必须用 ' + kind + '，不要换成别的）']),
+    ...(draft === undefined || draft === null
+      ? []
+      : ['当前草稿（可以参考，也可以不用）：' + JSON.stringify({
+        match_kind: safeLogValue(String(draft.kind ?? ''), 40),
+        match_value: safeLogValue(String(draft.value ?? ''), 300),
+        label: safeLogValue(String(draft.label ?? ''), 120),
+      })]),
     ...(recent.length === 0 ? [] : ['同一工具的其他动作：' + JSON.stringify(recent)]),
   ].join('\n')
 }
@@ -942,22 +1374,41 @@ function buildRulePrompt({ signature, list, records }) {
  * @returns {Promise<object|undefined>} 规则建议
  */
 async function optimizeRule(ctx, options) {
-  const { request, config, language, signature, list, records } = options
+  const { request, config, language, signature, list, records, kind, draft } = options
   const route = resolveRoute(request, config)
   if (route === undefined) return undefined
   const signal = AbortSignal.timeout(config.timeoutMs)
   try {
-    const reply = await callModelOnce(ctx, {
+    const result = await callModelOnce(ctx, {
       route,
       system: ruleTemplate,
-      prompt: buildRulePrompt({ signature, list, records }),
+      prompt: buildRulePrompt({ signature, list, records, kind, draft }),
       maxTokens: config.maxOutputTokens,
       reasoningEffort: config.reviewerReasoningEffort,
       sessionId: request.sessionId ?? request.agent?.session?.id,
       purpose: RULE_PURPOSE,
       signal,
     })
-    return parseSuggestedRule(parseJsonReply(reply, language ?? 'zh'))
+    const parsed = parseSuggestedRule(parseJsonReply(result.text, language ?? 'zh'))
+    if (parsed === undefined) {
+      ctx.logger.warn('dsh-auto-pass: 规则优化结果不合法，已丢弃')
+      return undefined
+    }
+    // 用户点了某个匹配条件就必须是那个条件：模型擅自换 kind 直接判失败，
+    // 让客户端保留它按条件推导出来的值（宁可没有模型产出，也不要文不对题的条件）
+    if (MATCH_KINDS.includes(kind) && parsed.match.kind !== kind) {
+      ctx.logger.warn('dsh-auto-pass: 规则优化没按要求返回匹配条件 wanted=' + String(kind)
+        + ' got=' + safeLogValue(String(parsed.match.kind)))
+      return undefined
+    }
+    // 生成的条件至少要覆盖这次动作，否则写进名单也永远命不中（与 suggestionUsable 同一道闸）
+    if (suggestionUsable(parsed, signature) !== true) {
+      ctx.logger.warn('dsh-auto-pass: 规则优化结果不覆盖本次动作，已丢弃 kind='
+        + safeLogValue(String(parsed.match.kind)) + ' value=' + safeLogValue(String(parsed.match.value)))
+      return undefined
+    }
+    ctx.logger.info('dsh-auto-pass: 规则优化完成 tokens=' + describeUsage(result.usage))
+    return parsed
   } catch (error) {
     ctx.logger.warn('dsh-auto-pass: 规则优化调用失败：' + safeLogValue(errorMessage(error)))
     return undefined
@@ -987,9 +1438,16 @@ async function proposeRule(ctx, policies, records, request, options) {
     ctx.logger.warn('dsh-auto-pass: 没有 userQuestions 服务，跳过规则确认 signature=' + safeLogValue(signature.text))
     return
   }
-  // 匹配条件优先用本次审查里模型给出的建议（同一次调用产出，零额外开销）；
-  // 没有建议就直接用这次的精确签名 —— 不再为「固化」单起一次模型调用。
-  const rule = decision?.suggestedRule ?? exactRuleOf(signature)
+  // 匹配条件优先用本次审查里模型给出的建议（同一次调用产出，零额外开销），但**必须覆盖本次动作**；
+  // 建议不可用（或本来就没有）就用**命令前缀**兜底（用户要求 2026-09-15），
+  // 动作没有命令时才退回精确签名 —— 不再为「固化」单起一次模型调用。
+  const suggested = decision?.suggestedRule
+  const usable = suggested !== undefined && suggestionUsable(suggested, signature)
+  if (suggested !== undefined && usable !== true) {
+    ctx.logger.warn('dsh-auto-pass: 规则确认忽略不覆盖本次动作的模型建议 kind='
+      + safeLogValue(String(suggested.match?.kind)) + ' value=' + safeLogValue(String(suggested.match?.value)))
+  }
+  const rule = (usable === true ? suggested : undefined) ?? defaultRuleOf(signature)
   if (rule === undefined) {
     ctx.logger.warn('dsh-auto-pass: 没有可用的匹配条件，跳过规则确认 signature=' + safeLogValue(signature.text))
     return
@@ -1052,18 +1510,111 @@ async function proposeRule(ctx, policies, records, request, options) {
     ruleApplied: { scope: added.scope, list: suggestion.list, label: rule.label, ruleId: added.rule.id },
   })
   ctx.logger.info('dsh-auto-pass: 用户确认后已写入规则 list=' + suggestion.list + ' scope=' + added.scope
-    + ' label=' + safeLogValue(rule.label))
+    + ' replaced=' + String(added.replaced === true) + ' covered=' + String(added.covered === true)
+    + ' merged=' + String(added.merged ?? 0) + ' label=' + safeLogValue(rule.label))
 }
 
-/** 不进入模型审查的请求：记录转交理由后直接交给后续人工审批器。 */
+/** 追问「拒绝理由」的问题 id：客户端按它取回答（自由文本优先，其次按选项 label 精确匹配）。 */
+const REJECT_REASON_QUESTION_ID = 'dsh-auto-pass:reject-reason'
+/** 模型意见在选项 label 里的展示上限：太长会把选项撑爆，注入正文仍按通知上限裁剪。 */
+const MAX_REJECT_REASON_OPTION_CHARS = 60
+
+/**
+ * 人工拒绝后追问一句拒绝理由（用户要求，2026-09-15）。
+ * 选项第一项默认「采用模型意见」——点一下就把这次审查的理由带进上下文；也可以自己写
+ * （原生问题卡带自由文本框），或选「不留言」。整条流程是**旁路**：结果那行在 finish 里已经
+ * 注入过了，这里只补第二行并把理由回写进审批记录；问不到人、用户不答、写记录失败都只记日志，
+ * 绝不影响已经做出的审批结论。
+ * @param {object} ctx 宿主上下文
+ * @param {object} request 审批请求（用它的 agent 与 toolName）
+ * @param {object} options language / decision（取模型意见）/ recordId / records
+ */
+async function askRejectionReason(ctx, request, options) {
+  const { language, decision, recordId, records } = options
+  const messages = HOST_MESSAGES[language]
+  const userQuestions = typeof ctx.get === 'function' ? ctx.get('userQuestions') : undefined
+  if (userQuestions === undefined || typeof userQuestions.ask !== 'function') {
+    ctx.logger.warn('dsh-auto-pass: 没有 userQuestions 服务，跳过拒绝理由追问')
+    return
+  }
+  // 默认选项引用本次审查的模型意见；审查失败 / 命中名单这类没有意见的路径只留「不留言」
+  const modelReason = String(decision?.rationale ?? '').trim()
+  const choices = []
+  if (modelReason !== '') {
+    choices.push({
+      value: modelReason,
+      label: messages.rejectReasonUseModel + '：' + truncateText(modelReason, MAX_REJECT_REASON_OPTION_CHARS),
+      description: messages.rejectReasonUseModelDetail(truncateText(modelReason, MAX_APPROVAL_NOTE_CHARS)),
+    })
+  }
+  choices.push({
+    value: '',
+    label: messages.rejectReasonSkip,
+    description: messages.rejectReasonSkipDetail,
+  })
+  let answer
+  try {
+    answer = await userQuestions.ask({
+      questions: [{
+        id: REJECT_REASON_QUESTION_ID,
+        header: messages.rejectReasonHeader,
+        question: messages.rejectReasonQuestion({ toolName: String(request.toolName ?? '') }),
+        options: choices.map(choice => ({ label: choice.label, description: choice.description })),
+      }],
+      agent: request.agent,
+    })
+  } catch (error) {
+    // 与规则确认同一条姿态：问不到人（子 Agent / 没有应答器 / 调用已中止）只记日志
+    ctx.logger.warn('dsh-auto-pass: 拒绝理由未能送达用户：' + safeLogValue(errorMessage(error)))
+    return
+  }
+  const entry = answer?.answers?.find(item => item.id === REJECT_REASON_QUESTION_ID)
+  const custom = String(entry?.custom ?? '').trim()
+  const selected = Array.isArray(entry?.selected) ? entry.selected : []
+  const chosen = choices.find(choice => selected.includes(choice.label))
+  // 自由文本优先：原生问题卡在有自定义答案时会把 selected 清空，只把文本放进 custom
+  const reason = custom !== '' ? custom : String(chosen?.value ?? '')
+  if (reason === '') {
+    ctx.logger.info('dsh-auto-pass: 用户没有留下拒绝理由')
+    return
+  }
+  injectReasonNotice(ctx, request, { reason, language })
+  updateRecord(ctx, records, recordId, { rejectReason: reason })
+  ctx.logger.info('dsh-auto-pass: 已注入人工拒绝理由 chars=' + String(reason.length))
+}
+
+/**
+ * 转人工时把审查意见写进审批请求的 `reason`：DSH 人工审批卡的首行渲染的就是它
+ * （`dsh-client-ui-approval` 的 `headline = pending.reason ?? 默认文案`）。`request` 在
+ * waterfall 里始终是同一个对象引用，而 `dsh-api-remotes` 要到 `next()` 之后才把请求推进
+ * 转发队列并序列化，所以在调用 `next()` 之前就地改写一定生效。注意 `approval/asked`
+ * 会话事件里的 reason 是 `ApprovalService.request()` 在 `decide()` 之前写的原文，不受影响。
+ * 版式是「调用方原文 + 空行 + 带标签的意见」：卡片首行的换行由客户端半注入的 CSS 打开
+ * （`white-space: pre-wrap`），所以这里直接用 `\n\n` 分段；调用方原本没给原文时只写意见那段。
+ * @param {object} request 审批请求（就地改写 reason）
+ * @param {string} note 审查意见（模型理由，或转人工的理由）
+ * @param {object} messages 当前语言的文案表
+ * @param {string} [label] 意见那一段的标签，缺省是「自动审批：」
+ */
+function attachReviewNote(request, note, messages, label) {
+  const text = String(note ?? '').trim()
+  if (text === '') return
+  // 意见那一段过长会把原文挤出视野，按上限截断
+  const clipped = text.length > MAX_APPROVAL_NOTE_CHARS
+    ? text.slice(0, MAX_APPROVAL_NOTE_CHARS) + '…'
+    : text
+  const block = (label ?? messages.deferNoteLabel) + clipped
+  const existing = typeof request.reason === 'string' ? request.reason.trim() : ''
+  request.reason = existing === '' ? block : existing + '\n\n' + block
+}
+
+/** 不进入模型审查的请求：记录转交理由后直接交给后续人工审批器（通知由 finish 在拿到结论后注入）。 */
 function deferWithoutReview(ctx, request, reason, next, language, finish) {
+  const messages = HOST_MESSAGES[language]
   ctx.logger.warn(`dsh-auto-pass: ${reason} 已转人工审批`)
-  injectReviewNotice(ctx, request, {
-    outcome: 'defer',
-    steps: 0,
-    rationale: reason,
-  }, language)
-  return finish(next(), { verdict: 'defer', rationale: reason, steps: 0 })
+  attachReviewNote(request, reason, messages)
+  return finish(next(), { verdict: 'defer', rationale: reason, steps: 0 },
+    { outcome: 'defer', steps: 0, rationale: reason })
 }
 
 /** 组装一条审批记录：动作参数裁剪到上限，其余字段原样保留。 */
@@ -1075,7 +1626,9 @@ function buildRecord(request, action, outcome, decision, latencyMs, signature, o
     sessionId: request.agent.session.id,
     callId: request.callId,
     toolName: request.toolName,
+    // 第几轮第几步：来自本次动作对应的 tool/call（ptc 档位从父调用补齐），时间线据此定位到具体那一步
     turn: action?.turn,
+    step: action?.step,
     cwd: action?.cwd,
     reason: request.reason,
     verdict: decision.verdict,
@@ -1100,6 +1653,8 @@ function buildRecord(request, action, outcome, decision, latencyMs, signature, o
       ...(signature.paths === undefined || signature.paths.length === 0 ? {} : { paths: [...signature.paths] }),
     } }),
     ...(decision.suggestedRule === undefined ? {} : { suggestedRule: decision.suggestedRule }),
+    // 这次审查消耗的 token（时间线展示；拿不到用量时字段不存在）
+    ...(decision.usage === undefined ? {} : { usage: decision.usage }),
     ...(decision.policyHit === undefined ? {} : { policy: decision.policyHit }),
     ...(observed?.promoted === null || observed?.promoted === undefined
       ? {}
@@ -1192,11 +1747,11 @@ function resolveRoute(request, config) {
 }
 
 /**
- * 单轮模型调用（**不起子代理**）：一次 llm.stream，把回复里的文本拼起来返回。
+ * 单轮模型调用（**不起子代理**）：一次 llm.stream，把回复文本与 token 用量一起返回。
  * 审查与规则优化共用它；任何失败都抛错，由调用方把这次审批转人工。
  * @param {object} ctx 宿主上下文
  * @param {object} options route / system / prompt / maxTokens / reasoningEffort / sessionId / purpose / signal
- * @returns {Promise<string>} 模型回复的纯文本
+ * @returns {Promise<{text: string, usage: object|undefined}>} 回复文本与规范化后的用量
  */
 async function callModelOnce(ctx, options) {
   const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
@@ -1229,7 +1784,38 @@ async function callModelOnce(ctx, options) {
     .join('\n')
     .trim()
   if (text === '') throw new Error('模型没有返回任何文本')
-  return text
+  // 用量来自 stream 的 usage 块（BlockAssembler 收在 assembler.usage 上）；提供方不给就是 undefined
+  return { text, usage: normalizeUsage(assembler.usage) }
+}
+
+/**
+ * 规范化模型用量：只保留 USAGE_FIELDS 里的有限数字。
+ * @param {object|undefined} usage assembler.usage 的原始值
+ * @returns {object|undefined} 规范后的用量；一个可用字段都没有时返回 undefined
+ */
+function normalizeUsage(usage) {
+  if (usage === null || typeof usage !== 'object') return undefined
+  const normalized = {}
+  for (const field of USAGE_FIELDS) {
+    const value = usage[field]
+    if (typeof value === 'number' && Number.isFinite(value)) normalized[field] = value
+  }
+  return Object.keys(normalized).length === 0 ? undefined : normalized
+}
+
+/**
+ * 把用量压成一段日志文本，例如 `in=1200 out=40 cacheRead=800`。
+ * @param {object|undefined} usage 规范化后的用量
+ * @returns {string} 日志片段；没有用量时是 `.`
+ */
+function describeUsage(usage) {
+  if (usage === undefined) return '.'
+  const parts = []
+  if (usage.inputTokens !== undefined) parts.push('in=' + String(usage.inputTokens))
+  if (usage.outputTokens !== undefined) parts.push('out=' + String(usage.outputTokens))
+  if (usage.cacheReadTokens !== undefined) parts.push('cacheRead=' + String(usage.cacheReadTokens))
+  if (usage.reasoningTokens !== undefined) parts.push('reasoning=' + String(usage.reasoningTokens))
+  return parts.length === 0 ? '.' : parts.join(' ')
 }
 
 /**
@@ -1419,8 +2005,15 @@ const NOTICE_LABELS = Object.freeze({
   zh: Object.freeze({
     allowedHeadline: toolName => `自动审批 已自动批准 ${toolName}`,
     deferredHeadline: toolName => `自动审批 未自动批准 ${toolName}，已转交你审批`,
-    summaryAllowed: '自动审批：允许',
-    summaryDeferred: '自动审批：转交人工审批',
+    rejectedHeadline: toolName => `自动审批 已直接拒绝 ${toolName}（命中黑名单）`,
+    summaryAllowed: '自动审批：已批准',
+    summaryDeferred: '自动审批：已转人工审批',
+    summaryRejected: '自动审批：已直接拒绝',
+    resultApproved: '已批准',
+    resultRejected: '已拒绝',
+    resultCancelled: '已取消',
+    resultUnavailable: '无人应答',
+    finalResult: '最终结果：',
     riskAuth: (risk, authorization) => `${risk}/${authorization}`,
     steps: steps => `${steps} 步`,
     rationale: '理由：',
@@ -1429,12 +2022,21 @@ const NOTICE_LABELS = Object.freeze({
     tagHuman: '人工',
     whitelist: '白名单',
     denylist: '黑名单',
+    reasonHeadline: '人工拒绝理由',
+    summaryReason: '自动审批：拒绝理由',
   }),
   en: Object.freeze({
     allowedHeadline: toolName => `Auto Approve allowed ${toolName}`,
     deferredHeadline: toolName => `Auto Approve did not allow ${toolName}; handed to you`,
-    summaryAllowed: 'Auto Approve: allowed',
-    summaryDeferred: 'Auto Approve: deferred to the user',
+    rejectedHeadline: toolName => `Auto Approve rejected ${toolName} outright (denylist)`,
+    summaryAllowed: 'Auto Approve: approved',
+    summaryDeferred: 'Auto Approve: handed to the user',
+    summaryRejected: 'Auto Approve: rejected outright',
+    resultApproved: 'approved',
+    resultRejected: 'rejected',
+    resultCancelled: 'cancelled',
+    resultUnavailable: 'no answerer',
+    finalResult: 'final result：',
     riskAuth: (risk, authorization) => `${risk}/${authorization}`,
     steps: steps => `${steps} steps`,
     rationale: 'Rationale: ',
@@ -1443,53 +2045,121 @@ const NOTICE_LABELS = Object.freeze({
     tagHuman: 'human',
     whitelist: 'allowlist',
     denylist: 'denylist',
+    reasonHeadline: 'rejection reason from the user',
+    summaryReason: 'Auto Approve: rejection reason',
   }),
 })
 
 /**
- * 把安全摘要加入父 Agent；完整调查过程保留在 Reviewer 子 session。
- *
- * 正文**只有一行**：这条通知会真的进入模型上下文，所以只保留「结论 + 工具 + 风险/授权 + 步数 + 理由摘要」；
- * Reviewer 会话、建议规则、命中规则全文都留在审批时间线与宿主日志里，不塞进上下文。
+ * 这次结论是谁给的：插件自己决定（自动放行、或开启「黑名单直接拒绝」后的直接拒绝）记 'auto'，
+ * 其余（转交人工后的通过 / 拒绝 / 无人应答）记 'human'。时间线与注入通知都用它显示「自动 / 人工」。
  */
-function injectReviewNotice(ctx, request, review, language) {
+export function decisionSource(settled, decision) {
+  // 黑名单直接拒绝是**插件自己**判的：没有人参与，所以它必须落 'auto'。
+  // （曾经的写法把这种记录算成 'human'，与上面的注释相反——2026-09-15 修正。）
+  if (decision?.verdict === 'blacklist-reject') return 'auto'
+  const pluginDecided = decision?.verdict === 'allow' || decision?.policyHit?.list === 'allow'
+  return pluginDecided && settled === 'allowed-once' ? 'auto' : 'human'
+}
+
+/**
+ * 最终结果文案：转人工的记录等人工链给出结论后再算，所以注入通知能写出「最终结果是批准还是拒绝」。
+ * 拿不到已知结论（cancelled / unavailable / 老记录）时按闭集里的原值回落到中性文案。
+ */
+function finalResultText(settled, decision, labels) {
+  if (decision?.verdict === 'blacklist-reject') return labels.resultRejected
+  if (settled === 'allowed-once') return labels.resultApproved
+  if (settled === 'rejected') return labels.resultRejected
+  if (settled === 'cancelled') return labels.resultCancelled
+  if (settled === 'unavailable') return labels.resultUnavailable
+  return String(settled)
+}
+
+/**
+ * 把一次审批的结果压成一行加进父 Agent 上下文。
+ *
+ * 正文**只有一行**，因为这条通知会真的进入模型上下文：第一段是「谁、怎么决定的」（标签 + 结论 + 工具），
+ * 第二段是审批理由，第三段是**最终结果**（转人工的记录要等人工审批有结论后才会注入，所以这里能看到
+ * 人工最终是批准还是拒绝）。命中规则全文、Reviewer 会话等细节留在审批时间线与宿主日志里。
+ * @param {object} ctx 宿主上下文
+ * @param {object} request 审批请求（用它的 agent.inject 与 toolName）
+ * @param {object} options notice（工具名/结论/理由/命中/风险等）、settled（闭集结论）、decision、language
+ */
+function injectReviewNotice(ctx, request, options) {
+  const { notice, settled, decision, language } = options
   const labels = NOTICE_LABELS[language]
-  // 只有 allow 是插件自己给出的结论，其余（deny / defer）都是转交用户处理。
-  const allowed = review.outcome === 'allow'
-  const rationale = review.rationale.length <= MAX_NOTICE_REASON_CHARS
-    ? review.rationale
-    : `${review.rationale.slice(0, MAX_NOTICE_REASON_CHARS - 1)}…`
-  // 一个标签同时用在正文与折叠标题上：命中名单时带上名单，再带决策来源（自动 / 人工）
-  const hitTag = review.policyHit === undefined
+  // 最终结论由闭集返回值决定：只有 allowed-once 是「批准」，其余都是没有放行
+  const approved = settled === 'allowed-once'
+  const byAuto = decisionSource(settled, decision) === 'auto'
+  const rationale = truncateText(String(notice.rationale ?? ''), MAX_NOTICE_REASON_CHARS)
+  const hitTag = notice.policyHit === undefined
     ? ''
-    : (review.policyHit.list === 'allow' ? labels.whitelist : labels.denylist) + '·'
-  const tag = '[' + hitTag + (allowed ? labels.tagAuto : labels.tagHuman) + ']'
+    : (notice.policyHit.list === 'allow' ? labels.whitelist : labels.denylist) + '·'
+  const tag = '[' + hitTag + (byAuto ? labels.tagAuto : labels.tagHuman) + ']'
+  const headline = notice.rejected === true
+    ? labels.rejectedHeadline(request.toolName)
+    : (notice.outcome === 'allow'
+      ? labels.allowedHeadline(request.toolName)
+      : labels.deferredHeadline(request.toolName))
   const parts = [
-    tag + ' ' + (allowed ? labels.allowedHeadline(request.toolName) : labels.deferredHeadline(request.toolName)),
-    ...(review.policyHit === undefined
+    tag + ' ' + headline,
+    ...(notice.policyHit === undefined
       ? []
-      : [labels.policy + review.policyHit.list + ' · ' + String(review.policyHit.label ?? '')]),
-    ...(review.risk_level === undefined && review.user_authorization === undefined
+      : [labels.policy + notice.policyHit.list + ' · ' + String(notice.policyHit.label ?? '')]),
+    ...(notice.risk_level === undefined && notice.user_authorization === undefined
       ? []
-      : [labels.riskAuth(String(review.risk_level ?? '?'), String(review.user_authorization ?? '?'))]),
-    ...(review.steps === undefined ? [] : [labels.steps(review.steps)]),
+      : [labels.riskAuth(String(notice.risk_level ?? '?'), String(notice.user_authorization ?? '?'))]),
+    ...(notice.steps === undefined ? [] : [labels.steps(notice.steps)]),
+    // 最终结果：转人工的请求等人工链给出结论后才注入，所以这里能看到「人工批准 / 人工拒绝」
+    labels.finalResult + finalResultText(settled, decision, labels),
+    labels.rationale + rationale,
   ]
-  const details = [truncateText(parts.join(' · ') + ' · ' + labels.rationale + rationale, MAX_NOTICE_LINE_CHARS)]
   try {
     request.agent.inject({
       id: randomUUID(),
       role: 'user',
-      content: [{ type: 'text', text: details.join('\n') }],
+      content: [{ type: 'text', text: truncateText(parts.join(' · '), MAX_NOTICE_LINE_CHARS) }],
       source: {
         kind: 'plugin',
         plugin: 'dsh-auto-pass',
         form: 'notice',
-        // 折叠标题也带同一个标签（用户要求两处一致）
-        summary: tag + ' ' + (allowed ? labels.summaryAllowed : labels.summaryDeferred),
+        // 折叠标题与正文用同一个标签；状态词按最终结果给（已批准 / 已拒绝 / 已转人工审批）
+        summary: tag + ' ' + (notice.rejected === true
+          ? labels.summaryRejected
+          : approved ? labels.summaryAllowed : labels.summaryDeferred),
       },
     })
   } catch (error) {
     ctx.logger.warn(`dsh-auto-pass: 无法把审查通知加入会话：${safeLogValue(errorMessage(error))}`)
+  }
+}
+
+/**
+ * 把人工补的拒绝理由压成一行加进父 Agent 上下文。
+ * 与结果那行**分开**注入（用户选择「先给结果、理由到了再补一行」），所以这里不阻塞工具调用；
+ * 只有明确的人工拒绝才会走到这里，notice 开关关掉时调用方根本不会调用它。
+ * @param {object} ctx 宿主上下文
+ * @param {object} request 审批请求（用它的 agent.inject）
+ * @param {object} options reason（人工写/选的原文）、language
+ */
+function injectReasonNotice(ctx, request, options) {
+  const { reason, language } = options
+  const labels = NOTICE_LABELS[language]
+  const text = '[' + labels.tagHuman + '] ' + labels.reasonHeadline + '：' + truncateText(String(reason), MAX_NOTICE_REASON_CHARS)
+  try {
+    request.agent.inject({
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text: truncateText(text, MAX_NOTICE_LINE_CHARS) }],
+      source: {
+        kind: 'plugin',
+        plugin: 'dsh-auto-pass',
+        form: 'notice',
+        summary: '[' + labels.tagHuman + '] ' + labels.summaryReason,
+      },
+    })
+  } catch (error) {
+    ctx.logger.warn('dsh-auto-pass: 无法把拒绝理由加入会话：' + safeLogValue(errorMessage(error)))
   }
 }
 

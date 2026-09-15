@@ -19,6 +19,7 @@ import {
   resolveConfig,
   resolveReviewLanguage,
 } from '../src/index.js'
+import { signatureOf } from '../src/policy.js'
 
 // 单轮调用要用 DSH 的 llm 模块（消息构造器 + 流式装配器）。测试环境里没有这个包，
 // 用工厂 mock 顶掉：装配器只认本套测试产出的文本块。
@@ -32,6 +33,8 @@ vi.mock('@deepseek-ai/dsh-llm', () => ({
     push(chunk) {
       if (typeof chunk === 'string') this.parts.push(chunk)
       else if (chunk !== null && typeof chunk === 'object' && chunk.text !== undefined) this.parts.push(String(chunk.text))
+      // 真实的 BlockAssembler 也这样收 usage 块：留在 this.usage 上供调用方读取
+      else if (chunk !== null && typeof chunk === 'object' && chunk.usage !== undefined) this.usage = chunk.usage
     }
 
     blocks() {
@@ -125,6 +128,13 @@ function requestWith(preset = 'auto-approve', overrides = {}) {
   }
 }
 
+/**
+ * 等一轮宏任务：拒绝理由追问是**旁路**注入（finish 不 await 它），断言注入结果前要让它跑完。
+ */
+function flush() {
+  return new Promise(resolve => setTimeout(resolve, 0))
+}
+
 function languageSession(messages, extraEvents = []) {
   const events = [
     ...messages.map((text, index) => event('user/message', {
@@ -170,12 +180,17 @@ function reviewerRun(structured, overrides = {}) {
 /** 把旧的 reviewerRun(...) 写法转成「模型回复 JSON」的取数函数。 */
 function toReply(item) {
   if (typeof item === 'string' || item instanceof Error) return item
+  // 直接给 { text, usage }：拿它当模型回复原文（用于「有用量但回复不合法」这类用例）
+  if (item !== null && typeof item === 'object' && typeof item.text === 'string') return () => item
   return async () => {
     const result = await item.result
     if (result?.stopReason !== undefined && result.stopReason !== 'completed') {
       throw new Error('模型调用未正常结束：' + result.stopReason)
     }
-    return JSON.stringify(result?.structured ?? {})
+    const text = JSON.stringify(result?.structured ?? {})
+    // reviewerRun 可以带 usage：交给 stream 变成一次 usage 块，覆盖「记录 token 消耗」的路径
+    const usage = item.usage ?? result?.usage
+    return usage === undefined ? text : { text, usage }
   }
 }
 
@@ -183,7 +198,7 @@ function toReply(item) {
  * 假宿主：llm 服务按顺序吐出排练好的回复。
  * 每个条目可以是字符串（模型回复）、Error（调用失败），或沿用旧的 reviewerRun(...)（转成 JSON 回复）。
  */
-function contextWith(replies) {
+function contextWith(replies, options = {}) {
   const queue = (Array.isArray(replies) ? [...replies] : [replies]).map(toReply)
   const calls = []
   const llm = {
@@ -193,6 +208,12 @@ function contextWith(replies) {
       return (async function* () {
         const value = typeof next === 'function' ? await next() : next
         if (value instanceof Error) throw value
+        // 排练项可以是纯文本，也可以是 { text, usage }（带 token 用量）
+        if (value !== null && typeof value === 'object' && typeof value.text === 'string') {
+          yield { text: value.text }
+          if (value.usage !== undefined) yield { usage: value.usage }
+          return
+        }
         yield { text: value }
       })()
     },
@@ -205,7 +226,13 @@ function contextWith(replies) {
         ? { resolve: () => ({ mode: 'workspace-write' }) }
         : name === 'approval'
           ? { config: { policy: 'ask' }, overrideOf: () => undefined }
-          : undefined),
+          // 设置命名空间（options.settings 给了就当作宿主已注册，用来验证行为开关）
+          : name === 'settings' && options.settings !== undefined
+            ? { get: () => options.settings }
+            // 人工追问通道（规则确认 / 拒绝理由追问）：给了就当作有人在应答
+            : name === 'userQuestions' && options.userQuestions !== undefined
+              ? options.userQuestions
+              : undefined),
     logger: { info: vi.fn(), warn: vi.fn() },
   }
 }
@@ -316,10 +343,12 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(notice.content[0].text.startsWith('[自动]')).toBe(true)
     expect(notice.content[0].text).toContain('自动审批 已自动批准 bash')
     expect(notice.content[0].text).toContain('low/high')
+    // 自动放行的结果当场就有了：正文要写明「最终结果：已批准」
+    expect(notice.content[0].text).toContain('最终结果：已批准')
     expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).not.toContain('Reviewer 会话')
     // 折叠标题与正文用同一个标签
-    expect(notice.source).toMatchObject({ form: 'notice', summary: '[自动] 自动审批：允许' })
+    expect(notice.source).toMatchObject({ form: 'notice', summary: '[自动] 自动审批：已批准' })
   })
 
   it('模型 deny 时转交人工审批', async () => {
@@ -337,7 +366,198 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(notice.content[0].text).toContain('自动审批 未自动批准 bash，已转交你审批')
     expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).toContain('理由：提权范围超过运行测试所需。')
-    expect(notice.source.summary).toBe('[人工] 自动审批：转交人工审批')
+    // 通知改到审批结束后注入：正文带上人工链的最终结论（this case: 人工拒绝）
+    expect(notice.content[0].text).toContain('最终结果：已拒绝')
+    expect(notice.source.summary).toBe('[人工] 自动审批：已转人工审批')
+  })
+
+  it('人工拒绝后追问理由：默认选项就是模型意见，回答作为第二行注入并回写记录', async () => {
+    const request = requestWith()
+    const records = { add: vi.fn(() => ({ id: 'record-1' })), update: vi.fn(), list: () => [], size: () => 0 }
+    const userQuestions = {
+      ask: vi.fn().mockResolvedValue({
+        answers: [{ id: 'dsh-auto-pass:reject-reason', selected: ['采用模型意见：提权范围超过运行测试所需。'] }],
+      }),
+    }
+    const outcome = await createAutoApprovalHandler(
+      contextWith(reviewerRun(deny), { userQuestions }),
+      resolveConfig(),
+      records,
+    )(request, vi.fn().mockResolvedValue('rejected'))
+    await flush()
+
+    expect(outcome).toBe('rejected')
+    // 第一行照旧是结果（不阻塞工具调用），第二行才是人工补的理由
+    const injected = request.agent.inject.mock.calls.map(call => call[0])
+    expect(injected).toHaveLength(2)
+    expect(injected[0].content[0].text).toContain('最终结果：已拒绝')
+    expect(injected[1].content[0].text).toBe('[人工] 人工拒绝理由：提权范围超过运行测试所需。')
+    expect(injected[1].source).toMatchObject({ form: 'notice', summary: '[人工] 自动审批：拒绝理由' })
+    // 追问卡：agent 是父 Agent，第一项采用模型意见、最后一项是不留言
+    const asked = userQuestions.ask.mock.calls[0][0]
+    expect(asked.agent).toBe(request.agent)
+    expect(asked.questions[0].options.map(option => option.label)).toEqual([
+      '采用模型意见：提权范围超过运行测试所需。',
+      '不留言',
+    ])
+    // 理由同时回写进审批记录（时间线详情里能看到「人工拒绝理由」）
+    expect(records.update).toHaveBeenCalledWith('record-1', { rejectReason: '提权范围超过运行测试所需。' })
+  })
+
+  it('追问理由只看 askRejectReason：设置关掉、自动放行不追问；notice 关掉不连带（只少结果行）', async () => {
+    const offRequest = requestWith()
+    const offQuestions = { ask: vi.fn() }
+    await createAutoApprovalHandler(
+      contextWith(reviewerRun(deny), { settings: { notice: true, askRejectReason: false }, userQuestions: offQuestions }),
+      resolveConfig(),
+    )(offRequest, vi.fn().mockResolvedValue('rejected'))
+    await flush()
+    expect(offQuestions.ask).not.toHaveBeenCalled()
+    expect(offRequest.agent.inject).toHaveBeenCalledOnce()
+
+    // notice 不是总开关：关掉后结果行不注入，但「拒绝理由」照问、第二行照注入
+    const quietRequest = requestWith()
+    const quietQuestions = {
+      ask: vi.fn().mockResolvedValue({
+        answers: [{ id: 'dsh-auto-pass:reject-reason', selected: ['采用模型意见：提权范围超过运行测试所需。'] }],
+      }),
+    }
+    await createAutoApprovalHandler(
+      contextWith(reviewerRun(deny), { settings: { notice: false, askRejectReason: true }, userQuestions: quietQuestions }),
+      resolveConfig(),
+    )(quietRequest, vi.fn().mockResolvedValue('rejected'))
+    await flush()
+    expect(quietQuestions.ask).toHaveBeenCalledOnce()
+    const quietInjected = quietRequest.agent.inject.mock.calls.map(call => call[0])
+    expect(quietInjected).toHaveLength(1)
+    expect(quietInjected[0].content[0].text).toBe('[人工] 人工拒绝理由：提权范围超过运行测试所需。')
+
+    // 自动放行没有「拒绝理由」可问
+    const allowRequest = requestWith()
+    const allowQuestions = { ask: vi.fn() }
+    await createAutoApprovalHandler(
+      contextWith(reviewerRun(allow), { userQuestions: allowQuestions }),
+      resolveConfig(),
+    )(allowRequest, vi.fn())
+    await flush()
+    expect(allowQuestions.ask).not.toHaveBeenCalled()
+    expect(allowRequest.agent.inject).toHaveBeenCalledOnce()
+  })
+
+  it('追问支持自由文本与「不留言」；问不到人时只记日志、结论不变', async () => {
+    // 自由文本优先：原生问题卡在有自定义答案时会把 selected 清空，只把文本放进 custom
+    const typedRequest = requestWith()
+    const typedQuestions = {
+      ask: vi.fn().mockResolvedValue({
+        answers: [{ id: 'dsh-auto-pass:reject-reason', selected: [], custom: '这次不需要提权，先别动。' }],
+      }),
+    }
+    await createAutoApprovalHandler(
+      contextWith(reviewerRun(deny), { userQuestions: typedQuestions }),
+      resolveConfig(),
+    )(typedRequest, vi.fn().mockResolvedValue('rejected'))
+    await flush()
+    expect(typedRequest.agent.inject.mock.calls.at(-1)[0].content[0].text)
+      .toBe('[人工] 人工拒绝理由：这次不需要提权，先别动。')
+
+    // 选「不留言」：只留结果那一行
+    const skipRequest = requestWith()
+    const skipQuestions = {
+      ask: vi.fn().mockResolvedValue({
+        answers: [{ id: 'dsh-auto-pass:reject-reason', selected: ['不留言'] }],
+      }),
+    }
+    await createAutoApprovalHandler(
+      contextWith(reviewerRun(deny), { userQuestions: skipQuestions }),
+      resolveConfig(),
+    )(skipRequest, vi.fn().mockResolvedValue('rejected'))
+    await flush()
+    expect(skipQuestions.ask).toHaveBeenCalledOnce()
+    expect(skipRequest.agent.inject).toHaveBeenCalledOnce()
+
+    // 没有 userQuestions 服务（子 Agent / 无人应答）：只记日志，审批结论与结果通知都不受影响
+    const offlineRequest = requestWith()
+    const offlineCtx = contextWith(reviewerRun(deny))
+    const outcome = await createAutoApprovalHandler(offlineCtx, resolveConfig())(
+      offlineRequest,
+      vi.fn().mockResolvedValue('rejected'),
+    )
+    await flush()
+    expect(outcome).toBe('rejected')
+    expect(offlineRequest.agent.inject).toHaveBeenCalledOnce()
+    expect(offlineCtx.logger.warn).toHaveBeenCalledWith(expect.stringContaining('跳过拒绝理由追问'))
+  })
+
+  it('追问理由与规则确认串行：前一张问题卡答完才挂下一张', async () => {
+    const request = requestWith()
+    const signature = signatureOf(request, exactAction(request))
+    // 达阈值给出黑名单建议：这次审批同时欠两张问题卡（拒绝理由 + 规则确认）
+    const policies = {
+      match: () => undefined,
+      observe: () => ({ approvals: 0, denials: 0, suggestion: { list: 'deny', count: 3 } }),
+      dismiss: vi.fn(),
+      addRule: vi.fn(() => ({ ok: false, error: 'not used' })),
+    }
+    const events = []
+    let releaseReason
+    const userQuestions = {
+      ask: vi.fn(askRequest => {
+        events.push(askRequest.questions[0].id)
+        // 第一张卡（拒绝理由）先挂起：规则确认必须等它答完才发出
+        if (events.length === 1) {
+          return new Promise(resolve => {
+            releaseReason = () => resolve({
+              answers: [{ id: 'dsh-auto-pass:reject-reason', selected: ['不留言'] }],
+            })
+          })
+        }
+        return Promise.resolve({ answers: [] })
+      }),
+    }
+    const records = { add: vi.fn(() => ({ id: 'record-1' })), update: vi.fn(), list: () => [], size: () => 0 }
+    await createAutoApprovalHandler(
+      contextWith(reviewerRun(deny), { userQuestions }),
+      resolveConfig(),
+      records,
+      policies,
+    )(request, vi.fn().mockResolvedValue('rejected'))
+    await flush()
+
+    // 串行：第一张卡还没答，第二张卡不许发出
+    expect(events).toEqual(['dsh-auto-pass:reject-reason'])
+    expect(userQuestions.ask).toHaveBeenCalledOnce()
+
+    releaseReason()
+    await flush()
+    expect(events).toEqual(['dsh-auto-pass:reject-reason', 'dsh-auto-pass:deny'])
+    expect(userQuestions.ask).toHaveBeenCalledTimes(2)
+    // 规则确认照旧落盘/记结果：串行不改变任何一条旁路流程的结论
+    expect(policies.dismiss).toHaveBeenCalledOnce()
+  })
+
+  it('插件自己判的拒绝（黑名单直接拒绝）不追问：没有人参与，也就没有人能回答', async () => {
+    const request = requestWith()
+    const signature = signatureOf(request, exactAction(request))
+    const policies = {
+      match: () => ({ list: 'deny', scope: 'global', file: 'x', rule: { id: 'rule-1', label: signature.text, source: 'user', match: { kind: 'signature', value: signature.key } } }),
+      observe: () => ({ approvals: 0, denials: 0, suggestion: null }),
+    }
+    const userQuestions = { ask: vi.fn() }
+    const records = { add: vi.fn(() => ({ id: 'record-1' })), update: vi.fn(), list: () => [], size: () => 0 }
+    const outcome = await createAutoApprovalHandler(
+      contextWith([], { settings: { notice: true, denyDirect: true }, userQuestions }),
+      resolveConfig(),
+      records,
+      policies,
+    )(request, vi.fn())
+    await flush()
+
+    expect(outcome).toBe('rejected')
+    expect(userQuestions.ask).not.toHaveBeenCalled()
+    expect(records.update).not.toHaveBeenCalled()
+    // 插件自己判的拒绝：没有人参与这次判断，标签必须是「黑名单·自动」
+    expect(records.add.mock.calls[0][0].decidedBy).toBe('auto')
+    expect(request.agent.inject.mock.calls[0][0].content[0].text.startsWith('[黑名单·自动]')).toBe(true)
   })
 
   it('子 Agent 异常、无 structured 输出或缺少精确动作时一律转人工审批', async () => {
@@ -387,6 +607,9 @@ describe('Auto Approve Reviewer 子 Agent', () => {
       userAuthorization: 'high',
       rationale: allow.rationale,
       steps: 0,
+      // 第几轮第几步：审批记录要能定位回对话里的那一步
+      turn: 1,
+      step: 1,
       route: { provider: 'reviewer', model: 'safe-model' },
       // 插件自己决定的：时间线与通知都显示「自动」
       decidedBy: 'auto',
@@ -429,6 +652,94 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(records.add.mock.calls[0][0]).toMatchObject({ verdict: 'defer', outcome: 'rejected', steps: 0, decidedBy: 'human' })
   })
 
+  it('转人工时把模型意见写到审批卡首行，并保留调用方给的提权原文', async () => {
+    const ctx = contextWith(reviewerRun(deny))
+    const request = requestWith()
+    const next = vi.fn().mockResolvedValue('rejected')
+    const outcome = await createAutoApprovalHandler(ctx, resolveConfig())(request, next)
+
+    expect(outcome).toBe('rejected')
+    expect(next).toHaveBeenCalledOnce()
+    // DSH 的人工审批卡首行渲染的就是 req.reason（dsh-client-ui-approval 的 headline）：
+    // 版式 =「调用方原文 + 空行 + 模型审批意见」，换行由客户端注入的 pre-wrap 打开
+    expect(request.reason.startsWith('escalate sandbox to danger-full-access: 运行项目测试\n\n模型审批意见：')).toBe(true)
+    expect(request.reason).toContain(deny.rationale)
+    // 调用方原本的提权说明不能被覆盖掉
+    expect(request.reason).toContain('escalate sandbox to danger-full-access: 运行项目测试')
+  })
+
+  it('拿不到精确动作而转人工时，审批卡首行带上转交理由', async () => {
+    const request = requestWith('auto-approve', { callId: undefined })
+    const next = vi.fn().mockResolvedValue('rejected')
+    await createAutoApprovalHandler(contextWith([]), resolveConfig())(request, next)
+
+    expect(request.reason.startsWith('escalate sandbox to danger-full-access: 运行项目测试\n\n')).toBe(true)
+    expect(request.reason).toContain('自动审批：找不到待审批工具调用的精确参数。')
+  })
+
+  it('调用方没给 reason 时，首行只留意见那一段', async () => {
+    const request = requestWith('auto-approve', { callId: undefined, reason: undefined })
+    const next = vi.fn().mockResolvedValue('rejected')
+    await createAutoApprovalHandler(contextWith([]), resolveConfig())(request, next)
+
+    expect(request.reason).toBe('自动审批：找不到待审批工具调用的精确参数。')
+  })
+
+  it('审查失败转人工时，审批卡首行带上失败原因', async () => {
+    const ctx = contextWith(new Error('模型服务不可用'))
+    const request = requestWith()
+    const next = vi.fn().mockResolvedValue('rejected')
+    await createAutoApprovalHandler(ctx, resolveConfig())(request, next)
+
+    expect(request.reason).toContain('自动审批：自动审查未能完成，已转人工审批：模型服务不可用')
+  })
+
+  it('自动放行时不改审批请求的理由（本来也不会弹卡）', async () => {
+    const request = requestWith()
+    expect(await createAutoApprovalHandler(contextWith(reviewerRun(allow)), resolveConfig())(request, vi.fn()))
+      .toBe('allowed-once')
+    expect(request.reason).toBe('escalate sandbox to danger-full-access: 运行项目测试')
+  })
+
+  it('审查模型的 token 用量写进审批记录', async () => {
+    const usage = { inputTokens: 1200, outputTokens: 40, totalTokens: 1240, cacheReadTokens: 800 }
+    const ctx = contextWith(reviewerRun(allow, { usage }))
+    const records = { add: vi.fn(), list: () => [], size: () => 0 }
+    await createAutoApprovalHandler(ctx, resolveConfig(), records)(requestWith(), vi.fn())
+
+    expect(records.add.mock.calls[0][0].usage).toEqual(usage)
+    // 用量也写进宿主日志，排查时不用翻记录文件
+    expect(ctx.logger.info.mock.calls.map(call => call[0]).join('\n')).toContain('tokens=in=1200 out=40')
+  })
+
+  it('提供方没给用量时，记录里不出现 usage 字段', async () => {
+    const ctx = contextWith(reviewerRun(allow))
+    const records = { add: vi.fn(), list: () => [], size: () => 0 }
+    await createAutoApprovalHandler(ctx, resolveConfig(), records)(requestWith(), vi.fn())
+
+    expect('usage' in records.add.mock.calls[0][0]).toBe(false)
+  })
+
+  it('回复不合法而转人工时，已经烧掉的 token 仍记进记录', async () => {
+    const usage = { inputTokens: 900, outputTokens: 30 }
+    const ctx = contextWith([{ text: '这不是 JSON', usage }])
+    const records = { add: vi.fn(), list: () => [], size: () => 0 }
+    await createAutoApprovalHandler(ctx, resolveConfig(), records)(requestWith(), vi.fn().mockResolvedValue('rejected'))
+
+    const record = records.add.mock.calls[0][0]
+    expect(record.verdict).toBe('defer')
+    expect(record.usage).toEqual(usage)
+  })
+
+  it('英文会话用英文前缀', async () => {
+    const ctx = contextWith(reviewerRun({ ...deny, rationale: 'Escalation exceeds the request.' }))
+    const request = requestWith('auto-approve', { sessionOverrides: { directUserText: 'Please run the tests' } })
+    const next = vi.fn().mockResolvedValue('rejected')
+    await createAutoApprovalHandler(ctx, resolveConfig())(request, next)
+
+    expect(request.reason).toContain('\n\nModel review: Escalation exceeds the request.')
+  })
+
   it('写入记录抛错也不改变审批结论', async () => {
     const ctx = contextWith(reviewerRun(allow))
     const records = {
@@ -442,6 +753,101 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(outcome).toBe('allowed-once')
     expect(records.add).toHaveBeenCalledOnce()
     expect(request.agent.inject).toHaveBeenCalled()
+  })
+
+  it('设置里关掉通知注入后，上下文里不再写任何审批结果（审批结论不变）', async () => {
+    const request = requestWith()
+    const outcome = await createAutoApprovalHandler(
+      contextWith(reviewerRun(allow)),
+      resolveConfig({ notice: false }),
+    )(request, vi.fn())
+
+    expect(outcome).toBe('allowed-once')
+    expect(request.agent.inject).not.toHaveBeenCalled()
+  })
+
+  it('设置页的开关优先于插件 config：settings.notice 为 true 时照旧注入', async () => {
+    const request = requestWith()
+    const cfg = resolveConfig({
+      notice: false,
+      reviewerProvider: 'reviewer',
+      reviewerModel: 'safe-model',
+    })
+    const outcome = await createAutoApprovalHandler(
+      contextWith(reviewerRun(allow), { settings: { notice: true, denyDirect: false } }),
+      cfg,
+    )(request, vi.fn())
+
+    expect(outcome).toBe('allowed-once')
+    const notice = request.agent.inject.mock.calls.at(-1)[0]
+    expect(notice.content[0].text).toContain('最终结果：已批准')
+  })
+
+  it('黑名单直接拒绝（设置开启）：不弹人工审批卡，直接返回 rejected 并记一条 blacklist-reject', async () => {
+    const request = requestWith()
+    const signature = signatureOf(request, exactAction(request))
+    // 最小策略替身：命中黑名单（真实匹配逻辑由 tests/policy.spec.js 覆盖）
+    const policies = {
+      match: () => ({ list: 'deny', scope: 'global', file: 'x', rule: { id: 'rule-1', label: signature.text, source: 'user', match: { kind: 'signature', value: signature.key } } }),
+      observe: () => ({ approvals: 0, denials: 0, suggestion: null }),
+    }
+    const records = { add: vi.fn(), list: () => [], size: () => 0 }
+    const next = vi.fn().mockResolvedValue('allowed-once')
+    const outcome = await createAutoApprovalHandler(
+      contextWith([], { settings: { notice: true, denyDirect: true } }),
+      resolveConfig(),
+      records,
+      policies,
+    )(request, next)
+
+    // 关键语义：命中黑名单直接判为拒绝，人工审批链完全不被调用
+    expect(outcome).toBe('rejected')
+    expect(next).not.toHaveBeenCalled()
+    // 审批卡不会弹出，但理由仍写进 reason（时间线与日志都看得到为什么拒绝）
+    expect(request.reason).toContain('黑名单，已直接拒绝')
+    const record = records.add.mock.calls[0][0]
+    expect(record.verdict).toBe('blacklist-reject')
+    expect(record.outcome).toBe('rejected')
+    expect(record.policy.list).toBe('deny')
+    // 插件自己决定的拒绝：标签是「黑名单·人工」以外的形态——结论不是人工给的，最终结果记「已批准」之外的拒绝
+    const notice = request.agent.inject.mock.calls.at(-1)[0]
+    expect(notice.content[0].text).toContain('自动审批 已直接拒绝 bash')
+    expect(notice.content[0].text).toContain('最终结果：已拒绝')
+  })
+
+  it('黑名单直接拒绝默认关闭：设置没写时仍然转人工', async () => {
+    const request = requestWith()
+    const signature = signatureOf(request, exactAction(request))
+    const policies = {
+      match: () => ({ list: 'deny', scope: 'global', file: 'x', rule: { id: 'rule-1', label: signature.text, source: 'user', match: { kind: 'signature', value: signature.key } } }),
+      observe: () => ({ approvals: 0, denials: 0, suggestion: null }),
+    }
+    const next = vi.fn().mockResolvedValue('rejected')
+    expect(await createAutoApprovalHandler(contextWith([]), resolveConfig(), undefined, policies)(request, next))
+      .toBe('rejected')
+    expect(next).toHaveBeenCalledOnce()
+  })
+
+  it('行为开关每次审批重新读设置：handler 建好之后再打开 denyDirect 也立刻生效', async () => {
+    const request = requestWith()
+    const signature = signatureOf(request, exactAction(request))
+    const policies = {
+      match: () => ({ list: 'deny', scope: 'global', file: 'x', rule: { id: 'rule-1', label: signature.text, source: 'user', match: { kind: 'signature', value: signature.key } } }),
+      observe: () => ({ approvals: 0, denials: 0, suggestion: null }),
+    }
+    const records = { add: vi.fn(), list: () => [], size: () => 0 }
+    // 同一个 settings 对象：先在「关」的状态下建好 handler，再把开关翻成「开」。
+    // 回归点：旧实现把三个开关提到 handler 外面求值，那时 settings 还没就绪（`apply()` 里
+    // `installSettings` 排在 handler 创建之后），开关会静默退回默认值——这条用例必须看到
+    // 翻转立刻生效，且黑名单不再转人工。
+    const settings = { notice: true, denyDirect: false }
+    const handler = createAutoApprovalHandler(contextWith([], { settings }), resolveConfig(), records, policies)
+    settings.denyDirect = true
+
+    const next = vi.fn().mockResolvedValue('rejected')
+    expect(await handler(request, next)).toBe('rejected')
+    expect(next).not.toHaveBeenCalled()
+    expect(records.add.mock.calls[0][0].verdict).toBe('blacklist-reject')
   })
 
   it('连续多次 deny 不再中断 turn，每次都会转交人工审批', async () => {
@@ -481,6 +887,11 @@ describe('输入装配与配置', () => {
     const warn = vi.fn()
     expect(resolveConfig({ language: 'ja' }, warn).language).toBe('auto')
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/language=ja.*auto/))
+
+    // 四个行为开关的默认值：通知注入默认开、黑名单直接拒绝默认关、自动打开时间线默认开、拒绝后追问理由默认开
+    expect(resolveConfig()).toMatchObject({ notice: true, denyDirect: false, autoOpenTimeline: true, askRejectReason: true })
+    expect(resolveConfig({ notice: false, denyDirect: true, autoOpenTimeline: false, askRejectReason: false }))
+      .toMatchObject({ notice: false, denyDirect: true, autoOpenTimeline: false, askRejectReason: false })
 
     const ctx = {
       logger: { info: vi.fn(), warn: vi.fn() },
@@ -687,7 +1098,8 @@ describe('审查语言自动选择', () => {
     expect(notice.content[0].text).not.toContain('Reviewer session')
     expect(notice.content[0].text).not.toContain('\n')
     expect(notice.content[0].text).toContain('Rationale: The user explicitly requested')
-    expect(notice.source.summary).toBe('[auto] Auto Approve: allowed')
+    expect(notice.content[0].text).toContain('final result：approved')
+    expect(notice.source.summary).toBe('[auto] Auto Approve: approved')
 
     const failed = requestWith('auto-approve', {
       callId: undefined,
@@ -703,7 +1115,8 @@ describe('审查语言自动选择', () => {
       .toContain('Auto Approve did not allow bash; handed to you')
     expect(deferredNotice.content[0].text)
       .toContain('Rationale: The exact tool call awaiting approval could not be found.')
-    expect(deferredNotice.source.summary).toBe('[human] Auto Approve: deferred to the user')
+    expect(deferredNotice.content[0].text).toContain('final result：rejected')
+    expect(deferredNotice.source.summary).toBe('[human] Auto Approve: handed to the user')
 
     const denied = requestWith('auto-approve', {
       sessionOverrides: { directUserText: 'Please run the tests' },

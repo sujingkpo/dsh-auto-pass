@@ -10,6 +10,15 @@
  * @modify 2026-09-15 对话区改放「审批设置」，时间线移入右侧栏并加升级/降级操作
  * @modify 2026-09-15 面板改为与消息列同宽的居中卡片；时间线行内展示审批意见摘要
  * @modify 2026-09-15 右侧栏 chip 标题加图标；审批意见只显示一行
+ * @modify 2026-09-15 时间线切到「全部会话」时，在每条记录最下面用小字标出会话名
+ * @modify 2026-09-15 时间线加「全部 / 白名单 / 黑名单 / 自动 / 人工」快捷筛选（多选叠加，按钮带条数）
+ * @modify 2026-09-15 升级/降级结果如实区分「已更新同名规则 / 已被已有规则覆盖 / 已合并窄规则」
+ * @modify 2026-09-15 自动打开时间线改为「只要触发审批、且时间线没打开就展开」：常驻观察器按当前会话最新记录 id 判断新审批，首次观测只记基线
+ * @modify 2026-09-15 计数说明文案同步「最终结果为准、管道之后不参与区分」
+ * @modify 2026-09-15 规则可微调：时间线详情加可编辑表单（匹配条件/匹配值/标签，四个按钮按你填的内容写入），设置面板每条规则可「编辑」（op=update 原地更新）
+ * @modify 2026-09-15 规则表单改用自带分段按钮（原生 <select> 深色主题下弹层白底）、切条件时值立刻刷新、操作区改竖排
+ * @modify 2026-09-15 换匹配条件后让模型按该条件重新生成（/rule/draft，提示词带上条件与当前草稿）；路径前缀的通配符即时校验与口径提示
+ * @modify 2026-09-15 这次动作用不上的匹配条件（没有命令 / 没有路径）按钮禁用并说明原因
  */
 window.__ModuleLoader__.load({
   id: 'dsh-auto-pass',
@@ -26,10 +35,14 @@ window.__ModuleLoader__.load({
     const API_LOG = '/api/dsh-auto-pass/log'
     const API_POLICY = '/api/dsh-auto-pass/policy'
     const API_RULE = '/api/dsh-auto-pass/rule'
+    /** 只生成不落盘：换匹配条件时让模型按那个条件重新生成一遍。 */
+    const API_RULE_DRAFT = API_RULE + '/draft'
     /** 启动信标：把客户端半走到哪一步写进宿主日志（排查「看不到面板」用）。 */
     const API_BEACON = '/api/dsh-auto-pass/beacon'
     /** 时间轴轮询间隔（毫秒）。 */
     const POLL_MS = 3_000
+    /** 自动打开审批时间线失败后的重试延迟（毫秒）。 */
+    const AUTO_OPEN_RETRY_MS = 150
     /** 右侧栏 tab 类型标识，同时是正文/标题席位的 key。 */
     const SIDEBAR_ID = 'dsh-auto-pass'
     const SIDEBAR_KIND = 'dsh-auto-pass-log'
@@ -84,6 +97,7 @@ window.__ModuleLoader__.load({
         loading: '加载中…',
         autoApproved: '自动批准',
         referred: '转人工',
+        denyRejected: '直接拒绝',
         reviewFailed: '审查未完成',
         outcomeAllowed: '已批准',
         outcomeRejected: '已拒绝',
@@ -95,6 +109,10 @@ window.__ModuleLoader__.load({
         action: '动作',
         latency: '耗时',
         reviewer: 'Reviewer',
+        tokens: 'Token 消耗',
+        usageIn: '输入',
+        usageOut: '输出',
+        usageTotal: '合计',
         reason: '审批原因',
         time: '时间',
         signature: '权限签名',
@@ -102,6 +120,10 @@ window.__ModuleLoader__.load({
         policyHit: '命中规则',
         hitAllow: '白名单',
         hitDeny: '黑名单',
+        filterAll: '全部',
+        filterAuto: '自动',
+        filterHuman: '人工',
+        filterEmpty: '没有符合筛选条件的记录',
         promoted: '已自动升级',
         applied: '已应用',
         approvals: '连续放行',
@@ -125,7 +147,33 @@ window.__ModuleLoader__.load({
         working: '处理中…',
         appliedModel: '已加入（模型优化）',
         appliedRecord: '已加入（采用审查时的模型建议）',
-        appliedFallback: '已加入（模型优化不可用，已回落到精确签名）',
+        appliedFallback: '已加入（没有可用的模型建议，已回落到默认条件：命令前缀，或没有命令时的精确签名）',
+        appliedReplaced: '（已更新同名规则）',
+        appliedCovered: '（已有规则已覆盖这个动作，未重复添加）',
+        appliedMerged: count => '（已合并 ' + String(count) + ' 条被它覆盖的窄规则）',
+        appliedManual: '已按你填写的条件加入',
+        ruleDraftLabel: '加入名单的规则',
+        ruleKind: '匹配条件',
+        ruleValue: '匹配值',
+        ruleLabelField: '规则标签',
+        ruleDraftFromModel: '默认来自这次审查的模型建议，可以直接改',
+        ruleDraftFromSignature: '默认是本次动作的精确签名（最窄）；嫌窄就切到「命令前缀」',
+        ruleDraftEdited: '值已按所选条件刷新，仍可继续手改（管道 | 之后的部分只决定怎么显示输出）',
+        ruleDraftRegenerating: '正在让模型按所选条件重新生成…',
+        ruleDraftRegenerated: '已让模型按所选条件重新生成，仍可继续手改',
+        ruleDraftRegenFailed: '模型这次没能生成（已按条件本地推导，可继续手改）',
+        ruleNeedLabel: '规则标签不能为空',
+        ruleNeedValue: '匹配值不能为空',
+        ruleNeedLongerPrefix: '前缀类条件至少 3 个字符',
+        rulePathGlobHint: '路径前缀支持单层通配：D:/work/x/src/*.js 只匹配该目录下的 .js 文件（不跨目录）',
+        ruleNoDoubleStar: '路径规则不支持 **（跨目录通配太宽）',
+        ruleNoOtherGlob: '只支持 * 这一个通配符（不支持 ? 与 []）',
+        ruleStarLastSegment: '* 只能出现在路径的最后一段（文件名部分）',
+        ruleCommandStarHint: '命令前缀里的 * 是字面量、不会展开：这样写只会命中「命令文本里真的带 tests/*」的调用。想覆盖一类命令请把前缀写短，例如 pnpm vitest run',
+        ruleKindUnavailable: kind => kind + '匹配不到这次动作（它没有对应的命令或路径参数），已禁用',
+        edit: '编辑',
+        saveEdit: '保存修改',
+        cancelEdit: '取消',
         sourceUser: '手动',
         sourceModel: '模型',
         sourceMemory: '记忆',
@@ -139,7 +187,7 @@ window.__ModuleLoader__.load({
         thresholdHintAllow: '达到后询问是否加入白名单',
         thresholdHintDeny: '达到后询问是否加入黑名单',
         thresholdUnit: '次',
-        ruleAskNote: '自动审批与你本人的放行都计入「连续放行」；模型判定拒绝或你选择了拒绝都计入「连续被拒」。问过一次并选择「不加入」后，这个动作不会再被询问。',
+        ruleAskNote: '自动审批与你本人的放行都计入「连续放行」（哪怕模型原本判了拒绝，只要你点了允许一次就算放行）；最终没被批准才计入「连续被拒」。计数只看命令本身，管道 | 后面的输出截断不参与区分。问过一次并选择「不加入」后，这个动作不会再被询问。',
         save: '保存',
         saved: '已保存',
         globalScope: '全局（所有项目）',
@@ -152,10 +200,26 @@ window.__ModuleLoader__.load({
         cardName: '自动审批面板',
         placementTitle: '面板显示位置',
         placementDesc: '审批设置显示在对话标签页，审批时间线显示在右侧栏（auto 优先右侧栏，座位不可用时退回对话标签页）',
+        noticeTitle: '注入审批结果到上下文',
+        noticeHint: '关闭后，审批结果不再写进模型的对话上下文（审批时间线不受影响）',
+        denyDirectTitle: '黑名单直接拒绝',
+        denyDirectHint: '命中黑名单时直接把这次调用判为拒绝（工具调用失败），不再弹人工审批卡',
+        autoOpenTitle: '自动打开审批时间线',
+        autoOpenHint: '触发审批时自动展开审批时间线；已显示时不抢焦点',
+        askReasonTitle: '拒绝后追问理由',
+        askReasonHint: '你拒绝一次审批后，插件问一句拒绝理由并注入模型上下文（默认选项就是本次的模型审批意见）',
+        saveFailed: '保存失败',
+        switchOn: '开',
+        switchOff: '关',
+        turnStep: '轮次/步数',
+        turnStepLabel: (turn, step) => '第 ' + String(turn) + ' 轮 · 第 ' + String(step) + ' 步',
+        rejectReason: '人工拒绝理由',
+        savedTip: '已保存',
         placementAuto: '自动',
         placementTab: '只保留审批设置',
         placementSidebar: '只保留时间线',
         placementAll: '两处都显示',
+        panelCardDesc: '面板显示在哪里，以及四个行为开关：是否把审批结果注入模型上下文、命中黑名单是否直接拒绝、本会话第一次审批时是否自动打开审批时间线、人工拒绝后是否追问一句拒绝理由。',
       },
       en: {
         timelineTab: 'Approval timeline',
@@ -170,6 +234,7 @@ window.__ModuleLoader__.load({
         loading: 'Loading…',
         autoApproved: 'auto-approved',
         referred: 'handed to user',
+        denyRejected: 'rejected outright',
         reviewFailed: 'review incomplete',
         outcomeAllowed: 'allowed',
         outcomeRejected: 'rejected',
@@ -181,6 +246,10 @@ window.__ModuleLoader__.load({
         action: 'Action',
         latency: 'Latency',
         reviewer: 'Reviewer',
+        tokens: 'Token usage',
+        usageIn: 'in',
+        usageOut: 'out',
+        usageTotal: 'total',
         reason: 'Approval reason',
         time: 'Time',
         signature: 'Signature',
@@ -188,6 +257,10 @@ window.__ModuleLoader__.load({
         policyHit: 'Matched rule',
         hitAllow: 'Allowlist',
         hitDeny: 'Denylist',
+        filterAll: 'All',
+        filterAuto: 'Auto',
+        filterHuman: 'Human',
+        filterEmpty: 'No records match the filters',
         promoted: 'Auto-promoted',
         applied: 'Applied',
         approvals: 'Consecutive approvals',
@@ -211,7 +284,33 @@ window.__ModuleLoader__.load({
         working: 'Working…',
         appliedModel: 'Added (model-optimized)',
         appliedRecord: 'Added (rule suggested by the review model)',
-        appliedFallback: 'Added (model optimization unavailable; fell back to the exact signature)',
+        appliedFallback: 'Added (no usable model suggestion; fell back to the default condition: a command prefix, or the exact signature when there is no command)',
+        appliedReplaced: ' (updated the existing rule)',
+        appliedCovered: ' (already covered by an existing rule; nothing added)',
+        appliedMerged: count => ' (merged ' + String(count) + ' narrower rule(s) it covers)',
+        appliedManual: 'Added with the condition you wrote',
+        ruleDraftLabel: 'Rule to add',
+        ruleKind: 'Match kind',
+        ruleValue: 'Match value',
+        ruleLabelField: 'Rule label',
+        ruleDraftFromModel: 'prefilled from this review model suggestion - edit it freely',
+        ruleDraftFromSignature: 'prefilled with this action exact signature (narrowest); switch to a command prefix to widen it',
+        ruleDraftEdited: 'the value was refreshed for the kind you picked - edit it freely (anything after a | only shapes the output)',
+        ruleDraftRegenerating: 'asking the model to regenerate a rule for the kind you picked...',
+        ruleDraftRegenerated: 'the model regenerated a rule for the kind you picked - still editable',
+        ruleDraftRegenFailed: 'the model could not regenerate this time (kept the locally derived value - still editable)',
+        ruleNeedLabel: 'rule label must not be empty',
+        ruleNeedValue: 'match value must not be empty',
+        ruleNeedLongerPrefix: 'a prefix condition needs at least 3 characters',
+        rulePathGlobHint: 'a path prefix takes one single-segment wildcard: D:/work/x/src/*.js matches only .js files directly in that directory',
+        ruleNoDoubleStar: '** is not supported for path rules (cross-directory is too broad)',
+        ruleNoOtherGlob: 'only * is supported as a wildcard (no ? or [])',
+        ruleStarLastSegment: '* may only appear in the last path segment (the file name)',
+        ruleCommandStarHint: '* in a command prefix is literal and never expands: that rule only matches calls whose command text literally contains tests/*. Shorten the prefix instead, e.g. pnpm vitest run',
+        ruleKindUnavailable: kind => kind + ' cannot match this action (it carries no command/paths) - disabled',
+        edit: 'Edit',
+        saveEdit: 'Save',
+        cancelEdit: 'Cancel',
         sourceUser: 'manual',
         sourceModel: 'model',
         sourceMemory: 'memory',
@@ -225,7 +324,7 @@ window.__ModuleLoader__.load({
         thresholdHintAllow: 'ask to allowlist after this many',
         thresholdHintDeny: 'ask to denylist after this many',
         thresholdUnit: 'times',
-        ruleAskNote: 'Auto-approved and user-approved calls both count as approvals; a model deny and your own rejection both count as denials. After you answer "do not add" once, that action is never asked about again.',
+        ruleAskNote: 'Auto-approved calls and your own approvals (that includes clicking "allow once" over a model denial) both count as approvals; only a request that ends up unapproved counts as a denial. Counting looks at the command itself, ignoring the output plumbing after a |. After you answer "do not add" once, that action is never asked about again.',
         save: 'Save',
         saved: 'Saved',
         globalScope: 'Global (all projects)',
@@ -238,10 +337,26 @@ window.__ModuleLoader__.load({
         cardName: 'Auto Approve panel',
         placementTitle: 'Panel placement',
         placementDesc: 'Approval policy lives in the conversation tab, the approval timeline in the right sidebar (auto prefers the sidebar and falls back to the conversation tab)',
+        noticeTitle: 'Inject approval results into the context',
+        noticeHint: 'When off, approval results are never written into the model conversation (the timeline is unaffected)',
+        denyDirectTitle: 'Reject on denylist',
+        denyDirectHint: 'A denylist hit fails the tool call outright instead of opening a human approval card',
+        autoOpenTitle: 'Open the approval timeline automatically',
+        autoOpenHint: 'Open the approval timeline when an approval is triggered; when it is already visible it stays put',
+        askReasonTitle: 'Ask for a rejection reason',
+        askReasonHint: 'After you reject an approval, the plugin asks for a reason and injects it into the model context (the model review note is the default answer)',
+        saveFailed: 'Save failed',
+        switchOn: 'on',
+        switchOff: 'off',
+        turnStep: 'Turn / step',
+        turnStepLabel: (turn, step) => 'turn ' + String(turn) + ' · step ' + String(step),
+        rejectReason: 'Rejection reason (user)',
+        savedTip: 'Saved',
         placementAuto: 'Auto',
         placementTab: 'Policy only',
         placementSidebar: 'Timeline only',
         placementAll: 'Both',
+        panelCardDesc: 'Where the panels live, plus four behaviour switches: inject approval results into the context, reject on a denylist hit, open the approval timeline automatically for this session’s first approval, and ask for a rejection reason after you reject one.',
       },
     }
     const t = COPY[ZH ? 'zh' : 'en']
@@ -406,12 +521,20 @@ window.__ModuleLoader__.load({
         '.ap-btn:disabled{opacity:.5;cursor:default}',
         '.ap-btnPrimary{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}',
         '.ap-btnDanger{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}',
+        // 快捷筛选条：多选 chip（命中名单两类 + 决策来源两类），每个 chip 后面跟当前范围内的条数
+        '.ap-filters{flex:none;display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px;border-bottom:1px solid var(--dsw-alias-border-l1)}',
+        '.ap-chip{appearance:none;display:inline-flex;align-items:center;gap:4px;border:1px solid var(--dsw-alias-border-l1);background:0 0;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;border-radius:8px;padding:2px 8px;cursor:pointer}',
+        '.ap-chip:hover{border-color:var(--dsw-alias-label-dimmed)}',
+        '.ap-chip[data-on="1"]{border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-state-business-primary)}',
+        '.ap-chipCount{color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}',
+        '.ap-chip[data-on="1"] .ap-chipCount{color:inherit}',
         '.ap-list{flex:auto;min-height:0;overflow-y:auto;margin:0;padding:4px 0 12px;list-style:none}',
         '.ap-row{border-bottom:1px solid var(--dsw-alias-border-l1)}',
         '.ap-rowHead{width:100%;appearance:none;border:0;background:0 0;font:inherit;text-align:left;color:inherit;display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer}',
         '.ap-rowHead:hover{background:var(--dsw-alias-bg-layer-2)}',
         '.ap-time{flex:none;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;font-size:11px;line-height:16px}',
         '.ap-tool{flex:none;font-family:var(--dsw-font-family-mono,ui-monospace,monospace);font-size:12px}',
+        '.ap-turnStep{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;font-variant-numeric:tabular-nums}',
         '.ap-badge{flex:none;border-radius:8px;padding:0 6px;font-size:11px;line-height:16px}',
         '.ap-badgeOk{color:var(--dsw-alias-state-success-primary);background:var(--dsw-alias-state-success-tertiary)}',
         '.ap-badgeWarn{color:var(--dsw-alias-state-warn-primary);background:var(--dsw-alias-state-warn-tertiary)}',
@@ -426,7 +549,10 @@ window.__ModuleLoader__.load({
         '.ap-mono{font-family:var(--dsw-font-family-mono,ui-monospace,monospace);font-size:11px}',
         '.ap-empty{color:var(--dsw-alias-label-tertiary);padding:16px 12px}',
         '.ap-error{color:var(--dsw-alias-state-warn-primary);padding:6px 12px;font-size:11px}',
-        '.ap-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding-top:4px}',
+        // 记录详情的操作区：竖着一行一行来（规则编辑器一行、两个操作各一行、状态提示一行），
+        // 之前是一整排 flex-wrap，控件一多就横七竖八（用户反馈「按钮排版好乱」）
+        '.ap-actions{display:flex;flex-direction:column;gap:6px;align-items:flex-start;padding-top:4px;min-width:0}',
+        '.ap-actionRow{display:flex;flex-wrap:wrap;align-items:center;gap:6px;width:100%;min-width:0}',
         '.ap-actionsLabel{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;min-width:5.5em}',
         '.ap-note{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}',
         '.ap-warn{color:var(--dsw-alias-state-warn-primary)}',
@@ -436,18 +562,41 @@ window.__ModuleLoader__.load({
         // 标签行（决策来源 / 命中名单共用）：chip + 说明文字，折叠态就能看见
         '.ap-hitRow{display:flex;align-items:center;gap:6px;min-width:0}',
         '.ap-hitText{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;min-width:0;overflow-wrap:anywhere}',
+        // 「全部会话」时记录最下面的一行会话名：小字、单行截断，不与审批意见/标签行抢视觉
+        '.ap-session{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;padding:0 12px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}',
         '.ap-sectionTitle{font-size:12px;font-weight:600;line-height:18px}',
         '.ap-subTitle{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;margin-top:4px}',
         '.ap-ruleList{list-style:none;margin:4px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}',
         '.ap-rule{display:flex;align-items:baseline;gap:6px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:4px 6px}',
         '.ap-ruleLabel{min-width:0;flex:auto;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere}',
         '.ap-input{appearance:none;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:0 0;color:inherit;font:inherit;font-size:12px;line-height:18px;padding:2px 8px;width:5em}',
+        // 规则编辑器（时间线的「加入名单的规则」与设置面板的编辑行）：条件分段按钮 + 值 + 标签一行，
+        // 说明与校验提示另起一行（挤在同一行会盖住按钮）。条件不用原生 <select>：它的弹层在深色主题下白底黑字
+        '.ap-ruleBlock{display:flex;flex-direction:column;gap:4px;width:100%;min-width:0}',
+        '.ap-ruleEditor{display:flex;flex-wrap:wrap;align-items:center;gap:6px;width:100%;min-width:0}',
+        '.ap-ruleEditorRow{flex:1}',
+        '.ap-inputWide{width:auto;flex:1;min-width:10em}',
         '.ap-row2{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+        // 开关：轨道 + 滑块。状态由原生 checkbox 承载（无障碍与键盘可用），轨道随 :checked 变色。
+        // 选择器用「input + track」的兄弟关系，不依赖 label 包裹。
+        '.ap-switch{flex:none;display:inline-flex;align-items:center;gap:8px;cursor:pointer}',
+        '.ap-switchInput{position:absolute;opacity:0;width:0;height:0;margin:0}',
+        '.ap-switchTrack{flex:none;position:relative;width:32px;height:18px;border-radius:9px;background:var(--dsw-alias-bg-layer-2);border:.5px solid var(--dsw-alias-border-l3)}',
+        '.ap-switchTrack::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:var(--dsw-alias-label-tertiary)}',
+        '.ap-switchInput:checked+.ap-switchTrack{background:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}',
+        '.ap-switchInput:checked+.ap-switchTrack::after{transform:translateX(14px);background:var(--dsw-alias-bg-layer-3)}',
+        '.ap-switchInput:focus-visible+.ap-switchTrack{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}',
+        '.ap-switchInput:disabled+.ap-switchTrack{opacity:.5}',
+        '.ap-switchText{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;min-width:1.5em}',
         // 档位名字前面的「盾牌 + A」：几何全部走 --ap-glyph-* 变量（chip 14/4/currentColor，菜单项 16/8/三级色），
         // 变量由 applyPresetIconVars 内联写在 span 上；mask 用 longhand，避免简写与变量混在一起出歧义
         `.${PRESET_ICON_CLASS}{display:inline-flex;align-items:center;gap:var(--ap-glyph-gap,8px)}`,
         // 图标本体：尺寸全走 --ap-glyph-* 变量；用 flex 的 align-items:center 对齐，和内置 itemIcon / triggerIcon 同一套机制（之前用 vertical-align 手调，真机上差了 2px）
         `.${PRESET_ICON_CLASS}::before{content:"";flex:none;width:var(--ap-glyph-box,16px);height:var(--ap-glyph-box,16px);background-color:var(--ap-glyph-color,currentColor);-webkit-mask-image:${PRESET_ICON_MASK};mask-image:${PRESET_ICON_MASK};-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-position:center;mask-position:center;-webkit-mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px);mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px)}`,
+        // 审批卡首行：DSH 把 pending.reason 放进一个纯文本 div，默认 white-space 会把我
+        // 们写入的换行折叠成空格；这里打开换行，让「原有信息 / 空行 / 模型审批意见」分行。
+        // 选择器只认官方卡片的 data-approval-key 属性（稳定），不依赖它的哈希类名。
+        '[data-approval-key] *{white-space:pre-wrap}',
       ].join('\n')
       ;(document.head || document.documentElement).appendChild(tag)
     }
@@ -465,47 +614,176 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * placement 状态：唯一真值在宿主（config 默认值 + 设置命名空间覆盖）。
-     * 设置页卡片、审批设置面板与挂载逻辑共用它，任何变更都会广播给订阅者重新挂载。
+     * 界面偏好状态：唯一真值在宿主（config 默认值 + 设置命名空间覆盖）。
+     * placement 决定面板挂在哪里（变更会广播出去重新挂载），notice / denyDirect 是两个行为开关
+     * （关掉通知注入、开启黑名单直接拒绝）。设置页卡片与审批设置面板共用这一份状态。
      */
-    const placementStore = {
-      value: 'all',
+    const runtimeStore = {
+      placement: 'all',
+      notice: true,
+      denyDirect: false,
+      // 本会话第一次产生审批记录时自动打开右侧栏时间线（默认开）
+      autoOpenTimeline: true,
+      // 人工拒绝后追问一句拒绝理由（默认开）
+      askRejectReason: true,
       writable: false,
       listeners: new Set(),
       subscribe(listener) {
         this.listeners.add(listener)
         return () => { this.listeners.delete(listener) }
       },
-      set(value) {
-        if (this.value === value) return
-        this.value = value
-        for (const listener of [...this.listeners]) listener(value)
+      /** 广播变更；placement 变化时把新值一并交给监听者（挂载逻辑要用它）。 */
+      emit() {
+        for (const listener of [...this.listeners]) listener(this.placement)
+      },
+      /** 把宿主返回的 settings 对象套用到本地状态；认不出的值保持原样。 */
+      apply(settings) {
+        if (settings === null || typeof settings !== 'object') return
+        if (typeof settings.placement === 'string' && PLACEMENTS.includes(settings.placement)) {
+          this.placement = settings.placement
+        }
+        if (typeof settings.notice === 'boolean') this.notice = settings.notice
+        if (typeof settings.denyDirect === 'boolean') this.denyDirect = settings.denyDirect
+        if (typeof settings.autoOpenTimeline === 'boolean') this.autoOpenTimeline = settings.autoOpenTimeline
+        if (typeof settings.askRejectReason === 'boolean') this.askRejectReason = settings.askRejectReason
       },
       async load() {
         try {
           const response = await fetch(API_CONFIG, { headers: { accept: 'application/json' } })
           const data = await response.json()
-          if (typeof data?.placement === 'string' && PLACEMENTS.includes(data.placement)) this.set(data.placement)
+          this.apply(data?.settings)
           this.writable = data?.writable === true
         } catch (error) {
-          console.warn(LOG, '读取宿主 placement 失败，沿用默认 all', error)
+          console.warn(LOG, '读取宿主界面偏好失败，沿用本地默认值', error)
         }
-        return this.value
+        this.emit()
+        return this.placement
       },
-      async save(next) {
+      /** 写一个偏好（placement / notice / denyDirect）并套用宿主回执；失败抛出由调用方回滚。 */
+      async save(patch) {
         const response = await fetch(API_CONFIG, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ placement: next }),
+          body: JSON.stringify(patch),
         })
         const data = await response.json()
         if (data?.ok !== true) throw new Error(String(data?.error ?? 'save failed'))
-        this.set(typeof data.placement === 'string' ? data.placement : next)
+        this.apply(data.settings)
+        this.emit()
+      },
+    }
+    /** placement 的读写入口：面板挂载逻辑只关心它，行为开关的变更不会触发重新挂载。 */
+    const placementStore = {
+      get value() { return runtimeStore.placement },
+      set(value) {
+        if (runtimeStore.placement === value) return
+        runtimeStore.placement = value
+        runtimeStore.emit()
+      },
+      subscribe(listener) {
+        return runtimeStore.subscribe(listener)
       },
     }
 
-    /** 客户端上下文：applyInner 时捕获，供组件里访问宿主客户端服务（sessions 等）。 */
+    /** 客户端上下文：applyInner 时捕获，供组件里访问宿主客户端服务（sessions / sidebarRight）。 */
     let clientCtx
+
+    /**
+     * 当前挂载状态（applyInner 与时间线面板写入）：
+     * - sidebar：右侧栏 tab 的注入 handle，非空表示 tab 类型已注册（placement=tab 时不注册，
+     *   那种放置方式下也没有可自动打开的时间线）；
+     * - timelineShown：审批时间线是否**正显示在眼前**——面板挂载且 tab 可见（收起侧栏、
+     *   切到别的 tab 都算「没打开」，用户选定的判定规则就靠它）。
+     */
+    const mountState = { tab: undefined, sidebar: undefined, timelineShown: false }
+
+    /** 审批观察器：seen 记每个会话上一次看到的最新记录 id（判断有没有出现新审批），timer 是轮询句柄。 */
+    const approvalWatch = { seen: new Map(), timer: undefined }
+
+    /** 当前会话 id：来自宿主 sessions 服务的列表快照（拿不到返回 undefined）。 */
+    function currentSessionId() {
+      try {
+        const snapshot = clientCtx?.get?.('sessions')?.list?.getSnapshot?.()
+        const current = snapshot?.current
+        return typeof current === 'string' && current !== '' ? current : undefined
+      } catch (error) {
+        console.warn(LOG, '读取当前会话失败', error)
+        return undefined
+      }
+    }
+
+    /**
+     * 看一次「当前会话有没有刚触发的审批」。
+     *
+     * 判定规则（用户 2026-09-15 选定）：**只要触发审批、且审批列表没打开，就自动打开**。
+     * 所以这里没有「本会话只开一次」的记忆：approvalWatch.seen 只用来发现「最新一条记录的 id 变了」，
+     * 变了就说明刚发生了审批。**首次观测只记基线**——页面刷新后会话里往往已经堆着历史记录，
+     * 那不是「刚触发的审批」，不该把时间线弹开。
+     * 观察器与面板无关：用户停在「轨迹」标签页、或 placement 只挂右侧栏时同样会触发
+     * （旧实现把探针写在「拿不到项目目录」的分支里，正常情况根本不执行，等于没生效）。
+     * @returns {Promise<void>} 无返回值；任何失败只记日志，绝不影响面板自身
+     */
+    async function watchApprovals() {
+      if (runtimeStore.autoOpenTimeline !== true) return
+      if (mountState.sidebar === undefined) return
+      const sessionId = currentSessionId()
+      if (sessionId === undefined) return
+      let newest = ''
+      try {
+        const response = await fetch(API_LOG + '?session=' + encodeURIComponent(sessionId) + '&limit=1', {
+          headers: { accept: 'application/json' },
+        })
+        const data = await response.json()
+        const first = Array.isArray(data?.records) ? data.records[0] : undefined
+        newest = first === undefined ? '' : String(first.id ?? first.time ?? '')
+      } catch (error) {
+        console.warn(LOG, '读取审批记录以判断是否自动打开时间线失败', error)
+        return
+      }
+      const seen = approvalWatch.seen.get(sessionId)
+      if (seen === newest) return
+      approvalWatch.seen.set(sessionId, newest)
+      // seen 不存在 = 本轮页面会话第一次看到这个会话：这是历史记录，只记基线不打开
+      if (seen === undefined || newest === '') return
+      maybeAutoOpenTimeline(sessionId)
+    }
+
+    /**
+     * 触发审批后自动展开右侧栏的「审批时间线」。
+     *
+     * 判定规则（用户 2026-09-15 选定）：**只要触发审批、且审批列表没打开，就自动打开**——
+     * 时间线已经显示在眼前时什么都不做（不抢焦点）；没显示（tab 从没打开过、切到了别的 tab、
+     * 或者侧栏被收起）就展开它。真正展开靠官方 sidebarRight 服务的 openTab
+     * （dsh-client-ui-sidebar-right 的 openContent 内部会 planSetExpanded(true)，右侧栏因此自动展开），
+     * 不需要自己拼 layout 调用。
+     * @param {string} sessionId 触发这次展开的会话（只用于信标与日志）
+     * @returns {void} 无返回值；任何失败只影响这次自动展开
+     */
+    function maybeAutoOpenTimeline(sessionId) {
+      if (runtimeStore.autoOpenTimeline !== true) return
+      if (mountState.sidebar === undefined) return
+      if (mountState.timelineShown === true) return
+      /** 开一次时间线；服务不可用或抛错时返回 false（调用方只重试一次）。 */
+      const attempt = () => {
+        try {
+          const service = typeof clientCtx?.get === 'function' ? clientCtx.get('sidebarRight') : undefined
+          if (service === undefined || typeof service.openTab !== 'function') return false
+          service.openTab(SIDEBAR_KIND)
+          return true
+        } catch (error) {
+          console.warn(LOG, '自动打开审批时间线失败', error)
+          return false
+        }
+      }
+      if (attempt()) {
+        beacon('auto-open-timeline', sessionId)
+        return
+      }
+      // 只重试一次：首个审批出现时，官方 sidebar-right 服务可能还没把座位绑定到当前会话
+      setTimeout(() => {
+        if (attempt()) beacon('auto-open-timeline', sessionId + '(retry)')
+      }, AUTO_OPEN_RETRY_MS)
+    }
 
     /**
      * 取当前会话的工作目录（项目作用域规则要用）。真值来自宿主 sessions 服务的
@@ -526,6 +804,30 @@ window.__ModuleLoader__.load({
         console.warn(LOG, '读取会话工作目录失败', error)
         return undefined
       }
+    }
+
+    /**
+     * 会话显示名：与 DSH 左侧会话列表同一份投影（durable title → 项目目录名 → 会话 id）。
+     * 「全部会话」视图下每条记录要在最下面标出属于哪个会话；历史会话可能不在当前列表快照里，
+     * 这时退回 id 的短形式（DSH 的会话 id 形如 session-<uuid>，去掉前缀再取 8 位），
+     * 保证不同会话仍能区分，而不是所有记录都空着。
+     */
+    function sessionNameOf(sessionId) {
+      if (typeof sessionId !== 'string' || sessionId === '') return undefined
+      try {
+        const sessions = typeof clientCtx?.get === 'function' ? clientCtx.get('sessions') : undefined
+        const snapshot = typeof sessions?.list?.getSnapshot === 'function' ? sessions.list.getSnapshot() : undefined
+        const row = snapshot !== null && typeof snapshot === 'object' && snapshot.byId !== undefined
+          ? snapshot.byId[sessionId]
+          : undefined
+        const displayTitle = row !== null && typeof row === 'object' ? row.displayTitle : undefined
+        if (typeof displayTitle === 'string' && displayTitle !== '') return displayTitle
+      } catch (error) {
+        console.warn(LOG, '读取会话名称失败', error)
+      }
+      // 8 位足以区分同机会话，又不至于把这行小字挤成两行
+      const bare = sessionId.startsWith('session-') ? sessionId.slice('session-'.length) : sessionId
+      return bare.length > 8 ? bare.slice(0, 8) : bare
     }
 
     /** 策略快照的客户端缓存：设置面板与时间线共用，任何变更广播给订阅者。 */
@@ -575,10 +877,10 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 把一条审批记录升级/降级成规则。规则文本由宿主依据记录里的模型建议产出，
-     * 没有建议时精确回落到该次动作签名——客户端只负责发起与刷新。
+     * 把一条审批记录升级/降级成规则。`rule` 给定时以它为准（用户在时间线上手填/微调过的条件，
+     * 宿主校验后原样写入）；不给时由宿主依据记录里的模型建议产出，没有建议就精确回落到该次签名。
      */
-    async function promoteRecord(recordId, scope, list, sessionId) {
+    async function promoteRecord(recordId, scope, list, sessionId, rule) {
       const response = await fetch(API_RULE, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -588,6 +890,7 @@ window.__ModuleLoader__.load({
           list,
           // 会话 id 让宿主把「现场模型优化」挂在对应会话的 Agent 下
           ...(typeof sessionId === 'string' && sessionId !== '' ? { sessionId } : {}),
+          ...(rule === undefined ? {} : { rule }),
         }),
       })
       const data = await response.json()
@@ -598,11 +901,196 @@ window.__ModuleLoader__.load({
       return data
     }
 
+    /**
+     * 请宿主**按指定匹配条件**重新生成一条规则（不写名单，只回给界面填草稿）。
+     * 提示词里会带上用户选的条件与当前草稿，所以模型知道要产出哪种条件。
+     * @param recordId 审批记录 id
+     * @param list 'allow' / 'deny'（只影响提示词里名单的说法）
+     * @param kind 用户选的匹配条件
+     * @param draft 当前草稿（给模型参考）
+     * @param sessionId 会话 id（宿主按它记 llm session）
+     * @returns {Promise<object>} 宿主回执（rule.match.kind / rule.match.value / rule.label）
+     */
+    async function draftRule(recordId, list, kind, draft, sessionId) {
+      const response = await fetch(API_RULE_DRAFT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          recordId,
+          list,
+          kind,
+          draft,
+          ...(typeof sessionId === 'string' && sessionId !== '' ? { sessionId } : {}),
+        }),
+      })
+      const data = await response.json()
+      if (data === null || typeof data !== 'object' || data.ok !== true) {
+        throw new Error(String(data?.error ?? 'rule draft failed'))
+      }
+      return data
+    }
+
     /** 规则来源文案。 */
     function sourceLabel(source) {
       if (source === 'model') return t.sourceModel
       if (source === 'memory') return t.sourceMemory
       return t.sourceUser
+    }
+
+    /** 匹配条件下拉的顺序（与宿主 policy.js 的 MATCH_KINDS 同一套闭集）。 */
+    const MATCH_KIND_ORDER = ['command_prefix', 'signature', 'path_prefix']
+
+    /**
+     * 规则草稿：默认用这次审查的模型建议（宿主管校验过，不覆盖本次动作的建议根本到不了这里），
+     * 没有建议就用本次动作的精确签名——精确签名是最窄、最安全的默认值。
+     * fromModel 只影响界面上的那句说明，用户改不改都行。
+     */
+    function ruleDraftOf(record) {
+      const suggested = record?.suggestedRule
+      if (suggested !== null && typeof suggested === 'object' && suggested.match !== undefined
+        && suggested.match !== null) {
+        return {
+          kind: suggested.match.kind,
+          value: String(suggested.match.value ?? ''),
+          label: String(suggested.label ?? ''),
+          fromModel: true,
+          edited: false,
+          source: 'suggestion',
+          pending: false,
+          error: '',
+        }
+      }
+      return {
+        kind: 'signature',
+        value: String(record?.signature?.key ?? ''),
+        label: String(record?.signature?.text ?? record?.toolName ?? ''),
+        fromModel: false,
+        edited: false,
+        source: 'signature',
+        pending: false,
+        error: '',
+      }
+    }
+
+    /**
+     * 把一条已有规则的匹配值翻译成另一种条件的值（设置面板里改条件时用）：
+     * 精确签名 → 命令前缀，就从签名 key 的 `cmd:` 段里把命令取出来（同样砍掉管道之后）。
+     * 翻译不出来就保留原值，绝不猜。
+     */
+    /**
+     * 命令前缀用的文本：砍掉第一个管道之后（只决定怎么显示输出）与结尾的纯输出重定向
+     * （`2>&1` / `>nul`）——与宿主 countingCommand 同口径，界面草稿才不会和宿主默认值长得不一样。
+     * @param command 原始命令文本
+     * @returns {string} 归一化后的命令
+     */
+    function plainCommand(command) {
+      const text = String(command ?? '').replace(/\s+/g, ' ').trim()
+      // 与宿主 firstPipeOutsideQuotes 同口径：引号里的竖线（正则里的 |）不算管道
+      let quote = ''
+      let cut = -1
+      for (let index = 0; index < text.length; index += 1) {
+        const char = text[index]
+        if (quote !== '') {
+          if (char === quote) quote = ''
+          continue
+        }
+        if (char === '"' || char === "'") quote = char
+        else if (char === '|') {
+          cut = index
+          break
+        }
+      }
+      const head = (cut === -1 ? text : text.slice(0, cut)).trim()
+      return head
+        .replace(/(?:\s|^)(?:\d?>{1,2}\s*(?:&1|&2|nul|\/dev\/null)|&>{1,2}\s*(?:nul|\/dev\/null))$/i, '')
+        .trim()
+    }
+
+    function ruleValueForKind(kind, value) {
+      if (kind !== 'command_prefix') return value
+      const head = String(value).split('\u0000')[1]
+      if (typeof head !== 'string' || !head.startsWith('cmd:')) return value
+      return plainCommand(head.slice('cmd:'.length))
+    }
+
+    /** 命令前缀的默认值：命令砍掉管道之后与结尾重定向（与宿主 defaultRuleOf 同源）。 */
+    function commandPrefixOf(signature) {
+      const plain = plainCommand(typeof signature?.command === 'string' ? signature.command : '')
+      return plain === '' ? undefined : plain
+    }
+
+    /**
+     * 换匹配条件时草稿值该填什么：签名 → 本次签名 key；命令前缀 → 本次命令（砍掉管道之后）；
+     * 路径前缀 → 本次动作的第一个路径。推导不出来就保留用户原来的值（别把人手填的内容冲掉）。
+     * @param record 审批记录
+     * @param kind 新选的匹配条件
+     * @param fallback 保留值（推导不出来时用它）
+     * @returns {string} 新的匹配值
+     */
+    function ruleDraftValueOf(record, kind, fallback) {
+      const signature = record?.signature
+      if (kind === 'signature') {
+        return typeof signature?.key === 'string' && signature.key !== '' ? signature.key : fallback
+      }
+      if (kind === 'command_prefix') return commandPrefixOf(signature) ?? fallback
+      if (kind === 'path_prefix') {
+        const paths = Array.isArray(signature?.paths) ? signature.paths : []
+        return paths.length > 0 ? String(paths[0]) : fallback
+      }
+      return fallback
+    }
+
+    /**
+     * 这次动作能不能用某种匹配条件（与宿主 kindApplicable 同口径）：新记录一定带 `paths` 字段
+     * （可能是空数组），所以「有没有命令 / 文件路径」是可知的——可知却对不上就禁用那个按钮，
+     * 免得生成一条永远命不中的规则（真机踩过：pwsh 命令记录被切到路径前缀，模型给了个目录）。
+     * 老记录判不了，按可用处理。
+     * @param record 审批记录
+     * @param kind 匹配条件
+     * @returns {boolean} 可用返回 true
+     */
+    function kindApplicable(record, kind) {
+      const signature = record?.signature
+      if (signature === undefined || signature === null) return true
+      const known = Array.isArray(signature.paths)
+      if (kind === 'command_prefix') return known !== true || typeof signature.command === 'string'
+      if (kind === 'path_prefix') {
+        return known !== true || (Array.isArray(signature.paths) && signature.paths.length > 0)
+      }
+      return true
+    }
+
+    /**
+     * 草稿那一行的说明文字：正在让模型按条件重新生成 / 模型已生成 / 本地按条件推导 / 初始来源。
+     * @param draft 规则草稿
+     * @returns {string} 说明文本
+     */
+    function draftHintText(draft) {
+      if (draft.pending === true) return t.ruleDraftRegenerating
+      if (typeof draft.error === 'string' && draft.error !== '') return t.ruleDraftRegenFailed
+      if (draft.source === 'model') return t.ruleDraftRegenerated
+      if (draft.source === 'local' || draft.edited === true) return t.ruleDraftEdited
+      return draft.fromModel === true ? t.ruleDraftFromModel : t.ruleDraftFromSignature
+    }
+
+    /**
+     * 草稿的本地校验（与宿主 validateRuleInput 同口径）：值与标签非空，前缀类条件至少 3 个字符。
+     * @param draft 规则草稿
+     * @returns {string|undefined} 有问题的说明文本；没问题返回 undefined
+     */
+    function ruleDraftProblem(draft) {
+      if (draft.label.trim() === '') return t.ruleNeedLabel
+      if (draft.value.trim() === '') return t.ruleNeedValue
+      if (draft.kind !== 'signature' && draft.value.trim().length < 3) return t.ruleNeedLongerPrefix
+      // 路径前缀的通配符口径与宿主 validatePathPattern 一致，先把关省得白跑一趟
+      if (draft.kind === 'path_prefix') {
+        const value = draft.value.trim()
+        if (value.includes('**')) return t.ruleNoDoubleStar
+        if (/[?[\]]/.test(value)) return t.ruleNoOtherGlob
+        const star = value.indexOf('*')
+        if (star !== -1 && value.slice(star + 1).includes('/')) return t.ruleStarLastSegment
+      }
+      return undefined
     }
 
     /** 匹配条件文案。 */
@@ -646,16 +1134,60 @@ window.__ModuleLoader__.load({
     /** 记录里的决策来源；老记录没有这个字段时按 verdict / outcome 兜底推断。 */
     function decidedByOf(record) {
       if (record.decidedBy === 'auto' || record.decidedBy === 'human') return record.decidedBy
+      // 与宿主 decisionSource 同一套口径：黑名单直接拒绝是插件自己判的，没有人参与
+      if (record.verdict === 'blacklist-reject') return 'auto'
       const pluginDecided = record.verdict === 'allow' || record.policy?.list === 'allow'
       return pluginDecided && record.outcome === 'allowed-once' ? 'auto' : 'human'
     }
 
-    /** 结论徽标：插件自身只可能给 allow，其余都是转交用户。 */
+    /**
+     * 快捷筛选的键：命中名单两类（allow / deny）+ 决策来源两类（auto / human），
+     * 数组顺序就是按钮顺序；四个键互不重叠（见 matchesFilter）。
+     * 「全部」不在表里，它是清空筛选的入口。
+     */
+    const FILTER_KEYS = ['allow', 'deny', 'auto', 'human']
+
+    /**
+     * 一条记录是否命中某个快捷筛选键。四个键**互不重叠**，四个 chip 的条数相加正好是总数。
+     * allow / deny 看这次审批有没有命中名单（record.policy.list）；auto / human 看决策来源，
+     * 但**命中名单的记录一律不算**——命中白名单那次 decidedBy 是 auto、命中黑名单那次是 human，
+     * 不排除就会让同一批记录同时出现在两类里。
+     * 于是 auto = 模型自动放行的记录，human = 你最终拍板的记录，两者都不含被名单拦下的那些。
+     * @param {object} record 审批记录
+     * @param {string} key 筛选键
+     * @returns {boolean} 命中返回 true
+     */
+    function matchesFilter(record, key) {
+      const list = record.policy?.list
+      if (key === 'allow' || key === 'deny') {
+        return list === key
+      }
+      if (list !== undefined) {
+        return false
+      }
+      return decidedByOf(record) === key
+    }
+
+    /**
+     * 快捷筛选按钮的文案：白/黑名单复用命中名单的措辞，自动/人工复用决策来源的措辞。
+     * @param {string} key 筛选键
+     * @returns {string} 按钮文字
+     */
+    function filterLabel(key) {
+      const map = { allow: t.hitAllow, deny: t.hitDeny, auto: t.filterAuto, human: t.filterHuman }
+      return map[key] ?? key
+    }
+
+    /**
+     * 结论徽标：allow=模型自动批准；blacklist-reject=插件按黑名单直接拒绝（设置开启时）；
+     * deny=模型拒绝（转人工）；其余按「审查未完成」显示。后两种都会转交人工，所以是警告色。
+     */
     function VerdictBadge({ record }) {
       const allow = record.verdict === 'allow'
-      const label = record.verdict === 'allow'
+      const label = allow
         ? t.autoApproved
-        : record.verdict === 'deny' ? t.referred : t.reviewFailed
+        : record.verdict === 'blacklist-reject' ? t.denyRejected
+          : record.verdict === 'deny' ? t.referred : t.reviewFailed
       return react.createElement('span', {
         className: 'ap-badge ' + (allow ? 'ap-badgeOk' : 'ap-badgeWarn'),
         title: record.rationale ?? '',
@@ -719,11 +1251,59 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = react.useState(false)
       const [error, setError] = react.useState('')
       const [done, setDone] = react.useState(undefined)
+      // 可调草稿：默认模型建议 / 本次精确签名，用户不满意就直接改（用户 2026-09-15 要求）
+      const [draft, setDraft] = react.useState(() => ruleDraftOf(record))
+      const draftProblem = ruleDraftProblem(draft)
+      const patch = next => setDraft(previous => ({ ...previous, ...next }))
+      /** 这次动作用不上的条件（没有命令 / 没有路径）：按钮已禁用，这里给一行说明。 */
+      const unavailableNote = MATCH_KIND_ORDER.filter(kind => kindApplicable(record, kind) !== true)
+        .map(kind => t.ruleKindUnavailable(kindLabel(kind))).join('；')
+      /**
+       * 换匹配条件：**值立刻按新条件刷新**（用户要求），不会留下「条件 = 命令前缀、值却是签名 key」
+       * 这种自相矛盾的组合；换过之后就不再是「模型建议」，提示语也跟着换。
+       */
+      const chooseKind = kind => {
+        // 这次动作根本用不上这个条件（没有命令 / 没有路径）：按钮已禁用，这里再兜一层
+        if (kindApplicable(record, kind) !== true) return
+        // ① 本地先按新条件推导一个值：不用等模型，界面立刻不空转
+        const derived = ruleDraftValueOf(record, kind, draft.value)
+        setDraft(previous => ({
+          ...previous,
+          kind,
+          value: derived,
+          fromModel: false,
+          edited: true,
+          source: 'local',
+          pending: true,
+          error: '',
+        }))
+        // ② 同时请模型**按这个条件**重新生成（提示词带上条件与当前草稿）；回来时若还停在这个
+        //    条件上就覆盖草稿（用户随时可以接着改），换了条件或失败就保留本地推导值
+        if (typeof record.id !== 'string' || record.id === '') return
+        draftRule(record.id, 'allow', kind, { kind, value: derived, label: draft.label }, record.sessionId)
+          .then(data => setDraft(previous => previous.kind === kind
+            ? {
+              ...previous,
+              source: 'model',
+              pending: false,
+              error: '',
+              value: String(data.rule?.match?.value ?? previous.value),
+              label: String(data.rule?.label ?? previous.label),
+            }
+            : previous))
+          .catch(cause => setDraft(previous => previous.kind === kind
+            ? { ...previous, pending: false, error: String(cause?.message ?? cause) }
+            : previous))
+      }
       const run = (list, scope) => {
         setBusy(true)
         setError('')
         setDone(undefined)
-        promoteRecord(record.id, scope, list, record.sessionId)
+        promoteRecord(record.id, scope, list, record.sessionId, {
+          tool: record.toolName,
+          match: { kind: draft.kind, value: draft.value },
+          label: draft.label,
+        })
           .then(data => {
             setDone(data)
             if (typeof onDone === 'function') onDone()
@@ -731,34 +1311,111 @@ window.__ModuleLoader__.load({
           .catch(cause => setError(String(cause?.message ?? cause)))
           .finally(() => setBusy(false))
       }
-      // 规则文本一定经过模型，但可能走的是「审查时的建议」或「精确签名兜底」，如实写出来
+      // 规则文本一定经过模型，但可能走的是「审查时的建议」或「精确签名兜底」，如实写出来；
+      // 查重结果也如实写出来（三选一）：已有规则覆盖了这次动作（没写新条目）/ 更新了同一条规则 /
+      // 顺带合并掉了几条被新规则覆盖的窄规则——用户一眼能看出「为什么名单没变或变少了」
+      const dedupeNote = done === undefined
+        ? ''
+        : done.covered === true
+          ? t.appliedCovered
+          : (done.replaced === true ? t.appliedReplaced : '')
+            + (typeof done.merged === 'number' && done.merged > 0 ? t.appliedMerged(done.merged) : '')
       const doneText = done === undefined
         ? undefined
         : (done.optimizedBy === 'signature'
           ? t.appliedFallback
-          : done.optimizedBy === 'record' ? t.appliedRecord : t.appliedModel)
+          : done.optimizedBy === 'record' ? t.appliedRecord
+            : done.optimizedBy === 'manual' ? t.appliedManual : t.appliedModel)
+          + dedupeNote
           + '：' + String(done.rule?.label ?? '')
       const scopeButtons = (list, className) => ['project', 'global'].map(scope => react.createElement('button', {
         key: list + ':' + scope,
         type: 'button',
         className: 'ap-btn ' + className,
-        disabled: busy || typeof record.id !== 'string',
+        disabled: busy || draftProblem !== undefined || typeof record.id !== 'string',
         onClick: () => run(list, scope),
       }, scope === 'project' ? t.scopeProject : t.scopeGlobal))
       return react.createElement('div', { className: 'ap-actions' },
-        react.createElement('span', { className: 'ap-actionsLabel' }, t.promote),
-        ...scopeButtons('allow', 'ap-btnPrimary'),
-        react.createElement('span', { className: 'ap-actionsLabel' }, t.demote),
-        ...scopeButtons('deny', 'ap-btnDanger'),
-        busy && react.createElement('span', { className: 'ap-note' }, t.working),
-        error !== '' && react.createElement('span', { className: 'ap-note' }, error),
-        doneText !== undefined && react.createElement('span', {
-          className: done.optimizedBy === 'signature' ? 'ap-note ap-warn' : 'ap-note',
-        }, doneText))
+        // 匹配条件 / 值 / 标签都能改：默认填的是模型建议或本次精确签名，按钮按这里的内容写入。
+        // 匹配条件用自带的分段按钮，不用原生 <select>：原生下拉的弹层在深色主题下是白底黑字（用户反馈）
+        react.createElement('span', { className: 'ap-actionsLabel' }, t.ruleDraftLabel),
+        react.createElement('div', { className: 'ap-ruleBlock' },
+          react.createElement('div', { className: 'ap-ruleEditor' },
+            react.createElement('div', { className: 'ap-seg', role: 'group', 'aria-label': t.ruleKind },
+              ...MATCH_KIND_ORDER.map(kind => react.createElement('button', {
+                key: kind,
+                type: 'button',
+                'data-kind': kind,
+                'data-on': draft.kind === kind ? '1' : '0',
+                'aria-pressed': draft.kind === kind,
+                // 这次动作没有命令 / 路径时对应条件禁用：那种规则永远命不中
+                disabled: kindApplicable(record, kind) !== true,
+                title: kindApplicable(record, kind) === true ? undefined : t.ruleKindUnavailable(kindLabel(kind)),
+                onClick: () => chooseKind(kind),
+              }, kindLabel(kind)))),
+            react.createElement('input', {
+              className: 'ap-input ap-inputWide',
+              'aria-label': t.ruleValue,
+              // 签名 key 很长，输入框放不下：title 兜住完整内容
+              title: draft.value,
+              value: draft.value,
+              onChange: event => patch({ value: event.target.value }),
+            }),
+            react.createElement('input', {
+              className: 'ap-input ap-inputWide',
+              'aria-label': t.ruleLabelField,
+              title: draft.label,
+              value: draft.label,
+              onChange: event => patch({ label: event.target.value }),
+            })),
+          react.createElement('span', { className: 'ap-note', title: draft.error === '' ? undefined : draft.error },
+            draftHintText(draft)),
+          // 选了路径前缀就说明一下通配符口径：只支持单层 *（** 会被宿主拒绝）
+          draft.kind === 'path_prefix'
+            && react.createElement('span', { className: 'ap-note' }, t.rulePathGlobHint),
+          // 命令前缀里的 * 是**字面量**（用户问过「pnpm vitest run tests/* 支持吗」）：提示一句，
+          // 别指望它会像 shell 那样展开——想覆盖一类命令就把前缀写短
+          draft.kind === 'command_prefix' && draft.value.includes('*')
+            && react.createElement('span', { className: 'ap-note' }, t.ruleCommandStarHint),
+          // 这次动作用不上的条件（没有命令 / 没有路径）明说一句，别让按钮无声地灰着
+          unavailableNote !== ''
+            && react.createElement('span', { className: 'ap-note' }, unavailableNote),
+          draftProblem !== undefined && react.createElement('span', { className: 'ap-note ap-warn' }, draftProblem)),
+        // 两行操作各自成行：标签 + 该组的两个作用域按钮，不会和别的控件挤在一起换行
+        react.createElement('div', { className: 'ap-actionRow' },
+          react.createElement('span', { className: 'ap-actionsLabel' }, t.promote),
+          ...scopeButtons('allow', 'ap-btnPrimary')),
+        react.createElement('div', { className: 'ap-actionRow' },
+          react.createElement('span', { className: 'ap-actionsLabel' }, t.demote),
+          ...scopeButtons('deny', 'ap-btnDanger')),
+        (busy || error !== '' || doneText !== undefined) && react.createElement('div', { className: 'ap-actionRow' },
+          busy && react.createElement('span', { className: 'ap-note' }, t.working),
+          error !== '' && react.createElement('span', { className: 'ap-note ap-warn' }, error),
+          doneText !== undefined && react.createElement('span', {
+            className: done.optimizedBy === 'signature' ? 'ap-note ap-warn' : 'ap-note',
+          }, doneText)))
+    }
+
+    /**
+     * 把记录里的 token 用量格式化成详情里一行的值文本。
+     * 只显示记录里确实存在的数字字段：审查失败或提供方不给用量时整行不显示。
+     * @param {object|undefined} usage 宿主写入的用量
+     * @param {object} t 当前语言的字典
+     * @returns {string|undefined} 形如「输入 1200 · 输出 40 · 合计 1240」的文本
+     */
+    function formatUsage(usage, t) {
+      if (usage === null || typeof usage !== 'object') return undefined
+      const parts = []
+      if (typeof usage.inputTokens === 'number') parts.push(t.usageIn + ' ' + String(usage.inputTokens))
+      if (typeof usage.outputTokens === 'number') parts.push(t.usageOut + ' ' + String(usage.outputTokens))
+      if (typeof usage.totalTokens === 'number') parts.push(t.usageTotal + ' ' + String(usage.totalTokens))
+      return parts.length === 0 ? undefined : parts.join(' · ')
     }
 
     /** 单条记录：折叠只显示概要，展开显示风险/授权/理由/动作，以及升级/降级操作。 */
-    function RecordRow({ record, open, onToggle, onChanged }) {
+    function RecordRow({ record, open, onToggle, onChanged, showSession }) {
+      // 会话名只在「全部会话」视图里需要：本次会话下每条都属于当前会话，写了只是噪声
+      const sessionName = showSession === true ? sessionNameOf(record.sessionId) : undefined
       const route = record.route === undefined ? undefined : record.route.provider + '/' + record.route.model
       const suggested = record.suggestedRule === undefined
         ? undefined
@@ -766,6 +1423,7 @@ window.__ModuleLoader__.load({
       const applied = record.ruleApplied === undefined
         ? undefined
         : scopeLabel(record.ruleApplied.scope) + ' / ' + (record.ruleApplied.list === 'allow' ? t.allowList : t.denyList) + ' · ' + String(record.ruleApplied.label ?? '')
+          + (record.ruleApplied.optimizedBy === 'manual' ? '（你手填的匹配条件）' : '')
       const promoted = record.promotedRule === undefined
         ? undefined
         : scopeLabel(record.promotedRule.scope) + ' · ' + String(record.promotedRule.label ?? '')
@@ -784,6 +1442,12 @@ window.__ModuleLoader__.load({
       const opinion = typeof record.rationale === 'string' && record.rationale.trim() !== ''
         ? record.rationale
         : undefined
+      // 这次审查烧掉的 token（详情里展示，折叠态留给结论与标签）
+      const usageText = formatUsage(record.usage, t)
+      // 这次动作发生在第几轮第几步（工作流定位用；老记录没有这两个字段时整行不显示）
+      const turn = typeof record.turn === 'number' ? record.turn : undefined
+      const step = typeof record.step === 'number' ? record.step : undefined
+      const turnStep = turn === undefined && step === undefined ? undefined : t.turnStepLabel(turn ?? '?', step ?? '?')
       return react.createElement('li', { className: 'ap-row' },
         react.createElement('button', {
           type: 'button', className: 'ap-rowHead', 'aria-expanded': open,
@@ -793,6 +1457,8 @@ window.__ModuleLoader__.load({
           react.createElement('span', { className: 'ap-rowMain' },
             react.createElement('span', { className: 'ap-rowTop' },
               react.createElement('span', { className: 'ap-time', title: String(record.time ?? '') }, formatTime(record.time)),
+              // 折叠态就能看到「第几轮第几步」：审批记录要靠它对应回对话里的那一步
+              turnStep !== undefined && react.createElement('span', { className: 'ap-turnStep' }, turnStep),
               react.createElement('span', { className: 'ap-tool' }, String(record.toolName ?? '?')),
               react.createElement('span', { className: 'ap-grow' }, ''),
               react.createElement(VerdictBadge, { record }),
@@ -802,7 +1468,10 @@ window.__ModuleLoader__.load({
         open === true && react.createElement('div', { className: 'ap-detail' },
           react.createElement(Field, { label: t.risk, value: record.riskLevel }),
           react.createElement(Field, { label: t.authorization, value: record.userAuthorization }),
+          react.createElement(Field, { label: t.turnStep, value: turnStep }),
           react.createElement(Field, { label: t.rationale, value: record.rationale }),
+          // 人工补的拒绝理由（追问卡的回答）：与插件/模型意见分开显示
+          react.createElement(Field, { label: t.rejectReason, value: record.rejectReason }),
           react.createElement(Field, { label: t.reason, value: record.reason }),
           react.createElement(Field, { label: t.action, value: record.action, mono: true }),
           react.createElement(Field, { label: t.signature, value: record.signature === undefined ? undefined : record.signature.text, mono: true }),
@@ -816,39 +1485,124 @@ window.__ModuleLoader__.load({
           react.createElement(Field, { label: t.ruleAsk, value: declined }),
           react.createElement(Field, { label: t.latency, value: record.latencyMs === undefined ? undefined : String(record.latencyMs) + ' ms' }),
           react.createElement(Field, { label: t.reviewer, value: [record.reviewerSessionId, record.steps === undefined ? undefined : record.steps + ' steps'].filter(Boolean).join(' · ') }),
+          react.createElement(Field, { label: t.tokens, value: usageText }),
           react.createElement(Field, { label: t.time, value: record.time }),
           // 升级/降级需要记录的签名或模型建议；更早版本留下的老记录两者都没有，不显示死按钮
           (record.signature !== undefined || record.suggestedRule !== undefined)
-            && react.createElement(RuleActions, { record, onDone: onChanged })))
+            && react.createElement(RuleActions, { record, onDone: onChanged })),
+        // 「全部会话」时在整条记录的最下面用小字标出会话名；title 挂完整 sessionId 便于核对
+        sessionName !== undefined && react.createElement('div', {
+          className: 'ap-session',
+          title: typeof record.sessionId === 'string' ? record.sessionId : undefined,
+        }, sessionName))
     }
 
-    /** 一组规则的列表：显示标签、来源、匹配条件，并可删除。 */
-    function RuleList({ scope, list, title, rules, onRemove }) {
+    /**
+     * 一组规则的列表：显示标签、来源、匹配条件，并可**编辑**或删除。
+     * 编辑走「原地更新」（同一 id）：改完标签或匹配条件就立刻生效，不需要删掉再加一条。
+     */
+    function RuleList({ scope, list, title, rules, onRemove, onEdit }) {
+      const [editing, setEditing] = react.useState(undefined)
+      const [draft, setDraft] = react.useState(undefined)
+      const [error, setError] = react.useState('')
+      /** 进入编辑态：把这条规则摊成草稿。 */
+      const begin = rule => {
+        setError('')
+        setEditing(String(rule.id))
+        setDraft({
+          id: rule.id,
+          tool: rule.tool,
+          kind: rule.match?.kind ?? 'signature',
+          value: String(rule.match?.value ?? ''),
+          label: String(rule.label ?? ''),
+        })
+      }
+      /** 保存：本地先按宿主同口径校验，再把草稿交给面板写回。 */
+      const save = () => {
+        const problem = ruleDraftProblem(draft)
+        if (problem !== undefined) {
+          setError(problem)
+          return
+        }
+        setEditing(undefined)
+        setError('')
+        onEdit(scope, list, draft.id, {
+          tool: draft.tool,
+          match: { kind: draft.kind, value: draft.value },
+          label: draft.label,
+        })
+      }
+      /** 一条规则的展示行（不在编辑态时）。 */
+      const rowOf = rule => [
+        react.createElement('span', { className: 'ap-ruleLabel', key: 'label' }, String(rule.label ?? '')),
+        react.createElement('span', { className: 'ap-badge ap-badgeMuted', key: 'source' }, sourceLabel(rule.source)),
+        react.createElement('span', { className: 'ap-badge ap-badgeMuted', key: 'kind' }, kindLabel(rule.match?.kind)),
+        react.createElement('span', { className: 'ap-mono', key: 'value' }, String(rule.match?.value ?? '').slice(0, 48)),
+        react.createElement('button', {
+          type: 'button', className: 'ap-btn', key: 'edit', onClick: () => begin(rule),
+        }, t.edit),
+        react.createElement('button', {
+          type: 'button', className: 'ap-btn', key: 'remove', onClick: () => onRemove(scope, list, rule.id),
+        }, t.remove),
+      ]
+      /**
+       * 换匹配条件：值也按新条件刷新一下（从精确签名切到命令前缀时，把签名 key 里的命令取出来当前缀），
+       * 免得留下「条件 = 命令前缀、值却是一串签名 key」这种组合。
+       */
+      const chooseKind = kind => setDraft(previous => ({
+        ...previous,
+        kind,
+        value: ruleValueForKind(kind, previous.value),
+      }))
+      /** 一条规则的编辑行：匹配条件 / 值 / 标签，与时间线那块表单同一套控件（同样不用原生下拉）。 */
+      const editorOf = rule => react.createElement('span', { className: 'ap-ruleEditor ap-ruleEditorRow' },
+        react.createElement('span', { className: 'ap-seg', role: 'group', 'aria-label': t.ruleKind },
+          ...MATCH_KIND_ORDER.map(kind => react.createElement('button', {
+            key: kind,
+            type: 'button',
+            'data-kind': kind,
+            'data-on': draft.kind === kind ? '1' : '0',
+            'aria-pressed': draft.kind === kind,
+            onClick: () => chooseKind(kind),
+          }, kindLabel(kind)))),
+        react.createElement('input', {
+          className: 'ap-input ap-inputWide',
+          'aria-label': t.ruleValue,
+          value: draft.value,
+          onChange: event => setDraft(previous => ({ ...previous, value: event.target.value })),
+        }),
+        react.createElement('input', {
+          className: 'ap-input ap-inputWide',
+          'aria-label': t.ruleLabelField,
+          value: draft.label,
+          onChange: event => setDraft(previous => ({ ...previous, label: event.target.value })),
+        }),
+        react.createElement('button', {
+          type: 'button', className: 'ap-btn ap-btnPrimary', onClick: save,
+        }, t.saveEdit),
+        react.createElement('button', {
+          type: 'button', className: 'ap-btn', onClick: () => setEditing(undefined),
+        }, t.cancelEdit))
       return react.createElement('div', null,
         react.createElement('div', { className: 'ap-subTitle' }, title),
         rules.length === 0
           ? react.createElement('div', { className: 'ap-note' }, t.emptyList)
           : react.createElement('ul', { className: 'ap-ruleList' },
             rules.map(rule => react.createElement('li', { className: 'ap-rule', key: String(rule.id) },
-              react.createElement('span', { className: 'ap-ruleLabel' }, String(rule.label ?? '')),
-              react.createElement('span', { className: 'ap-badge ap-badgeMuted' }, sourceLabel(rule.source)),
-              react.createElement('span', { className: 'ap-badge ap-badgeMuted' }, kindLabel(rule.match?.kind)),
-              react.createElement('span', { className: 'ap-mono' }, String(rule.match?.value ?? '').slice(0, 48)),
-              react.createElement('button', {
-                type: 'button', className: 'ap-btn', onClick: () => onRemove(scope, list, rule.id),
-              }, t.remove)))))
+              ...(editing === String(rule.id) && draft !== undefined ? [editorOf(rule)] : rowOf(rule))))),
+        error !== '' && react.createElement('div', { className: 'ap-note ap-warn' }, error))
     }
 
-    /** 设置页卡片 / 审批设置面板共用的放置位置选择器。 */
+    /** 设置页卡片 / 审批设置面板共用的放置位置选择器（写宿主设置命名空间，即时重挂）。 */
     function PlacementControl() {
       const [value, setValue] = react.useState(() => placementStore.value)
       const [error, setError] = react.useState('')
-      react.useEffect(() => placementStore.subscribe(setValue), [])
+      react.useEffect(() => runtimeStore.subscribe(setValue), [])
       const choose = (next) => {
         setError('')
         const previous = placementStore.value
         setValue(next)
-        placementStore.save(next).catch(cause => {
+        runtimeStore.save({ placement: next }).catch(cause => {
           console.warn(LOG, '保存 placement 失败', cause)
           setValue(previous)
           setError(String(cause?.message ?? cause))
@@ -870,6 +1624,74 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 一行设置：标题 + switch（轨道 + 滑块）+ 说明。状态由原生 checkbox 承载（可键盘操作、
+     * 读屏可识别），宿主每次审批时读设置，所以拨动即生效。保存失败由调用方回滚并提示。
+     * @param props.label 标题、props.hint 说明、props.value 当前值、props.onChange 写值
+     */
+    function SwitchRow({ label, hint, value, onChange }) {
+      return react.createElement('div', { className: 'ap-row2' },
+        react.createElement('span', { className: 'ap-fieldKey' }, label),
+        react.createElement('label', { className: 'ap-switch' },
+          react.createElement('input', {
+            type: 'checkbox',
+            className: 'ap-switchInput',
+            checked: value === true,
+            onChange: event => onChange(event.target.checked === true),
+          }),
+          react.createElement('span', { className: 'ap-switchTrack', 'aria-hidden': 'true' }),
+          react.createElement('span', { className: 'ap-switchText' }, value === true ? t.switchOn : t.switchOff)),
+        react.createElement('span', { className: 'ap-note' }, hint))
+    }
+
+    /** 四个行为开关的键 + 文案（设置页卡片与「审批设置」面板共用同一份顺序）。 */
+    function behaviorSwitchSpecs() {
+      return [
+        { key: 'notice', label: t.noticeTitle, hint: t.noticeHint },
+        { key: 'denyDirect', label: t.denyDirectTitle, hint: t.denyDirectHint },
+        { key: 'autoOpenTimeline', label: t.autoOpenTitle, hint: t.autoOpenHint },
+        { key: 'askRejectReason', label: t.askReasonTitle, hint: t.askReasonHint },
+      ]
+    }
+
+    /**
+     * 行为开关组：注入审批结果到上下文 / 黑名单直接拒绝 / 自动打开审批时间线 / 拒绝后追问理由。
+     * 四个值都来自宿主 /config（设置命名空间）；写回是**先乐观置本地值**，失败回滚并提示，
+     * 绝不让界面显示一个没写进宿主的状态。设置页卡片与「审批设置」面板都渲染这一个组件。
+     */
+    function BehaviorSettings() {
+      const [, bump] = react.useState(0)
+      const [saved, setSaved] = react.useState(false)
+      const [error, setError] = react.useState('')
+      react.useEffect(() => runtimeStore.subscribe(() => bump(value => value + 1)), [])
+      /** 写一个开关：乐观置值 → 写宿主 → 成功提示 / 失败回滚。 */
+      const save = (key, next) => {
+        setError('')
+        setSaved(false)
+        const previous = runtimeStore[key]
+        runtimeStore[key] = next
+        runtimeStore.emit()
+        runtimeStore.save({ [key]: next })
+          .then(() => { setSaved(true); bump(value => value + 1) })
+          .catch(cause => {
+            console.warn(LOG, '保存界面偏好失败', cause)
+            runtimeStore[key] = previous
+            runtimeStore.emit()
+            setError(t.saveFailed + '：' + String(cause?.message ?? cause))
+          })
+      }
+      return react.createElement('div', { className: 'ap-col' },
+        ...behaviorSwitchSpecs().map(spec => react.createElement(SwitchRow, {
+          key: spec.key,
+          label: spec.label,
+          hint: spec.hint,
+          value: runtimeStore[spec.key],
+          onChange: next => save(spec.key, next),
+        })),
+        saved && react.createElement('div', { className: 'ap-note' }, t.savedTip),
+        error !== '' && react.createElement('div', { className: 'ap-note ap-warn' }, error))
+    }
+
+    /**
      * 渲染一张卡片：设置页插件卡与对话区面板共用同一套外观。
      * 设置页的容器是 ul，所以那里必须传 'li'——传 div 会拿不到任何卡片样式，
      * 表现就是「设置里只有一段裸文字」。
@@ -886,9 +1708,17 @@ window.__ModuleLoader__.load({
         react.createElement.apply(null, ['div', { className: 'ap-cardBody' }].concat(body)))
     }
 
-    /** 设置页卡片：选择面板显示在哪里（写宿主设置命名空间，即时重挂）。 */
-    function PlacementCard() {
-      return card('li', t.cardName, t.placementDesc, react.createElement(PlacementControl, null))
+    /**
+     * 设置卡片：面板显示在哪里（写宿主设置命名空间、即时重挂）+ 三个行为开关
+     * （注入审批结果到上下文 / 黑名单直接拒绝 / 自动打开审批时间线）。
+     * 设置页（容器是 ul，所以必须是 li）与「审批设置」面板共用同一套内容。
+     * @param props.tag 宿主标签（设置页传 'li'，对话区面板传 'section'）
+     * @param props.desc 卡片说明（设置页多一句：这里还能开关通知与黑名单行为）
+     */
+    function SettingsCard({ tag, desc }) {
+      return card(tag ?? 'section', t.cardName, desc ?? t.placementDesc, react.createElement('div', { className: 'ap-col' },
+        react.createElement(PlacementControl, null),
+        react.createElement(BehaviorSettings, null)))
     }
 
     /**
@@ -960,6 +1790,12 @@ window.__ModuleLoader__.load({
         policyStore.post({ op: 'remove', scope, list, id, cwd })
           .catch(cause => setError(String(cause?.message ?? cause)))
       }
+      /** 编辑一条已有规则（按 id 原地更新）：改完立刻写宿主并回读快照。 */
+      const editRule = (scope, list, id, rule) => {
+        setError('')
+        policyStore.post({ op: 'update', scope, list, id, rule, cwd })
+          .catch(cause => setError(String(cause?.message ?? cause)))
+      }
       void revision
       // 内容列与消息列同宽并居中：一屏一卡，卡片外观与设置页保持一致
       return react.createElement('div', { className: 'ap-root' },
@@ -984,16 +1820,16 @@ window.__ModuleLoader__.load({
               react.createElement('div', { className: 'ap-note' }, t.ruleAskNote),
             ]),
             card('section', t.globalScope, undefined, [
-              react.createElement(RuleList, { scope: 'global', list: 'allow', title: t.allowList, rules: globalRules.allow, onRemove: remove }),
-              react.createElement(RuleList, { scope: 'global', list: 'deny', title: t.denyList, rules: globalRules.deny, onRemove: remove }),
+              react.createElement(RuleList, { scope: 'global', list: 'allow', title: t.allowList, rules: globalRules.allow, onRemove: remove, onEdit: editRule }),
+              react.createElement(RuleList, { scope: 'global', list: 'deny', title: t.denyList, rules: globalRules.deny, onRemove: remove, onEdit: editRule }),
             ]),
             cwd === undefined
               ? card('section', t.projectScope, t.projectUnknown, null)
               : card('section', t.projectScope + ' · ' + cwd, undefined, [
-                react.createElement(RuleList, { scope: 'project', list: 'allow', title: t.allowList, rules: projectRules?.allow ?? [], onRemove: remove }),
-                react.createElement(RuleList, { scope: 'project', list: 'deny', title: t.denyList, rules: projectRules?.deny ?? [], onRemove: remove }),
+                react.createElement(RuleList, { scope: 'project', list: 'allow', title: t.allowList, rules: projectRules?.allow ?? [], onRemove: remove, onEdit: editRule }),
+                react.createElement(RuleList, { scope: 'project', list: 'deny', title: t.denyList, rules: projectRules?.deny ?? [], onRemove: remove, onEdit: editRule }),
               ]),
-            card('section', t.placementTitle, undefined, react.createElement(PlacementControl, null)),
+            react.createElement(SettingsCard, { tag: 'section' }),
             (error !== '' || policyStore.error !== '')
               && react.createElement('div', { className: 'ap-note' }, error !== '' ? error : policyStore.error))))
     }
@@ -1004,9 +1840,18 @@ window.__ModuleLoader__.load({
       const info = typeof props.useTabInfo === 'function' ? props.useTabInfo() : undefined
       // 右侧栏 tab 隐藏时暂停轮询；对话标签页没有这个信号，保持轮询。
       const visible = info === undefined || info?.tab?.visible !== false
+      // 自动打开的判定要读「时间线是不是正显示在眼前」（面板挂载 + tab 可见）：收起侧栏、
+      // 切到别的 tab 都算没打开。useTabInfo 缺失（单测里没有宿主 hook）时按「打开」处理——
+      // 面板都在渲染了，它就确实显示着。
+      react.useEffect(() => {
+        mountState.timelineShown = visible
+        return () => { mountState.timelineShown = false }
+      }, [visible])
       const [scope, setScope] = react.useState('session')
       const [state, setState] = react.useState({ records: [], error: '', loaded: false })
       const [openId, setOpenId] = react.useState('')
+      // 快捷筛选：多选叠加（空数组 = 不筛选，显示全部）
+      const [filters, setFilters] = react.useState([])
 
       const key = scope + '|' + sessionId
       const load = react.useCallback(async () => {
@@ -1038,6 +1883,21 @@ window.__ModuleLoader__.load({
 
       const records = state.records
       const auto = records.filter(record => record.verdict === 'allow').length
+      // 各筛选键在当前会话范围下的条数：为 0 也显示，用户据此判断点下去会不会空
+      const filterCounts = {}
+      for (const key of FILTER_KEYS) {
+        filterCounts[key] = records.filter(record => matchesFilter(record, key)).length
+      }
+      // 多选叠加：点亮多个时显示满足任一条件的记录（并集）；一个都没点亮就是全部
+      const shown = filters.length === 0
+        ? records
+        : records.filter(record => filters.some(key => matchesFilter(record, key)))
+      /** 切换一个筛选键：已点亮就取消，未点亮就叠加。 */
+      const toggleFilter = key => {
+        setFilters(previous => previous.includes(key)
+          ? previous.filter(item => item !== key)
+          : [...previous, key])
+      }
       // 升级/降级成功后同时刷新记录与策略快照：记录上会回写「已应用」，设置面板同步见到新规则
       const refresh = () => { void load(); void policyStore.load() }
       return react.createElement('div', { className: 'ap-root' },
@@ -1050,15 +1910,34 @@ window.__ModuleLoader__.load({
             react.createElement('button', { type: 'button', 'data-on': scope === 'all' ? '1' : '0', onClick: () => setScope('all') }, t.scopeAll)),
           react.createElement('button', { type: 'button', className: 'ap-btn', onClick: refresh }, t.reload)),
         state.error !== '' && react.createElement('div', { className: 'ap-error' }, state.error),
-        records.length === 0
-          ? react.createElement('div', { className: 'ap-empty' }, state.loaded ? t.empty : t.loading)
+        react.createElement('div', { className: 'ap-filters' },
+          react.createElement('button', {
+            type: 'button',
+            className: 'ap-chip',
+            'data-filter': 'all',
+            'data-on': filters.length === 0 ? '1' : '0',
+            onClick: () => setFilters([]),
+          }, t.filterAll, react.createElement('span', { className: 'ap-chipCount' }, String(records.length))),
+          ...FILTER_KEYS.map(key => react.createElement('button', {
+            key,
+            type: 'button',
+            className: 'ap-chip',
+            'data-filter': key,
+            'data-on': filters.includes(key) ? '1' : '0',
+            onClick: () => toggleFilter(key),
+          }, filterLabel(key), react.createElement('span', { className: 'ap-chipCount' }, String(filterCounts[key]))))),
+        shown.length === 0
+          ? react.createElement('div', { className: 'ap-empty' },
+            state.loaded === false ? t.loading : (records.length === 0 ? t.empty : t.filterEmpty))
           : react.createElement('ul', { className: 'ap-list' },
-            records.map(record => react.createElement(RecordRow, {
+            shown.map(record => react.createElement(RecordRow, {
               key: String(record.id ?? record.time),
               record,
               open: openId === String(record.id ?? record.time),
               onToggle: () => setOpenId(previous => previous === String(record.id ?? record.time) ? '' : String(record.id ?? record.time)),
               onChanged: refresh,
+              // 只有「全部会话」需要标明每条记录属于哪个会话
+              showSession: scope === 'all',
             }))))
     }
 
@@ -1085,7 +1964,10 @@ window.__ModuleLoader__.load({
         console.warn(LOG, '没有 slots 服务，审批面板未注册')
         return
       }
-      const mounted = { tab: undefined, sidebar: undefined }
+      // 复用模块级挂载状态：自动打开时间线要能看到「右侧栏 tab 是否已注册」
+      const mounted = mountState
+      mounted.tab = undefined
+      mounted.sidebar = undefined
       let lastKey = ''
 
       /** 对话区标签页：只放「审批设置」，时间线不再出现在这里。 */
@@ -1181,8 +2063,14 @@ window.__ModuleLoader__.load({
       beacon('mounted', 'placement=' + placementStore.value + ' tab=' + String(mounted.tab !== undefined)
         + ' sidebar=' + String(mounted.sidebar !== undefined)
         + ' hasSidebarSeat=' + String(ctx.get('sidebarRightTabs') !== undefined))
-      void placementStore.load().then(remount)
+      void runtimeStore.load().then(remount)
       void policyStore.load(undefined)
+      // 审批观察器：当前会话一出现新审批、且时间线没打开，就自动展开它。它与面板无关
+      // （用户停在「轨迹」标签页、或 placement 只挂右侧栏时同样要能触发），所以挂在插件入口；
+      // 放在 remount() 之后启动，右侧栏 tab 才已经注册、页面一加载就能取到「历史记录」基线。
+      if (approvalWatch.timer !== undefined) clearInterval(approvalWatch.timer)
+      approvalWatch.timer = setInterval(() => { void watchApprovals() }, POLL_MS)
+      void watchApprovals()
 
       ctx.effect(() => slots.inject('settings.plugin.item', () => {
         try {
@@ -1190,7 +2078,7 @@ window.__ModuleLoader__.load({
             name: 'settings.plugin.item',
             key: 'dsh-auto-pass',
             id: 'dsh-auto-pass',
-          }, () => react.createElement(PlacementCard))
+          }, () => react.createElement(SettingsCard, { tag: 'li', desc: t.panelCardDesc }))
           beacon('settings-registered')
           return dispose
         } catch (error) {
@@ -1202,6 +2090,11 @@ window.__ModuleLoader__.load({
       ctx.effect(() => () => {
         unsubscribe()
         unmount()
+        // 观察器随插件一起停：插件被卸载后不该再有后台轮询
+        if (approvalWatch.timer !== undefined) {
+          clearInterval(approvalWatch.timer)
+          approvalWatch.timer = undefined
+        }
       }, 'dsh-auto-pass: panel mounts')
       console.log(LOG, 'client loaded, placement=' + placementStore.value)
     }

@@ -22,6 +22,10 @@
 
 - risk_level：不可逆或影响面大 = high / critical；只读或范围很小 = low。
 - user_authorization：用户明确点名要这个动作 = high；能推断出意图 = medium；看不出 = unknown。
-- 可选字段 rule：这次调用代表一类**值得记住的重复动作**时才给（安全的白名单，或明显的黑名单），
-  形如 {"tool":"<工具名>","match_kind":"signature|command_prefix|path_prefix","match_value":"<匹配值>","label":"<简短标签>"}；
-  没有把握就省略该字段。
+- 可选字段 rule：这次调用代表一类**值得记住的重复动作**时才给（安全的白名单，或明显的黑名单）。
+  - **有命令的动作默认用 command_prefix**：match_value 抄「动作」里 command 的开头一段（去掉 `|` 之后的部分，
+    再去掉结尾的 `2>&1` 这类输出重定向），例如 `pnpm test`、`git rev-parse --short HEAD`。
+    **不要**写提权标记（`danger-full-access`）、不要写一句描述、不要自己编值——那种值一个动作都匹配不到，宿主会直接丢弃。
+  - 只有文件路径、没有命令的动作才用 path_prefix：match_value 取动作里给的绝对路径（目录，或最后一段用单层 `*`）。
+  - **不要用 signature**：精确签名是机器产出的整串 key，这里看不到它，写出来的必然命不中。
+  - 形如 {"tool":"<工具名>","match_kind":"command_prefix","match_value":"pnpm test","label":"<简短标签>"}；没有把握就省略该字段。

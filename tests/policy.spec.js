@@ -7,13 +7,16 @@
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  canonicalizeCounters,
+  canonicalMemoryKey,
   createPolicyStore,
   matchRule,
   MIN_PREFIX_CHARS,
   normalizePath,
   projectPolicyFile,
+  ruleCovers,
   signatureOf,
   validateRuleInput,
 } from '../src/policy.js'
@@ -60,6 +63,57 @@ describe('signatureOf', () => {
     expect(elevated.memoryKey).not.toBe(first.memoryKey)
   })
 
+  it('计数键把管道之后当噪声：同一条命令的不同输出截断算同一条', () => {
+    // 真机踩到的坑（2026-09-15）：用户连续人工放行了 4 次
+    // `pnpm vitest run tests/client.spec.js 2>&1 | Select-Object -Last 60/45/30/26`，
+    // 因为计数键含完整命令，每次都是一条新计数，阈值（3）永远攒不到。
+    const first = pwshSignature('pnpm vitest run tests/client.spec.js 2>&1 | Select-Object -Last 60')
+    const second = pwshSignature('pnpm vitest run tests/client.spec.js 2>&1 | Select-Object -Last 30')
+    const third = pwshSignature("pnpm vitest run tests/client.spec.js 2>&1 | Select-String -Pattern 'Tests ' | Out-String")
+    // 精确签名仍然各不相同：规则匹配必须逐字，计数才做归并
+    expect(first.key).not.toBe(second.key)
+    expect(first.key).not.toBe(third.key)
+    expect(first.memoryKey).toBe(second.memoryKey)
+    expect(first.memoryKey).toBe(third.memoryKey)
+    // 结尾的纯输出重定向也当噪声：`pnpm test 2>&1` 与 `pnpm test` 是同一条权限
+    expect(first.memoryKey).toContain('cmd:pnpm vitest run tests/client.spec.js')
+    expect(first.memoryKey).not.toContain('Select-Object')
+    // 没有管道的命令整条保留
+    expect(pwshSignature('git status --short').memoryKey).toContain('cmd:git status --short')
+  })
+
+  it('结尾的纯输出重定向也算噪声（2>&1 / >nul / 2>/dev/null）', () => {
+    // 真机踩到的坑：`pnpm test 2>&1` 与 `pnpm test` 被算成两条权限，阈值 3 攒不到
+    expect(pwshSignature('pnpm test 2>&1').memoryKey).toBe(pwshSignature('pnpm test').memoryKey)
+    expect(pwshSignature('npm run build >nul').memoryKey).toBe(pwshSignature('npm run build').memoryKey)
+    expect(pwshSignature('node x.js 2>/dev/null').memoryKey).toBe(pwshSignature('node x.js').memoryKey)
+    // 真会写文件的输出重定向不是噪声：它改变的是「在授权什么」
+    expect(pwshSignature('node x.js > out.txt').memoryKey).not.toBe(pwshSignature('node x.js').memoryKey)
+  })
+
+  it('workdir 不进计数键（同一工作区里的目录差异算同一条），精确签名仍按目录区分', () => {
+    const back = pwshSignature('pnpm test 2>&1', { workdir: 'D:\\work\\dsh-auto' })
+    const forward = pwshSignature('pnpm test 2>&1 | Select-Object -Last 12', { workdir: 'D:/work/dsh-auto' })
+    const absent = pwshSignature('pnpm test', {})
+    expect(back.memoryKey).toBe(forward.memoryKey)
+    expect(forward.memoryKey).toBe(absent.memoryKey)
+    // 精确签名只归一化分隔符、不丢目录：规则匹配不会因此放宽
+    expect(pwshSignature('pnpm test', { workdir: 'D:\\work\\x' }).key)
+      .toBe(pwshSignature('pnpm test', { workdir: 'D:/work/x' }).key)
+    expect(pwshSignature('pnpm test', { workdir: 'D:/work/x' }).key)
+      .not.toBe(pwshSignature('pnpm test', {}).key)
+  })
+
+  it('引号内的竖线不算管道（正则里的 | 不该截断计数键）', () => {
+    const first = pwshSignature("rg 'a|b' src")
+    const second = pwshSignature("rg 'a|c' src")
+    expect(first.memoryKey).not.toBe(second.memoryKey)
+    expect(first.memoryKey).toContain("rg 'a|b' src")
+    // 引号之前的真管道照旧截断
+    expect(pwshSignature("rg 'a|b' src | Select-Object -First 5").memoryKey)
+      .toBe(pwshSignature("rg 'a|b' src | Out-String").memoryKey)
+  })
+
   it('提权标记等额外参数参与签名', () => {
     const plain = pwshSignature('git status')
     const elevated = pwshSignature('git status', { sandbox_permissions: 'danger-full-access' })
@@ -76,6 +130,55 @@ describe('signatureOf', () => {
 
   it('缺少动作参数时不抛错', () => {
     expect(signatureOf({ toolName: 'pwsh' }, undefined).key).toContain('pwsh')
+  })
+})
+
+describe('计数键折算（canonicalMemoryKey / canonicalizeCounters）', () => {
+  it('当前算法产出的记忆键折算后不变（幂等）', () => {
+    const signature = pwshSignature('pnpm test 2>&1 | Select-Object -Last 12', {
+      workdir: 'D:/work/x',
+      sandbox_permissions: 'danger-full-access',
+    })
+    expect(canonicalMemoryKey(signature.memoryKey)).toBe(signature.memoryKey)
+  })
+
+  it('格式不认识时返回 undefined，不乱改键', () => {
+    expect(canonicalMemoryKey('pwsh\u0000cmd:x')).toBeUndefined()
+    expect(canonicalMemoryKey('pwsh\u0000cmd:x\u0000y:{}')).toBeUndefined()
+    expect(canonicalMemoryKey('')).toBeUndefined()
+  })
+
+  it('历史键合并到当前口径：管道之后 / workdir / 2>&1 不再各算一条，同目标取较大值', () => {
+    const cwd = 'D:/w'
+    const migrated = canonicalizeCounters({
+      [cwd + '\u0000pwsh\u0000cmd:pnpm test 2>&1 | Select-Object -Last 30\u0000x:{"workdir":"D:/work/x"}']: { allow: 1, deny: 0 },
+      [cwd + '\u0000pwsh\u0000cmd:pnpm test 2>&1\u0000x:{"workdir":"D:\\\\work\\\\x"}']: { allow: 2, deny: 0 },
+      [cwd + '\u0000pwsh\u0000cmd:pnpm test\u0000x:{}']: { allow: 1, deny: 3 },
+    })
+    expect(migrated.moved).toBe(2)
+    const keys = Object.keys(migrated.counters)
+    expect(keys).toHaveLength(1)
+    // 折算历史不该凭空攒出新的「连续次数」：取较大值而不是求和
+    expect(migrated.counters[keys[0]]).toEqual({ allow: 2, deny: 3 })
+  })
+
+  it('启动时折算并写回策略文件', () => {
+    const root = newRoot()
+    const file = join(root, 'policy.json')
+    const current = pwshSignature('pnpm test 2>&1')
+    const legacy = 'D:/w\u0000pwsh\u0000cmd:pnpm test 2>&1 | Select-Object -Last 30\u0000x:{"workdir":"D:/w"}'
+    const canonical = 'D:/w\u0000' + current.memoryKey
+    writeFileSync(file, JSON.stringify({
+      version: 1,
+      rules: { allow: [], deny: [] },
+      counters: { [legacy]: { allow: 1, deny: 0 }, [canonical]: { allow: 2, deny: 0 } },
+    }), 'utf8')
+    const info = vi.fn()
+    createPolicyStore({ globalFile: file, warn: () => {}, info })
+    expect(info).toHaveBeenCalledWith(expect.stringContaining('已折算 1 个历史计数键'))
+    const persisted = JSON.parse(readFileSync(file, 'utf8'))
+    expect(Object.keys(persisted.counters)).toEqual([canonical])
+    expect(persisted.counters[canonical]).toEqual({ allow: 2, deny: 0 })
   })
 })
 
@@ -123,6 +226,26 @@ describe('matchRule', () => {
     const rule = { tool: 'write', match: { kind: 'path_prefix', value: 'D:/repo/src' } }
     expect(matchRule(rule, exact)).toBe(true)
   })
+
+  it('重建签名时缺 paths（老记录）一律不命中，绝不因为字段缺失而放行', () => {
+    // signatureFromRecord 对老记录不再伪造空数组：字段缺失 = 不知道，matchRule 必须拒绝
+    const legacy = { toolName: 'write', key: 'k', text: 'write: x' }
+    expect(matchRule({ tool: 'write', match: { kind: 'path_prefix', value: 'D:/repo/src' } }, legacy)).toBe(false)
+    expect(matchRule({ tool: 'write', match: { kind: 'path_prefix', value: 'D:/repo/src/*.js' } }, legacy)).toBe(false)
+  })
+
+  it('路径前缀的单层通配：同目录的 .js 命中，子目录 / 别的目录 / 别的后缀都不命中', () => {
+    const rule = { tool: 'write', match: { kind: 'path_prefix', value: 'D:/repo/src/*.js' } }
+    const at = path => signatureOf({ toolName: 'write' }, { arguments: { file_path: path } })
+    expect(matchRule(rule, at('D:/repo/src/a.js'))).toBe(true)
+    expect(matchRule(rule, at('D:/repo/src/a.b.js'))).toBe(true)
+    expect(matchRule(rule, at('D:/repo/src/a.ts'))).toBe(false)
+    // 不跨目录：子目录与兄弟目录都不算
+    expect(matchRule(rule, at('D:/repo/src/sub/a.js'))).toBe(false)
+    expect(matchRule(rule, at('D:/repo/other/a.js'))).toBe(false)
+    // 目录本身不是文件，不命中带通配符的规则
+    expect(matchRule(rule, at('D:/repo/src'))).toBe(false)
+  })
 })
 
 describe('validateRuleInput', () => {
@@ -137,11 +260,73 @@ describe('validateRuleInput', () => {
     expect(result.rule.label).toBe('git 只读命令')
   })
 
+  it('路径规则只认单层 *：** / ? / [] / 中段通配 / 无目录的通配一律拒绝', () => {
+    const ruleOf = value => validateRuleInput({ tool: 'write', label: 'x', match: { kind: 'path_prefix', value } })
+    expect(ruleOf('D:/repo/**/*.js').error).toContain('**')
+    expect(ruleOf('D:/repo/src/?a.js').ok).toBe(false)
+    expect(ruleOf('D:/repo/src/[ab].js').ok).toBe(false)
+    // * 只能出现在最后一段
+    expect(ruleOf('D:/repo/*/a.js').ok).toBe(false)
+    // 通配符前面必须有目录：*.js 这种相对模式在绝对路径上一条也命不中
+    expect(ruleOf('*.js').ok).toBe(false)
+    expect(ruleOf('*').ok).toBe(false)
+    // 合法的单层通配
+    expect(ruleOf('D:/repo/src/*.js').ok).toBe(true)
+    expect(ruleOf('D:/repo/src/*').ok).toBe(true)
+    // 不含通配符的目录前缀照旧
+    expect(ruleOf('D:/repo/src').ok).toBe(true)
+  })
+
   it('拒绝未知匹配条件、空标签与过短前缀', () => {
     expect(validateRuleInput({ tool: 'pwsh', label: 'x', match: { kind: 'regex', value: '.*' } }).ok).toBe(false)
     expect(validateRuleInput({ tool: 'pwsh', label: '', match: { kind: 'signature', value: 'k' } }).ok).toBe(false)
     expect(validateRuleInput({ tool: 'pwsh', label: 'x', match: { kind: 'command_prefix', value: 'gi' } }).ok).toBe(false)
     expect(validateRuleInput(null).ok).toBe(false)
+  })
+})
+
+describe('ruleCovers（规则之间的语义包含）', () => {
+  const prefix = (value, tool = 'pwsh') => ({ tool, match: { kind: 'command_prefix', value } })
+  const exact = (value, tool = 'pwsh') => ({ tool, match: { kind: 'signature', value } })
+  const pathPrefix = (value, tool = 'write') => ({ tool, match: { kind: 'path_prefix', value } })
+
+  it('命令前缀覆盖更长的前缀（含只差尾部空格的同义前缀），忽略大小写', () => {
+    // 「pnpm test」与「pnpm test 」（模型生成的规则文本常差一个尾部空格）是同一个范围
+    expect(ruleCovers(prefix('pnpm test'), prefix('pnpm test '))).toBe(true)
+    expect(ruleCovers(prefix('pnpm test'), prefix('PNPM test 2>&1'))).toBe(true)
+    expect(ruleCovers(prefix('pnpm test'), prefix('pnpm test'))).toBe(true)
+    // 词边界：更长的前缀必须从分隔符接上，否则不算被覆盖
+    expect(ruleCovers(prefix('pnpm test'), prefix('pnpm testing'))).toBe(false)
+    // 反向不成立：更长的前缀不覆盖更短的前缀
+    expect(ruleCovers(prefix('pnpm test 2>&1'), prefix('pnpm test'))).toBe(false)
+  })
+
+  it('命令前缀覆盖同一命令的精确签名，但不认非命令类签名', () => {
+    const test = pwshSignature('pnpm test 2>&1 | Select-Object -Last 12')
+    expect(ruleCovers(prefix('pnpm test'), exact(test.key))).toBe(true)
+    expect(ruleCovers(prefix('pnpm test'), exact(pwshSignature('git status').key))).toBe(false)
+    // 写文件这类签名是 args: 形态，取不出命令，判不出来就一律不算覆盖
+    const write = signatureOf({ toolName: 'write' }, { arguments: { file_path: 'D:/repo/a.js' } })
+    expect(ruleCovers({ tool: 'write', match: { kind: 'command_prefix', value: 'pnpm test' } }, exact(write.key, 'write'))).toBe(false)
+  })
+
+  it('路径前缀按目录边界覆盖，不误伤兄弟目录', () => {
+    expect(ruleCovers(pathPrefix('D:/repo/src'), pathPrefix('D:/repo/src/a'))).toBe(true)
+    expect(ruleCovers(pathPrefix('D:/repo/src'), pathPrefix('D:/repo/src'))).toBe(true)
+    expect(ruleCovers(pathPrefix('D:/repo/src'), pathPrefix('D:/repo/src-old'))).toBe(false)
+  })
+
+  it('工具不同、条件种类无法比较、缺字段时一律返回 false', () => {
+    expect(ruleCovers(prefix('pnpm test', 'bash'), prefix('pnpm test'))).toBe(false)
+    expect(ruleCovers(prefix('pnpm test'), pathPrefix('D:/repo'))).toBe(false)
+    expect(ruleCovers(exact('k'), prefix('pnpm test'))).toBe(false)
+    expect(ruleCovers(null, prefix('pnpm test'))).toBe(false)
+    expect(ruleCovers({ tool: 'pwsh' }, prefix('pnpm test'))).toBe(false)
+  })
+
+  it('精确签名只覆盖同一个签名', () => {
+    expect(ruleCovers(exact('a'), exact('a'))).toBe(true)
+    expect(ruleCovers(exact('a'), exact('b'))).toBe(false)
   })
 })
 
@@ -186,14 +371,185 @@ describe('policy store', () => {
     expect(hit.scope).toBe('project')
   })
 
-  it('同工具同条件重复升级只保留一条并更新内容', () => {
+  it('同工具同条件重复升级只保留一条并更新内容，且如实回报 replaced', () => {
     const instance = store()
     const signature = pwshSignature('git status')
-    instance.addRule(signatureRule('global', 'allow', signature, { note: 'a' }), cwd)
-    instance.addRule(signatureRule('global', 'allow', signature, { note: 'b' }), cwd)
+    // 第一次是新增，第二次命中同一条规则 = 更新（客户端据此提示「已更新」而不是「已加入」）
+    expect(instance.addRule(signatureRule('global', 'allow', signature, { note: 'a' }), cwd).replaced).toBe(false)
+    const second = instance.addRule(signatureRule('global', 'allow', signature, { note: 'b' }), cwd)
+    expect(second.replaced).toBe(true)
     const rules = instance.snapshot(cwd).global.allow
     expect(rules).toHaveLength(1)
     expect(rules[0].note).toBe('b')
+    // 不同名单互不干扰：同条件加进黑名单是新的一条，不是更新
+    expect(instance.addRule(signatureRule('global', 'deny', signature), cwd).replaced).toBe(false)
+    expect(instance.snapshot(cwd).global.deny).toHaveLength(1)
+  })
+
+  it('只差尾部空格（模型文本抖动）的同义规则按同一条更新，不会留下两条', () => {
+    const instance = store()
+    const prefixRule = value => ({
+      scope: 'global',
+      list: 'allow',
+      rule: { tool: 'pwsh', label: '跑测试', match: { kind: 'command_prefix', value } },
+    })
+    expect(instance.addRule(prefixRule('pnpm test'), cwd).replaced).toBe(false)
+    // 真机踩过的坑：模型第二次给的是「pnpm test 」（尾部多一个空格），旧代码按字符串比对判不出重复
+    const second = instance.addRule(prefixRule('pnpm test '), cwd)
+    expect(second.replaced).toBe(true)
+    expect(second.covered).toBe(false)
+    expect(instance.snapshot(cwd).global.allow).toHaveLength(1)
+    // 大小写同样归一：匹配器本来就忽略大小写，名单里也不该出现两条
+    expect(instance.addRule(prefixRule('PNPM TEST'), cwd).replaced).toBe(true)
+    expect(instance.snapshot(cwd).global.allow).toHaveLength(1)
+  })
+
+  it('已被更宽的规则覆盖时不重复写入，回报 covered 并指向那条规则', () => {
+    const instance = store()
+    const wide = instance.addRule({
+      scope: 'global',
+      list: 'allow',
+      rule: { tool: 'pwsh', label: '跑测试', match: { kind: 'command_prefix', value: 'pnpm test' } },
+    }, cwd)
+    // 精确签名（同一个动作）本来就在那条前缀规则的范围里：不该再写一条
+    const added = instance.addRule(signatureRule('global', 'allow', pwshSignature('pnpm test 2>&1 | Select-Object -Last 12')), cwd)
+    expect(added.covered).toBe(true)
+    expect(added.replaced).toBe(false)
+    expect(added.rule.id).toBe(wide.rule.id)
+    const rules = instance.snapshot(cwd).global.allow
+    expect(rules).toHaveLength(1)
+    expect(rules[0].match).toEqual({ kind: 'command_prefix', value: 'pnpm test' })
+  })
+
+  it('新规则覆盖了更窄的旧规则时合并掉窄规则，只留一条', () => {
+    const instance = store()
+    const narrow = instance.addRule(signatureRule('global', 'allow', pwshSignature('pnpm test 2>&1 | Select-Object -Last 12')), cwd)
+    const added = instance.addRule({
+      scope: 'global',
+      list: 'allow',
+      rule: { tool: 'pwsh', label: '跑测试', match: { kind: 'command_prefix', value: 'pnpm test' } },
+    }, cwd)
+    expect(added.covered).toBe(false)
+    expect(added.replaced).toBe(false)
+    expect(added.merged).toBe(1)
+    const rules = instance.snapshot(cwd).global.allow
+    expect(rules).toHaveLength(1)
+    expect(rules[0].id).not.toBe(narrow.rule.id)
+    expect(rules[0].match.kind).toBe('command_prefix')
+    // 合并是落盘的：新实例（模拟重启）看到的同样只有一条
+    expect(store().snapshot(cwd).global.allow).toHaveLength(1)
+  })
+
+  it('项目与全局两级各自查重，互不干扰', () => {
+    const instance = store()
+    const prefixRule = scope => ({
+      scope,
+      list: 'allow',
+      rule: { tool: 'pwsh', label: '跑测试', match: { kind: 'command_prefix', value: 'pnpm test' } },
+    })
+    expect(instance.addRule(prefixRule('project'), cwd).replaced).toBe(false)
+    // 全局是新的一条（同一份规则加到全局 = 放宽到所有项目，不是重复）
+    const global = instance.addRule(prefixRule('global'), cwd)
+    expect(global.replaced).toBe(false)
+    expect(global.covered).toBe(false)
+    expect(instance.snapshot(cwd).project.allow).toHaveLength(1)
+    expect(instance.snapshot(cwd).global.allow).toHaveLength(1)
+  })
+
+  it('签名按逐字比对：参数里只差空白的两条签名不会被当成同一条', () => {
+    const instance = store()
+    const ruleFor = key => ({
+      scope: 'global',
+      list: 'allow',
+      rule: { tool: 'write', label: '写文件', match: { kind: 'signature', value: key } },
+    })
+    // 前缀类条件要折叠空白/大小写，但签名是机器产出的精确 key：折叠会把两条不同签名
+    // 判成同一条，替换掉旧规则就等于让那条签名失去覆盖（审批面变大）
+    expect(instance.addRule(ruleFor('write\u0000args:{"content":"a b"}'), cwd).replaced).toBe(false)
+    const second = instance.addRule(ruleFor('write\u0000args:{"content":"a  b"}'), cwd)
+    expect(second.replaced).toBe(false)
+    expect(second.covered).toBe(false)
+    expect(instance.snapshot(cwd).global.allow).toHaveLength(2)
+  })
+
+  it('updateRule 按 id 原地更新匹配条件与标签，id 不变、立刻生效', () => {
+    const instance = store()
+    const added = instance.addRule({
+      scope: 'project',
+      list: 'allow',
+      rule: {
+        tool: 'pwsh',
+        label: '运行 policy.spec.js 单测',
+        match: { kind: 'command_prefix', value: 'pnpm vitest run tests/policy.spec.js' },
+      },
+    }, cwd)
+    const updated = instance.updateRule({
+      scope: 'project',
+      list: 'allow',
+      id: added.rule.id,
+      rule: { tool: 'pwsh', label: '运行测试套件', match: { kind: 'command_prefix', value: 'pnpm test' } },
+    }, cwd)
+    expect(updated.ok).toBe(true)
+    // id 不变：记录/时间线里的 ruleId 仍指得回来；来源如实改成「手动」
+    expect(updated.rule.id).toBe(added.rule.id)
+    expect(updated.rule.source).toBe('user')
+    expect(updated.rule.label).toBe('运行测试套件')
+    expect(updated.rule.match).toEqual({ kind: 'command_prefix', value: 'pnpm test' })
+    const rules = instance.snapshot(cwd).project.allow
+    expect(rules).toHaveLength(1)
+    expect(rules[0].match.value).toBe('pnpm test')
+    // 落盘 + 立刻生效：改宽之后原先命不中的动作也能命中
+    expect(store().snapshot(cwd).project.allow[0].label).toBe('运行测试套件')
+    expect(instance.match({ signature: pwshSignature('pnpm test 2>&1'), cwd })?.list).toBe('allow')
+  })
+
+  it('updateRule 改完与另一条同义时合并掉那条，名单里不留两条', () => {
+    const instance = store()
+    const prefixRule = value => ({
+      scope: 'project',
+      list: 'allow',
+      rule: { tool: 'pwsh', label: value, match: { kind: 'command_prefix', value } },
+    })
+    instance.addRule(prefixRule('pnpm test'), cwd)
+    const second = instance.addRule(prefixRule('pnpm vitest run tests/policy.spec.js'), cwd)
+    // 把第二条改成与第一条同义（只差一个尾部空格）：归一化后同值 → 合并
+    const updated = instance.updateRule({
+      scope: 'project',
+      list: 'allow',
+      id: second.rule.id,
+      rule: { tool: 'pwsh', label: '改名后的规则', match: { kind: 'command_prefix', value: 'pnpm test ' } },
+    }, cwd)
+    expect(updated.ok).toBe(true)
+    expect(updated.replaced).toBe(true)
+    const rules = instance.snapshot(cwd).project.allow
+    expect(rules).toHaveLength(1)
+    expect(rules[0].id).toBe(second.rule.id)
+  })
+
+  it('updateRule 找不到 id 或条件非法时如实报错，不动盘', () => {
+    const instance = store()
+    const added = instance.addRule({
+      scope: 'project',
+      list: 'allow',
+      rule: { tool: 'pwsh', label: 'x', match: { kind: 'signature', value: 'k' } },
+    }, cwd)
+    const missing = instance.updateRule({
+      scope: 'project', list: 'allow', id: 'nope',
+      rule: { tool: 'pwsh', label: 'x', match: { kind: 'signature', value: 'k' } },
+    }, cwd)
+    expect(missing.ok).toBe(false)
+    const invalid = instance.updateRule({
+      scope: 'project', list: 'allow', id: added.rule.id,
+      rule: { tool: 'pwsh', label: 'x', match: { kind: 'regex', value: '.*' } },
+    }, cwd)
+    expect(invalid.ok).toBe(false)
+    const badScope = instance.updateRule({
+      scope: 'nope', list: 'allow', id: added.rule.id,
+      rule: { tool: 'pwsh', label: 'x', match: { kind: 'signature', value: 'k' } },
+    }, cwd)
+    expect(badScope.ok).toBe(false)
+    expect(instance.snapshot(cwd).project.allow).toHaveLength(1)
+    expect(instance.snapshot(cwd).project.allow[0].label).toBe('x')
   })
 
   it('removeRule 按 id 删除并落盘', () => {
@@ -270,6 +626,16 @@ describe('observe（连续计数与升级建议）', () => {
     expect(instance.match({ signature, cwd })).toBeUndefined()
     // 触发后计数清零：同一次累积不会被重复触发
     expect(instance.observe({ signature, cwd, signal: 'pass' }).approvals).toBe(1)
+  })
+
+  it('同一条命令的不同管道变体算同一类：连续放行照样攒够阈值', () => {
+    // 用户真实场景：每次都是同一条 pnpm vitest run，只是输出截断从 -Last 60 变成 -Last 30
+    const instance = store(2)
+    const first = pwshSignature('pnpm vitest run tests/client.spec.js 2>&1 | Select-Object -Last 60')
+    const second = pwshSignature('pnpm vitest run tests/client.spec.js 2>&1 | Select-Object -Last 30')
+    expect(instance.observe({ signature: first, cwd, signal: 'pass' }).suggestion).toBeNull()
+    expect(instance.observe({ signature: second, cwd, signal: 'pass' }).suggestion)
+      .toEqual({ list: 'allow', count: 2 })
   })
 
   it('连续被拒达到阈值时给出黑名单建议', () => {

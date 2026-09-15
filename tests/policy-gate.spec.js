@@ -12,12 +12,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   apply,
   createAutoApprovalHandler,
+  decisionSignal,
+  defaultRuleOf,
   exactAction,
+  kindApplicable,
   parseSuggestedRule,
   POLICY_PATH,
   resolveConfig,
   ruleFromRecord,
+  RULE_DRAFT_PATH,
   RULE_PATH,
+  suggestionUsable,
 } from '../src/index.js'
 import { createPolicyStore } from '../src/policy.js'
 import { signatureOf } from '../src/policy.js'
@@ -34,6 +39,8 @@ vi.mock('@deepseek-ai/dsh-llm', () => ({
     push(chunk) {
       if (typeof chunk === 'string') this.parts.push(chunk)
       else if (chunk !== null && typeof chunk === 'object' && chunk.text !== undefined) this.parts.push(String(chunk.text))
+      // 真实的 BlockAssembler 也这样收 usage 块：留在 this.usage 上供调用方读取
+      else if (chunk !== null && typeof chunk === 'object' && chunk.usage !== undefined) this.usage = chunk.usage
     }
 
     blocks() {
@@ -45,12 +52,17 @@ vi.mock('@deepseek-ai/dsh-llm', () => ({
 /** 把 reviewerRun(...) 转成「模型回复」的取数函数（stopReason 不是 completed 就当调用失败）。 */
 function toReply(item) {
   if (typeof item === 'string' || item instanceof Error) return item
+  // 直接给 { text, usage }：拿它当模型回复原文（用于「有用量但回复不合法」这类用例）
+  if (item !== null && typeof item === 'object' && typeof item.text === 'string') return () => item
   return async () => {
     const result = await item.result
     if (result?.stopReason !== undefined && result.stopReason !== 'completed') {
       throw new Error('模型调用未正常结束：' + result.stopReason)
     }
-    return JSON.stringify(result?.structured ?? {})
+    const text = JSON.stringify(result?.structured ?? {})
+    // reviewerRun 可以带 usage：交给 stream 变成一次 usage 块，覆盖「记录 token 消耗」的路径
+    const usage = item.usage ?? result?.usage
+    return usage === undefined ? text : { text, usage }
   }
 }
 
@@ -122,6 +134,12 @@ function contextWith(runs = [], options = {}) {
       return (async function* () {
         const value = typeof next === 'function' ? await next() : next
         if (value instanceof Error) throw value
+        // 排练项可以是纯文本，也可以是 { text, usage }（带 token 用量）
+        if (value !== null && typeof value === 'object' && typeof value.text === 'string') {
+          yield { text: value.text }
+          if (value.usage !== undefined) yield { usage: value.usage }
+          return
+        }
         yield { text: value }
       })()
     },
@@ -252,6 +270,9 @@ describe('白名单与黑名单', () => {
     expect(outcome).toBe('rejected')
     expect(next).toHaveBeenCalledOnce()
     expect(ctx.llmCalls).toHaveLength(0)
+    // 审批卡首行（DSH 渲染 req.reason）带上「为什么转人工」，并保留调用方给的原文
+    expect(request.reason).toContain('\n\n自动审批：命中全局黑名单')
+    expect(request.reason).toContain('escalate sandbox')
   })
 
   it('白名单命中的记录写清命中的是哪一侧与哪条规则（时间线据此显示白名单）', async () => {
@@ -309,7 +330,61 @@ describe('白名单与黑名单', () => {
   })
 })
 
+describe('计数信号（decisionSignal）', () => {
+  it('最终获准执行就是放行：人工放行盖过模型的 deny', () => {
+    // 真机踩到的坑：模型判 deny、转人工后用户点了「允许一次」，旧实现计成「连续被拒」，
+    // 白名单永远攒不够阈值。
+    expect(decisionSignal('allowed-once', { verdict: 'deny' })).toBe('pass')
+    expect(decisionSignal('allowed-once', { verdict: 'allow' })).toBe('pass')
+    expect(decisionSignal('allowed-once', { verdict: 'defer' })).toBe('pass')
+  })
+
+  it('最终未被批准算拒绝；没人拍板时只看模型判定', () => {
+    expect(decisionSignal('rejected', { verdict: 'allow' })).toBe('reject')
+    expect(decisionSignal('rejected', { verdict: 'deny' })).toBe('reject')
+    // 无人应答 / 已取消：模型判过 deny 的算一次未获批准，其余（审查失败、defer）不计数
+    expect(decisionSignal('unavailable', { verdict: 'deny' })).toBe('reject')
+    expect(decisionSignal('cancelled', { verdict: 'deny' })).toBe('reject')
+    expect(decisionSignal('unavailable', { verdict: 'defer' })).toBeUndefined()
+    expect(decisionSignal(undefined, undefined)).toBeUndefined()
+  })
+})
+
 describe('权限记忆（达阈值后询问用户）', () => {
+  it('模型判 deny、你连续放行三次：按「连续放行」询问是否加入白名单', async () => {
+    const root = tempDir()
+    const projectDir = join(root, 'project')
+    const policies = policyStore(root, 3)
+    const asked = []
+    const ctx = contextWith([denyRun(), denyRun(), denyRun(RULE_SUGGESTION)], {
+      userQuestions: {
+        ask: async request => {
+          asked.push(request)
+          return { answers: [{ id: 'dsh-auto-pass:allow', selected: ['加入白名单（本项目）'] }] }
+        },
+      },
+    })
+    const handler = createAutoApprovalHandler(
+      ctx, resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' }), undefined, policies)
+    /** 每次都是「模型 deny → 你在审批卡上点允许一次」。 */
+    const approve = () => vi.fn().mockResolvedValue('allowed-once')
+
+    expect(await handler(requestWith({ cwd: projectDir }), approve())).toBe('allowed-once')
+    await flush()
+    expect(asked).toHaveLength(0)
+    expect(await handler(requestWith({ cwd: projectDir }), approve())).toBe('allowed-once')
+    await flush()
+    expect(asked).toHaveLength(0)
+
+    expect(await handler(requestWith({ cwd: projectDir }), approve())).toBe('allowed-once')
+    await flush()
+    // 第三次达到阈值：问的是**白名单**（你的放行被计成连续放行），黑名单一侧不该被计数
+    expect(asked).toHaveLength(1)
+    expect(asked[0].questions[0].id).toBe('dsh-auto-pass:allow')
+    expect(policies.snapshot(projectDir).project.allow).toHaveLength(1)
+    expect(policies.snapshot(projectDir).project.deny ?? []).toHaveLength(0)
+  })
+
   it('连续放行达到阈值后询问用户，同意才写入白名单', async () => {
     const root = tempDir()
     const projectDir = join(root, 'project')
@@ -356,6 +431,36 @@ describe('权限记忆（达阈值后询问用户）', () => {
     expect(await handler(requestWith({ cwd: projectDir }), third)).toBe('allowed-once')
     expect(third).not.toHaveBeenCalled()
     expect(ctx.llmCalls).toHaveLength(2)
+  })
+
+  it('没有可用的模型建议时，兜底写的是命令前缀（不是逐字的精确签名）', async () => {
+    const root = tempDir()
+    const projectDir = join(root, 'project')
+    const policies = policyStore(root, 2)
+    const asked = []
+    // 两次审查都判 deny 且**不给**建议规则：兜底必须自己整理成好用的条件
+    const ctx = contextWith([denyRun(), denyRun()], {
+      userQuestions: {
+        ask: async request => {
+          asked.push(request)
+          return { answers: [{ id: 'dsh-auto-pass:allow', selected: ['加入白名单（本项目）'] }] }
+        },
+      },
+    })
+    const handler = createAutoApprovalHandler(
+      ctx, resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' }), undefined, policies)
+    const approve = () => vi.fn().mockResolvedValue('allowed-once')
+
+    expect(await handler(requestWith({ cwd: projectDir }), approve())).toBe('allowed-once')
+    await flush()
+    expect(await handler(requestWith({ cwd: projectDir }), approve())).toBe('allowed-once')
+    await flush()
+
+    expect(asked).toHaveLength(1)
+    expect(asked[0].questions[0].question).toContain('命令前缀')
+    const rules = policies.snapshot(projectDir).project.allow
+    expect(rules).toHaveLength(1)
+    expect(rules[0].match).toEqual({ kind: 'command_prefix', value: 'npm test' })
   })
 
   it('人工拒绝打断连续计数', async () => {
@@ -463,8 +568,10 @@ describe('权限记忆（达阈值后询问用户）', () => {
     await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('rejected'))
     await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('rejected'))
     await flush()
-    expect(asked).toHaveLength(1)
-    expect(asked[0].questions[0].options.map(option => option.label)).toContain('加入黑名单（全局）')
+    // 两次人工拒绝各自还会触发一次「拒绝理由」追问，所以按 question id 挑出规则确认那一条
+    const suggestions = asked.filter(ask => ask.questions[0].id === 'dsh-auto-pass:deny')
+    expect(suggestions).toHaveLength(1)
+    expect(suggestions[0].questions[0].options.map(option => option.label)).toContain('加入黑名单（全局）')
     const rules = policies.snapshot(projectDir).global.deny
     expect(rules).toHaveLength(1)
     expect(rules[0].match).toEqual({ kind: 'command_prefix', value: 'npm test' })
@@ -563,6 +670,95 @@ describe('升级/降级规则', () => {
     expect(fallback.source).toBe('user')
     expect(ruleFromRecord({ cwd: '/p' })).toBeUndefined()
   })
+
+  it('ruleFromRecord 的兜底默认是命令前缀：换个参数不再命不中', () => {
+    const withCommand = ruleFromRecord({
+      cwd: '/p',
+      signature: signatureOf({ toolName: 'pwsh' }, {
+        arguments: { command: 'pnpm test 2>&1 | Select-Object -Last 12', sandbox_permissions: 'danger-full-access' },
+      }),
+    })
+    expect(withCommand.match).toEqual({ kind: 'command_prefix', value: 'pnpm test' })
+    expect(withCommand.note).toContain('默认为命令前缀')
+    // 这次动作没有命令（write 之类）：前缀条件用不上，仍回落精确签名
+    const noCommand = ruleFromRecord({
+      cwd: '/p',
+      signature: signatureOf({ toolName: 'write' }, { arguments: { file_path: '/p/a.txt' } }),
+    })
+    expect(noCommand.match.kind).toBe('signature')
+  })
+
+  it('defaultRuleOf：有命令给命令前缀，命令太短或没有命令才给精确签名', () => {
+    expect(defaultRuleOf(signatureOf({ toolName: 'pwsh' }, { arguments: { command: 'pnpm test 2>&1' } })).match)
+      .toEqual({ kind: 'command_prefix', value: 'pnpm test' })
+    expect(defaultRuleOf(signatureOf({ toolName: 'pwsh' }, { arguments: { command: 'ls' } })).match.kind).toBe('signature')
+    expect(defaultRuleOf(signatureOf({ toolName: 'write' }, { arguments: { file_path: '/p/a.txt' } })).match.kind)
+      .toBe('signature')
+    expect(defaultRuleOf(undefined)).toBeUndefined()
+  })
+})
+
+describe('模型建议规则的有效性（suggestionUsable）', () => {
+  const signature = signatureOf({ toolName: 'pwsh' }, {
+    arguments: { command: 'pnpm vitest run tests/policy-gate.spec.js 2>&1 | Select-String "done"', sandbox_permissions: 'danger-full-access' },
+  })
+
+  it('「精确签名」必须逐字等于本次签名，写成一句描述的一律不可用', () => {
+    // 真机记录里模型写过这三种：danger-full-access / escalation:danger-full-access / escalation=danger-full-access
+    expect(suggestionUsable({ tool: 'pwsh', match: { kind: 'signature', value: 'danger-full-access' } }, signature)).toBe(false)
+    expect(suggestionUsable({ tool: 'pwsh', match: { kind: 'signature', value: 'escalation:danger-full-access' } }, signature)).toBe(false)
+    expect(suggestionUsable({ tool: 'pwsh', match: { kind: 'signature', value: 'escalation=danger-full-access' } }, signature)).toBe(false)
+    expect(suggestionUsable({ tool: 'pwsh', match: { kind: 'signature', value: signature.key } }, signature)).toBe(true)
+    // 工具名对不上、条件种类不认识、没有签名可比对：一律不可用
+    expect(suggestionUsable({ tool: 'wsl', match: { kind: 'signature', value: signature.key } }, signature)).toBe(false)
+    expect(suggestionUsable({ tool: 'pwsh', match: { kind: 'regex', value: '.*' } }, signature)).toBe(false)
+    expect(suggestionUsable({ tool: 'pwsh', match: { kind: 'signature', value: signature.key } }, undefined)).toBe(false)
+  })
+
+  it('前缀类条件要真的覆盖本次动作；签名里没有可比对字段时先信模型', () => {
+    expect(suggestionUsable({ tool: 'pwsh', match: { kind: 'command_prefix', value: 'pnpm vitest run' } }, signature)).toBe(true)
+    expect(suggestionUsable({ tool: 'pwsh', match: { kind: 'command_prefix', value: 'git status' } }, signature)).toBe(false)
+    // 老记录只有 key/text（没有 command/paths）：判不了就照旧信任模型，别凭空丢弃
+    const legacy = { toolName: 'pwsh', key: 'k', text: 'pwsh: pnpm test' }
+    expect(suggestionUsable({ tool: 'pwsh', match: { kind: 'command_prefix', value: 'npm test' } }, legacy)).toBe(true)
+  })
+
+  it('新记录「字段为空」与老记录「字段缺失」区别对待：空的一律判不可用', () => {
+    // 真机踩到的坑：一条 pwsh 命令记录（paths 是空数组）被要求生成路径前缀，模型给了个目录，
+    // 旧写法因为「paths 为空 = 判不了」而放行，写进去一条永远命不中的规则
+    const commandOnly = {
+      toolName: 'pwsh',
+      key: 'k',
+      text: 'pwsh: pnpm test',
+      command: 'pnpm test',
+      paths: [],
+    }
+    expect(suggestionUsable({ tool: 'pwsh', match: { kind: 'path_prefix', value: 'D:/work/x' } }, commandOnly)).toBe(false)
+    expect(suggestionUsable({ tool: 'pwsh', match: { kind: 'command_prefix', value: 'pnpm test' } }, commandOnly)).toBe(true)
+    // 反过来：写文件的动作没有命令，命令前缀也命不中
+    const fileOnly = {
+      toolName: 'write',
+      key: 'k',
+      text: 'write: D:/work/x/a.js',
+      paths: ['D:/work/x/a.js'],
+    }
+    expect(suggestionUsable({ tool: 'write', match: { kind: 'command_prefix', value: 'pnpm test' } }, fileOnly)).toBe(false)
+    expect(suggestionUsable({ tool: 'write', match: { kind: 'path_prefix', value: 'D:/work/x' } }, fileOnly)).toBe(true)
+    // 老记录（连 paths 都没有）两边都算判不了 → 不拦
+    const legacy = { toolName: 'write', key: 'k', text: 'write: x' }
+    expect(suggestionUsable({ tool: 'write', match: { kind: 'path_prefix', value: 'D:/work/x' } }, legacy)).toBe(true)
+    expect(suggestionUsable({ tool: 'write', match: { kind: 'command_prefix', value: 'pnpm test' } }, legacy)).toBe(true)
+  })
+
+  it('kindApplicable 与上面同一口径：新记录按实际字段判，老记录一律可用', () => {
+    expect(kindApplicable({ toolName: 'pwsh', key: 'k', text: 't', command: 'pnpm test', paths: [] }, 'command_prefix')).toBe(true)
+    expect(kindApplicable({ toolName: 'pwsh', key: 'k', text: 't', command: 'pnpm test', paths: [] }, 'path_prefix')).toBe(false)
+    expect(kindApplicable({ toolName: 'write', key: 'k', text: 't', paths: ['D:/a.js'] }, 'path_prefix')).toBe(true)
+    expect(kindApplicable({ toolName: 'write', key: 'k', text: 't', paths: ['D:/a.js'] }, 'command_prefix')).toBe(false)
+    expect(kindApplicable({ toolName: 'x', key: 'k', text: 't' }, 'path_prefix')).toBe(true)
+    expect(kindApplicable({ toolName: 'x', key: 'k', text: 't' }, 'signature')).toBe(true)
+    expect(kindApplicable(undefined, 'signature')).toBe(false)
+  })
 })
 
 describe('策略 HTTP 入口', () => {
@@ -652,18 +848,201 @@ describe('策略 HTTP 入口', () => {
     const added = JSON.parse(add.state.body)
     expect(added.ok).toBe(true)
     expect(added.scope).toBe('project')
+    // 新增时如实回报「没有查到重复」
+    expect(added).toMatchObject({ replaced: false, covered: false, merged: 0 })
+
+    // 查重走 HTTP 出口：同一「工具 + 匹配条件」只差一个尾部空格 = 同一条规则，更新而不是追加
+    const again = fakeHttp('POST', POLICY_PATH, JSON.stringify({
+      op: 'add',
+      scope: 'project',
+      list: 'deny',
+      cwd: projectDir,
+      rule: { tool: 'bash', match: { kind: 'command_prefix', value: 'rm -rf ' }, label: '递归删除（更新）' },
+    }))
+    await handler(again.req, again.res)
+    expect(JSON.parse(again.state.body)).toMatchObject({ ok: true, replaced: true, covered: false })
+
+    // 已被更宽的规则覆盖：不写重复条目，回报 covered 并指向那条已有规则
+    const covered = fakeHttp('POST', POLICY_PATH, JSON.stringify({
+      op: 'add',
+      scope: 'project',
+      list: 'deny',
+      cwd: projectDir,
+      rule: { tool: 'bash', match: { kind: 'command_prefix', value: 'rm -rf /' }, label: '递归删除根目录' },
+    }))
+    await handler(covered.req, covered.res)
+    const coveredBody = JSON.parse(covered.state.body)
+    expect(coveredBody).toMatchObject({ ok: true, covered: true, replaced: false })
+    expect(coveredBody.rule.match).toEqual({ kind: 'command_prefix', value: 'rm -rf ' })
 
     const afterAdd = fakeHttp('GET', POLICY_PATH + '?cwd=' + encodeURIComponent(projectDir))
     await handler(afterAdd.req, afterAdd.res)
     expect(JSON.parse(afterAdd.state.body).project.deny).toHaveLength(1)
 
-    const remove = fakeHttp('POST', POLICY_PATH, JSON.stringify({ op: 'remove', scope: 'project', list: 'deny', id: added.rule.id, cwd: projectDir }))
+    // 覆盖那次没写新条目，所以删的仍是「更新后仍生效」的那条（id 已经不是第一次那条了）
+    const remove = fakeHttp('POST', POLICY_PATH, JSON.stringify({ op: 'remove', scope: 'project', list: 'deny', id: coveredBody.rule.id, cwd: projectDir }))
     await handler(remove.req, remove.res)
     expect(JSON.parse(remove.state.body).ok).toBe(true)
 
     const afterRemove = fakeHttp('GET', POLICY_PATH + '?cwd=' + encodeURIComponent(projectDir))
     await handler(afterRemove.req, afterRemove.res)
     expect(JSON.parse(afterRemove.state.body).project.deny).toEqual([])
+  })
+
+  it('时间线上手填的匹配条件原样写入，不再让模型改写；不覆盖本次动作的手填条件当场拒绝', async () => {
+    const root = tempDir()
+    const logFile = join(root, 'approvals.json')
+    const projectDir = join(root, 'project')
+    writeFileSync(logFile, JSON.stringify({
+      version: 1,
+      records: [{
+        id: 'rec-manual',
+        sessionId: 'session-1',
+        cwd: projectDir,
+        toolName: 'bash',
+        // 老记录只有 key/text：前缀类条件判不了「是否覆盖」，按信任处理
+        signature: { toolName: 'bash', key: 'sig-1', text: 'bash: npm test' },
+      }],
+    }), 'utf8')
+    const { ctx, routes } = fakeContext()
+    apply(ctx, { logFile, policyFile: join(root, 'home', 'policy.json') })
+    const handler = routes[0].handler
+
+    const promote = fakeHttp('POST', RULE_PATH, JSON.stringify({
+      recordId: 'rec-manual',
+      scope: 'project',
+      list: 'allow',
+      rule: { tool: 'bash', match: { kind: 'command_prefix', value: 'npm test' }, label: '我自己写的条件' },
+    }))
+    await handler(promote.req, promote.res)
+    const result = JSON.parse(promote.state.body)
+    expect(result.ok).toBe(true)
+    expect(result.optimizedBy).toBe('manual')
+    expect(result.rule.label).toBe('我自己写的条件')
+    expect(result.rule.source).toBe('user')
+    // 记录里带上来源：时间线据此显示「（你手填的匹配条件）」
+    const persisted = JSON.parse(readFileSync(logFile, 'utf8'))
+    expect(persisted.records[0].ruleApplied.optimizedBy).toBe('manual')
+
+    // 手填一条「精确签名」但值不是本次签名（模型写错过的那种）→ 400，不写盘
+    const bogus = fakeHttp('POST', RULE_PATH, JSON.stringify({
+      recordId: 'rec-manual',
+      scope: 'project',
+      list: 'allow',
+      rule: { tool: 'bash', match: { kind: 'signature', value: 'danger-full-access' }, label: '提权' },
+    }))
+    await handler(bogus.req, bogus.res)
+    expect(bogus.state.code).toBe(400)
+    expect(JSON.parse(bogus.state.body).code).toBe('not-covering')
+    const store = createPolicyStore({ globalFile: join(root, 'home', 'policy.json'), warn: () => {} })
+    expect(store.snapshot(projectDir).project.allow).toHaveLength(1)
+  })
+
+  it('设置面板能按 id 改一条已有规则（op=update），id 不变', async () => {
+    const root = tempDir()
+    const projectDir = join(root, 'project')
+    const { ctx, routes } = fakeContext()
+    apply(ctx, { policyFile: join(root, 'home', 'policy.json') })
+    const handler = routes[0].handler
+    const add = fakeHttp('POST', POLICY_PATH, JSON.stringify({
+      op: 'add',
+      scope: 'project',
+      list: 'allow',
+      cwd: projectDir,
+      rule: { tool: 'pwsh', match: { kind: 'command_prefix', value: 'pnpm vitest run tests/policy.spec.js' }, label: '运行 policy.spec.js 单测' },
+    }))
+    await handler(add.req, add.res)
+    const added = JSON.parse(add.state.body)
+
+    const update = fakeHttp('POST', POLICY_PATH, JSON.stringify({
+      op: 'update',
+      scope: 'project',
+      list: 'allow',
+      cwd: projectDir,
+      id: added.rule.id,
+      rule: { tool: 'pwsh', match: { kind: 'command_prefix', value: 'pnpm test' }, label: '运行测试套件' },
+    }))
+    await handler(update.req, update.res)
+    const updated = JSON.parse(update.state.body)
+    expect(updated.ok).toBe(true)
+    expect(updated.rule.id).toBe(added.rule.id)
+    expect(updated.rule.match).toEqual({ kind: 'command_prefix', value: 'pnpm test' })
+
+    const snapshot = fakeHttp('GET', POLICY_PATH + '?cwd=' + encodeURIComponent(projectDir))
+    await handler(snapshot.req, snapshot.res)
+    const rules = JSON.parse(snapshot.state.body).project.allow
+    expect(rules).toHaveLength(1)
+    expect(rules[0].label).toBe('运行测试套件')
+  })
+
+  it('换条件后让模型按该条件重新生成：条件写进提示词、不落盘、换条件或不覆盖就判失败', async () => {
+    const root = tempDir()
+    const logFile = join(root, 'approvals.json')
+    const projectDir = join(root, 'project')
+    writeFileSync(logFile, JSON.stringify({
+      version: 1,
+      records: [{
+        id: 'rec-draft',
+        sessionId: 'session-1',
+        cwd: projectDir,
+        toolName: 'bash',
+        signature: { toolName: 'bash', key: 'sig-1', text: 'bash: npm test', command: 'npm test', paths: [] },
+      }],
+    }), 'utf8')
+    /** 每个分支一份独立的假 llm：队列里排好模型回复，返回注册好的路由与调用记录。 */
+    const harnessFor = runs => {
+      const model = contextWith(runs)
+      const { ctx, routes } = fakeContext({ llm: model.get('llm') })
+      // 规则优化要有审查模型路由：与 profile 里的写法一致（provider/model 成对给出）
+      apply(ctx, { logFile, policyFile: join(root, 'home', 'policy.json'), reviewerProvider: 'p', reviewerModel: 'm' })
+      return { handler: routes[0].handler, model }
+    }
+    const draftHttp = (kind, draft) => fakeHttp('POST', RULE_DRAFT_PATH, JSON.stringify({
+      recordId: 'rec-draft',
+      kind,
+      ...(draft === undefined ? {} : { draft }),
+    }))
+
+    // ① 正常：按用户点的条件生成，提示词里带着条件与当前草稿；只回给界面，不写名单
+    const ok = harnessFor([ruleRun('npm test')])
+    const draft = draftHttp('command_prefix', { kind: 'command_prefix', value: 'npm', label: 'npm 测试' })
+    await ok.handler(draft.req, draft.res)
+    expect(draft.state.code).toBe(200)
+    expect(JSON.parse(draft.state.body).rule.match).toEqual({ kind: 'command_prefix', value: 'npm test' })
+    expect(ok.model.llmCalls).toHaveLength(1)
+    // 提示词走 createUserMessage 的 content 段（mock 把 input 原样摊开）：用户选的条件与草稿都在里面
+    const prompt = JSON.stringify(ok.model.llmCalls[0].messages)
+    expect(prompt).toContain('用户指定的匹配条件：命令前缀')
+    expect(prompt).toContain('npm 测试')
+    const store = createPolicyStore({ globalFile: join(root, 'home', 'policy.json'), warn: () => {} })
+    expect(store.snapshot(projectDir).project.allow ?? []).toHaveLength(0)
+
+    // ② 模型擅自换条件 → 失败（客户端保留自己按条件推导的值）
+    const wrong = harnessFor([reviewerRun({ tool: 'bash', match_kind: 'signature', match_value: 'sig-1', label: '换个条件' })])
+    const wrongDraft = draftHttp('command_prefix')
+    await wrong.handler(wrongDraft.req, wrongDraft.res)
+    expect(wrongDraft.state.code).toBe(503)
+
+    // ③ 生成的条件不覆盖本次动作 → 同样失败，不会回给界面一条永远命不中的规则
+    const outside = harnessFor([ruleRun('git status')])
+    const outsideDraft = draftHttp('command_prefix')
+    await outside.handler(outsideDraft.req, outsideDraft.res)
+    expect(outsideDraft.state.code).toBe(503)
+
+    // ④ 条件不在闭集里 → 400，连模型都不叫
+    const bad = harnessFor([])
+    const badDraft = draftHttp('regex')
+    await bad.handler(badDraft.req, badDraft.res)
+    expect(badDraft.state.code).toBe(400)
+    expect(bad.model.llmCalls).toHaveLength(0)
+
+    // ⑤ 条件与这次动作不搭（这条记录没有文件路径，却要路径前缀）→ 400，同样不叫模型
+    const mismatch = harnessFor([])
+    const mismatchDraft = draftHttp('path_prefix')
+    await mismatch.handler(mismatchDraft.req, mismatchDraft.res)
+    expect(mismatchDraft.state.code).toBe(400)
+    expect(JSON.parse(mismatchDraft.state.body).code).toBe('kind-not-applicable')
+    expect(mismatch.model.llmCalls).toHaveLength(0)
   })
 
   it('由一条审批记录一键升级：采用记录里的模型建议规则并回写记录', async () => {
