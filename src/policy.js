@@ -233,23 +233,24 @@ export function signatureOf(request, action) {
   const normalized = normalizeExtraArgs(args)
   const structured = { ...normalized }
   for (const key of [...COMMAND_ARG_KEYS, ...PATH_ARG_KEYS]) delete structured[key]
-  // 除命令/路径之外的参数（例如提权标记）同样进签名：提权重试不该与普通调用算作同一种权限。
-  const extra = stableJson(structured)
-  const base = COMMAND_TOOLS.includes(toolName.toLowerCase()) && command !== undefined
-    ? 'cmd:' + command
-    : 'args:' + stableJson(normalized)
-  // 记忆键：同样去掉噪声参数，命令再砍掉管道之后（只换了输出截断的同一条命令归到同一个计数）；
-  // 提权标记这类真会改变授权范围的参数保留，提权重试不会与普通调用混在一起计数。
+  // **权限指纹**（用户 2026-09-16 要求「有通用性，又保证安全性」）：在可读摘要的基础上，只抹掉
+  // **不改变「在授权什么」** 的东西——
+  //   ① 命令砍掉第一个引号外的管道之后与结尾的输出重定向（`| Select-Object -Last 40`、`2>&1`
+  //      只决定怎么显示输出，同一条命令换个截断不该变成另一种权限）；
+  //   ② 噪声参数 description / justification / timeoutMs（模型每次都会改写的说明）；
+  //   ③ workdir / cwd 的写法差异（`D:\\x` 与 `D:/x` 是同一个目录）。
+  // **提权标记（sandbox_permissions）这类真会改变授权范围的参数一律保留**：普通调用的指纹与
+  // 「提权重试」的指纹仍然是两条，规则不会因为通用化而放宽；命令的其他参数（测试文件名等）也保留。
   const memoryCommand = command === undefined ? undefined : countingCommand(command)
-  // 计数键再抹掉「在哪儿执行」：计数键本身已经带 `<cwd>` 前缀，同一个工作区里的目录差异
-  // （`workdir` 写没写、D:\\x 还是 D:/x）只该算同一条权限，否则连续计数永远攒不到阈值。
-  const memoryBase = COMMAND_TOOLS.includes(toolName.toLowerCase()) && memoryCommand !== undefined
+  const base = COMMAND_TOOLS.includes(toolName.toLowerCase()) && memoryCommand !== undefined
     ? 'cmd:' + memoryCommand
     : 'args:' + stableJson(withoutNoise(withoutDirArgs(normalized)))
+  const fingerprint = toolName + '\u0000' + base + '\u0000x:' + stableJson(withoutNoise(withoutDirArgs(structured)))
   return Object.freeze({
     toolName,
-    key: toolName + '\u0000' + base + '\u0000x:' + extra,
-    memoryKey: toolName + '\u0000' + memoryBase + '\u0000x:' + stableJson(withoutNoise(withoutDirArgs(structured))),
+    // key 与 memoryKey 是同一个串：规则的匹配单位、连续计数的计数键、详情里的「权限指纹」三者一致
+    key: fingerprint,
+    memoryKey: fingerprint,
     command,
     paths,
     text: labelOf(toolName, command, paths, args),
@@ -489,6 +490,51 @@ export function ruleCovers(left, right) {
   return false
 }
 
+/**
+ * 一条规则折算成当前口径：老版本的 `signature` 值是**逐字 key**（带管道之后、未归一化 workdir、
+ * 噪声参数），折算成现在的归一化指纹；不是 signature、或折不出来就原样返回。
+ * @param rule 规则
+ * @returns {object} 折算后的规则（值相同时返回原对象）
+ */
+function canonicalRule(rule) {
+  if (rule?.match?.kind !== 'signature' || typeof rule.match.value !== 'string') return rule
+  const canonical = canonicalMemoryKey(rule.match.value)
+  if (canonical === undefined || canonical === rule.match.value) return rule
+  return { ...rule, match: { ...rule.match, value: canonical } }
+}
+
+/**
+ * 折算一个策略文档里的 signature 规则（老 key → 权限指纹）；折算后撞车的（同工具 + 同指纹）
+ * 只留第一条，别在名单里留下两条同义规则。
+ * @param doc 策略文档
+ * @returns {{moved: number, dropped: number}} 折算条数与被合并掉的重复条数
+ */
+export function canonicalizeRules(doc) {
+  let moved = 0
+  let dropped = 0
+  for (const list of POLICY_LISTS) {
+    const rules = doc?.rules?.[list]
+    if (!Array.isArray(rules)) continue
+    const seen = new Set()
+    const next = []
+    for (const rule of rules) {
+      const canonical = canonicalRule(rule)
+      if (canonical !== rule) moved += 1
+      if (canonical?.match?.kind === 'signature') {
+        const identity = String(canonical.tool) + '\u0000' + String(canonical.match.value)
+        if (seen.has(identity)) {
+          dropped += 1
+          continue
+        }
+        seen.add(identity)
+      }
+      next.push(canonical)
+    }
+    doc.rules[list] = next
+  }
+  return { moved, dropped }
+}
+
 /** 计数用的键：记忆键抹掉了 description / justification / timeoutMs 这类噪声，取不到时退回精确签名。 */
 export function memoryKeyOf(signature) {
   return signature?.memoryKey ?? signature?.key
@@ -694,7 +740,9 @@ export const noopPolicyStore = Object.freeze({
     project: undefined,
   }),
   addRule: () => ({ ok: false, error: 'policy store disabled' }),
+  updateRule: () => ({ ok: false, error: 'policy store disabled' }),
   removeRule: () => false,
+  revertRule: () => ({ ok: false, error: 'policy store disabled' }),
   setThreshold: (value, list = 'allow') => (list === 'deny' ? DEFAULT_AUTO_DENY_AFTER : DEFAULT_AUTO_APPROVE_AFTER),
 })
 
@@ -718,7 +766,7 @@ export function createPolicyStore(options = {}) {
   }
   const warn = typeof options.warn === 'function' ? options.warn : () => {}
   const info = typeof options.info === 'function' ? options.info : () => {}
-  const docs = new Map([[globalFile, read(globalFile)]])
+  const docs = new Map([[globalFile, readCanonical(globalFile)]])
   /** 计数文件缓存：file -> { version, counters }。 */
   const counterDocs = new Map()
   // 老形态：所有工作区的计数都塞在全局策略文件的 counters 里（键带 `<cwd>\u0000` 前缀）。
@@ -896,12 +944,30 @@ export function createPolicyStore(options = {}) {
     return pruned.removed
   }
 
-  /** 取某个策略文件对应的文档（懒加载并缓存）。 */
+  /**
+   * 读一个策略文件，并把里面的**老形状** `signature` 规则折算成当前的**权限指纹**
+   * （2026-09-16 起 key 改成归一化指纹；不折算的话那些老规则永远命不中，用户会以为名单失灵）。
+   * 真有变化才写回，并记一行日志。
+   * @param file 策略文件路径
+   * @returns {object} 折算后的文档
+   */
+  function readCanonical(file) {
+    const doc = read(file)
+    const canonical = canonicalizeRules(doc)
+    if (canonical.moved > 0 || canonical.dropped > 0) {
+      write(file, doc)
+      info('dsh-auto-pass: 已把 ' + String(canonical.moved) + ' 条精确签名规则折算成权限指纹'
+        + (canonical.dropped > 0 ? '（合并掉 ' + String(canonical.dropped) + ' 条重复）' : ''))
+    }
+    return doc
+  }
+
+  /** 取某个策略文件对应的文档（懒加载并缓存；读入时折算老签名规则，见 readCanonical）。 */
   function docFor(file) {
     if (file === undefined) return undefined
     let doc = docs.get(file)
     if (doc === undefined) {
-      doc = read(file)
+      doc = readCanonical(file)
       docs.set(file, doc)
     }
     return doc
@@ -950,10 +1016,12 @@ export function createPolicyStore(options = {}) {
    * @param list allow / deny
    * @param fields 已校验的规则字段（tool / match / label）
    * @param rawRule 原始规则输入（取 source / note）
-   * @returns {{rule: object, replaced: boolean, covered?: boolean, merged?: number}|undefined}
+   * @returns {{rule: object, replaced: boolean, covered?: boolean, merged?: number,
+   *   mergedRules?: object[], previousRule?: object}|undefined}
    *   - replaced：同一条规则已存在，这次是**更新**（调用方提示「已更新同名规则」）；
    *   - covered：已有规则完整覆盖这次的动作，**没有写入**（rule 指向那条已有规则）；
-   *   - merged：这次写入顺带合并掉的更窄旧规则条数。
+   *   - merged：这次写入顺带合并掉的更窄旧规则条数；
+   *   - mergedRules / previousRule：被这次写入顶掉的旧规则**快照**（撤销时原样放回去，见 revertRule）。
    *   写入失败返回 undefined。
    */
   function commit(file, scope, list, fields, rawRule) {
@@ -966,20 +1034,29 @@ export function createPolicyStore(options = {}) {
       source: rawRule.source ?? 'user',
       ...(rawRule.note === undefined ? {} : { note: rawRule.note }),
     })
-    const replaced = rules.some(candidate => sameTarget(candidate, created))
+    // 同一条（工具 + 匹配条件 + 值）已存在时这次是「更新那条」：新条目顶掉它，
+    // 它的快照随回执返回，撤销时才能放回去
+    const previous = rules.find(candidate => sameTarget(candidate, created))
+    const replaced = previous !== undefined
     // 已有的某条规则把这次的新规则整个盖住时，新规则带不来任何新覆盖范围：
     // 不写重复条目，如实把那条规则回报给调用方（用户看到「已被 … 覆盖」而不是又加了一条）。
     if (replaced === false) {
       const covering = rules.find(candidate => ruleCovers(candidate, created))
-      if (covering !== undefined) return { rule: covering, replaced: false, covered: true, merged: 0 }
+      if (covering !== undefined) {
+        return { rule: covering, replaced: false, covered: true, merged: 0, mergedRules: [], previousRule: undefined }
+      }
     }
+    // 新规则把更窄的旧规则整个盖住时**删掉那些窄规则**（同一名单里不留互相覆盖的两条）。
+    // 它们的快照照样返回：用户要求「说清楚，并能撤销」（2026-09-16）。
     const merged = rules.filter(candidate => !sameTarget(candidate, created) && ruleCovers(created, candidate))
     doc.rules[list] = [
       ...rules.filter(candidate => !sameTarget(candidate, created) && !merged.includes(candidate)),
       created,
     ]
     if (created.match.kind === 'signature') delete doc.counters[(fields.cwd ?? '') + '\u0000' + created.match.value]
-    return write(file, doc) ? { rule: created, replaced, covered: false, merged: merged.length } : undefined
+    return write(file, doc)
+      ? { rule: created, replaced, covered: false, merged: merged.length, mergedRules: merged, previousRule: previous }
+      : undefined
   }
 
   /**
@@ -1008,6 +1085,9 @@ export function createPolicyStore(options = {}) {
         replaced: committed.replaced,
         covered: committed.covered === true,
         merged: committed.merged ?? 0,
+        // 撤销凭据（被这次写入顶掉的旧规则快照）：调用方写进记录，撤销时按它还原
+        mergedRules: committed.mergedRules ?? [],
+        previousRule: committed.previousRule,
         scope,
         file: target,
       }
@@ -1025,7 +1105,9 @@ export function createPolicyStore(options = {}) {
    * 新条件若与名单里另一条重复，或把更窄的规则整个盖住，就按 addRule 的同一套口径合并掉——
    * 名单里依旧不会出现互相覆盖的两条。用户手改过的规则 source 一律记 user。
    * @param spec { scope, list, id, rule }（rule 走 validateRuleInput）
-   * @returns {{ok: boolean, error?: string, rule?: object, replaced?: boolean, merged?: number}}
+   * @returns {{ok: boolean, error?: string, rule?: object, replaced?: boolean, merged?: number,
+   *   mergedRules?: object[], previousRule?: object}}
+   *   mergedRules / previousRule 是撤销量：被新条件顶掉的旧规则快照（见 revertRule）。
    */
   function updateRule({ scope, list, id, rule }, cwd) {
     if (!POLICY_LISTS.includes(list) || !POLICY_SCOPES.includes(scope)) {
@@ -1047,16 +1129,22 @@ export function createPolicyStore(options = {}) {
       source: 'user',
       note: '用户在面板里手动调整过匹配条件',
     })
+    // 更新前的那一条（同一个 id）也随回执返回：撤销时把它换回来
+    const before = rules[index]
     const others = rules.filter((candidate, at) => at !== index)
-    const merged = others.filter(candidate => sameTarget(candidate, updated) || ruleCovers(updated, candidate))
-    doc.rules[list] = [...others.filter(candidate => !merged.includes(candidate)), updated]
+    // 同义的另一条 = 被这次更新顶掉；被新条件盖住的窄规则同理——两类快照都要留着才能撤销
+    const previous = others.find(candidate => sameTarget(candidate, updated))
+    const merged = others.filter(candidate => !sameTarget(candidate, updated) && ruleCovers(updated, candidate))
+    doc.rules[list] = [...others.filter(candidate => !merged.includes(candidate) && candidate !== previous), updated]
     if (updated.match.kind === 'signature') delete doc.counters[(cwd ?? '') + '\u0000' + updated.match.value]
     if (write(file, doc) !== true) return { ok: false, error: 'policy write failed', file }
     return {
       ok: true,
       rule: updated,
-      replaced: merged.some(candidate => sameTarget(candidate, updated)),
+      replaced: previous !== undefined,
       merged: merged.length,
+      mergedRules: merged,
+      previousRule: before,
       scope,
       file,
     }
@@ -1073,6 +1161,45 @@ export function createPolicyStore(options = {}) {
     if (doc.rules[list].length === before) return false
     write(file, doc)
     return true
+  }
+
+  /**
+   * 撤销一次「加入名单」：删掉那次写进去的规则，并把它顶掉的旧规则**原样放回**名单
+   * （用户 2026-09-16 要求「说清楚并能撤销」——一条更宽的前缀把用户之前手工确认过的窄规则
+   * 合并掉时，名单会悄悄变大，得能还原回来）。
+   *
+   * 覆盖判定（ruleCovers）在这里**不参与**：撤销的目的就是把名单还原成写入前的样子，
+   * 哪怕还原出来的两条互相覆盖。撤销只针对「这一次写入」：
+   * - 现在找不到这条规则 → 拒绝（可能已经撤销过，或被别处删掉）；
+   * - 值/条件与回执不一致 → 拒绝（写入之后又被改过，撤销不该顺手删掉后来的改动）。
+   * @param spec { scope, list, ruleId, match?, previousRule?, mergedRules? }（回执见 addRule / updateRule）
+   * @param cwd 会话工作目录（project 作用域据此定位项目策略文件）
+   * @returns {{ok: boolean, error?: string, file?: string, restored?: string[]}}
+   */
+  function revertRule({ scope, list, ruleId, match, previousRule, mergedRules }, cwd) {
+    if (!POLICY_LISTS.includes(list) || !POLICY_SCOPES.includes(scope)) {
+      return { ok: false, error: 'invalid scope or list' }
+    }
+    if (typeof ruleId !== 'string' || ruleId === '') return { ok: false, error: 'invalid rule id' }
+    const file = scope === 'project' ? projectPolicyFile(cwd) : globalFile
+    const doc = docFor(file)
+    if (doc === undefined) return { ok: false, error: 'policy store disabled' }
+    const rules = doc.rules[list]
+    const index = rules.findIndex(candidate => candidate.id === ruleId)
+    if (index === -1) return { ok: false, error: 'rule not found (already reverted or removed)' }
+    const current = rules[index]
+    if (match !== undefined && match !== null
+      && (current.match?.kind !== match.kind || current.match?.value !== match.value)) {
+      return { ok: false, error: 'rule has been changed since, not reverting' }
+    }
+    const restore = [previousRule, ...(Array.isArray(mergedRules) ? mergedRules : [])]
+      .filter(rule => rule !== null && typeof rule === 'object' && typeof rule.id === 'string')
+    // 还原的规则按 id 去重，并且不重复放回「本来就在名单里」的那些
+    const keep = rules.filter((candidate, at) => at !== index
+      && !restore.some(rule => rule.id === candidate.id))
+    doc.rules[list] = [...keep, ...restore]
+    if (write(file, doc) !== true) return { ok: false, error: 'policy write failed', file }
+    return { ok: true, file, restored: restore.map(rule => String(rule.label ?? rule.id)) }
   }
 
   return {
@@ -1107,6 +1234,8 @@ export function createPolicyStore(options = {}) {
     updateRule,
     /** 删一条规则（时间线里撤销升级/降级）。 */
     removeRule,
+    /** 撤销一次「加入名单」：删掉那次写入的规则，并把它顶掉的旧规则放回去。 */
+    revertRule,
     match({ signature, cwd }) {
       if (signature === undefined) return undefined
       const find = lists => {

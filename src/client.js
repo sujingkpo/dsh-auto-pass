@@ -19,6 +19,12 @@
  * @modify 2026-09-15 规则表单改用自带分段按钮（原生 <select> 深色主题下弹层白底）、切条件时值立刻刷新、操作区改竖排
  * @modify 2026-09-15 换匹配条件后让模型按该条件重新生成（/rule/draft，提示词带上条件与当前草稿）；路径前缀的通配符即时校验与口径提示
  * @modify 2026-09-15 这次动作用不上的匹配条件（没有命令 / 没有路径）按钮禁用并说明原因
+ * @modify 2026-09-16 详情里的「权限指纹」显示归一化后的签名 key（与规则表单生成的签名逐字一致），
+ *   可读文本另起一行「签名摘要」；模型建议里不等于本次签名的假签名不再当表单默认值
+ * @modify 2026-09-16 「加入名单」可撤销：详情里列出被顶掉的规则，并可通过 /rule/revert 还原；
+ *   覆盖命中（没写入任何条目）不给撤销；设置面板编辑规则也会列出被合并掉的窄规则
+ * @modify 2026-09-16 权限指纹只读 + 可视化：原始串（含 NUL）不再显示/不再靠选中复制——
+ *   界面显示渲染后的文案，整串复制走「复制指纹」按钮（剪贴板 API）；详情里拆成工具/命令/额外参数
  */
 window.__ModuleLoader__.load({
   id: 'dsh-auto-pass',
@@ -37,6 +43,8 @@ window.__ModuleLoader__.load({
     const API_RULE = '/api/dsh-auto-pass/rule'
     /** 只生成不落盘：换匹配条件时让模型按那个条件重新生成一遍。 */
     const API_RULE_DRAFT = API_RULE + '/draft'
+    /** 撤销一次「加入名单」：宿主按记录里的凭据还原名单。 */
+    const API_RULE_REVERT = API_RULE + '/revert'
     /** 启动信标：把客户端半走到哪一步写进宿主日志（排查「看不到面板」用）。 */
     const API_BEACON = '/api/dsh-auto-pass/beacon'
     /** 时间轴轮询间隔（毫秒）。 */
@@ -115,7 +123,8 @@ window.__ModuleLoader__.load({
         usageTotal: '合计',
         reason: '审批原因',
         time: '时间',
-        signature: '权限签名',
+        signature: '权限指纹',
+        signatureText: '签名摘要',
         suggestedRule: '模型建议规则',
         policyHit: '命中规则',
         hitAllow: '白名单',
@@ -147,17 +156,23 @@ window.__ModuleLoader__.load({
         working: '处理中…',
         appliedModel: '已加入（模型优化）',
         appliedRecord: '已加入（采用审查时的模型建议）',
-        appliedFallback: '已加入（没有可用的模型建议，已回落到默认条件：命令前缀，或没有命令时的精确签名）',
-        appliedReplaced: '（已更新同名规则）',
+        appliedFallback: '已加入（没有可用的模型建议，已回落到本次动作的权限指纹）',
+        appliedReplaced: labels => '（已更新同名规则' + (labels === '' || labels === undefined ? '' : '：' + labels) + '）',
         appliedCovered: '（已有规则已覆盖这个动作，未重复添加）',
-        appliedMerged: count => '（已合并 ' + String(count) + ' 条被它覆盖的窄规则）',
+        appliedMerged: (count, labels) => '（已合并 ' + String(count) + ' 条被它覆盖的窄规则'
+          + (labels === '' || labels === undefined ? '' : '：' + labels) + '）',
         appliedManual: '已按你填写的条件加入',
+        // 「加入名单」可以撤销（用户 2026-09-16 要求）：一条更宽的前缀会把之前确认过的窄规则合并掉，得能还原
+        undoRule: '撤销这次加入',
+        ruleUndoLabel: '本次加入的规则',
+        ruleDropped: labels => '顶掉了：' + labels,
+        ruleUndone: '已撤销，名单已还原',
         ruleDraftLabel: '加入名单的规则',
         ruleKind: '匹配条件',
         ruleValue: '匹配值',
         ruleLabelField: '规则标签',
         ruleDraftFromModel: '默认来自这次审查的模型建议，可以直接改',
-        ruleDraftFromSignature: '默认是本次动作的精确签名（最窄）；嫌窄就切到「命令前缀」',
+        ruleDraftFromSignature: '默认是本次动作的权限指纹（同一动作换个输出截断/说明仍是同一个）；想覆盖同一命令的其他参数就切到「命令前缀」',
         ruleDraftEdited: '值已按所选条件刷新，仍可继续手改（管道 | 之后的部分只决定怎么显示输出）',
         ruleDraftRegenerating: '正在让模型按所选条件重新生成…',
         ruleDraftRegenerated: '已让模型按所选条件重新生成，仍可继续手改',
@@ -177,7 +192,17 @@ window.__ModuleLoader__.load({
         sourceUser: '手动',
         sourceModel: '模型',
         sourceMemory: '记忆',
-        kindSignature: '精确签名',
+        kindSignature: '权限指纹',
+        // 权限指纹是机器算出来的串：界面上只读，并按它的结构摊开给人看（用户 2026-09-16 要求）
+        fingerprintTool: '工具',
+        fingerprintCommand: '命令',
+        fingerprintArgs: '参数',
+        fingerprintExtra: '额外参数',
+        fingerprintReadonly: '权限指纹由插件算出、不能手改；想覆盖同一命令的其他参数请切到「命令前缀」',
+        fingerprintLocked: '权限指纹不能手填（只能由时间线上的某条记录生成）',
+        copyFingerprint: '复制指纹',
+        copiedFingerprint: '已复制完整指纹',
+        copyFingerprintFailed: '复制不了（这个环境没有剪贴板权限）',
         kindCommandPrefix: '命令前缀',
         kindPathPrefix: '路径前缀',
         settingsTitle: '审批设置',
@@ -252,7 +277,8 @@ window.__ModuleLoader__.load({
         usageTotal: 'total',
         reason: 'Approval reason',
         time: 'Time',
-        signature: 'Signature',
+        signature: 'Permission fingerprint',
+        signatureText: 'Signature summary',
         suggestedRule: 'Suggested rule',
         policyHit: 'Matched rule',
         hitAllow: 'Allowlist',
@@ -284,17 +310,22 @@ window.__ModuleLoader__.load({
         working: 'Working…',
         appliedModel: 'Added (model-optimized)',
         appliedRecord: 'Added (rule suggested by the review model)',
-        appliedFallback: 'Added (no usable model suggestion; fell back to the default condition: a command prefix, or the exact signature when there is no command)',
-        appliedReplaced: ' (updated the existing rule)',
+        appliedFallback: 'Added (no usable model suggestion; fell back to this action\u2019s permission fingerprint)',
+        appliedReplaced: labels => ' (updated the existing rule' + (labels === '' || labels === undefined ? '' : ': ' + labels) + ')',
         appliedCovered: ' (already covered by an existing rule; nothing added)',
-        appliedMerged: count => ' (merged ' + String(count) + ' narrower rule(s) it covers)',
+        appliedMerged: (count, labels) => ' (merged ' + String(count) + ' narrower rule(s) it covers'
+          + (labels === '' || labels === undefined ? '' : ': ' + labels) + ')',
         appliedManual: 'Added with the condition you wrote',
+        undoRule: 'Undo this add',
+        ruleUndoLabel: 'Rule added',
+        ruleDropped: labels => 'Displaced: ' + labels,
+        ruleUndone: 'Undone; the list was restored',
         ruleDraftLabel: 'Rule to add',
         ruleKind: 'Match kind',
         ruleValue: 'Match value',
         ruleLabelField: 'Rule label',
         ruleDraftFromModel: 'prefilled from this review model suggestion - edit it freely',
-        ruleDraftFromSignature: 'prefilled with this action exact signature (narrowest); switch to a command prefix to widen it',
+        ruleDraftFromSignature: 'prefilled with this action\u2019s permission fingerprint (same action, different output truncation or description, still the same); switch to a command prefix to also cover other arguments',
         ruleDraftEdited: 'the value was refreshed for the kind you picked - edit it freely (anything after a | only shapes the output)',
         ruleDraftRegenerating: 'asking the model to regenerate a rule for the kind you picked...',
         ruleDraftRegenerated: 'the model regenerated a rule for the kind you picked - still editable',
@@ -314,7 +345,16 @@ window.__ModuleLoader__.load({
         sourceUser: 'manual',
         sourceModel: 'model',
         sourceMemory: 'memory',
-        kindSignature: 'exact signature',
+        kindSignature: 'permission fingerprint',
+        fingerprintTool: 'Tool',
+        fingerprintCommand: 'Command',
+        fingerprintArgs: 'Arguments',
+        fingerprintExtra: 'Extra arguments',
+        fingerprintReadonly: 'computed by the plugin and is not editable; switch to "command prefix" to cover other arguments of the same command',
+        fingerprintLocked: 'a permission fingerprint cannot be typed in (it can only be generated from a timeline record)',
+        copyFingerprint: 'Copy fingerprint',
+        copiedFingerprint: 'full fingerprint copied',
+        copyFingerprintFailed: 'cannot copy (no clipboard access here)',
         kindCommandPrefix: 'command prefix',
         kindPathPrefix: 'path prefix',
         settingsTitle: 'Approval policy',
@@ -930,6 +970,26 @@ window.__ModuleLoader__.load({
       return data
     }
 
+    /**
+     * 撤销一次「加入名单」：宿主按记录里的凭据删掉那次写入的规则、把它顶掉的旧规则放回去。
+     * 客户端只报 recordId——**不让浏览器指定要恢复什么**，凭据只认记录里那一份。
+     * @param recordId 审批记录 id
+     * @returns {Promise<object>} 宿主回执（restored：被放回去的规则标签）
+     */
+    async function revertRecord(recordId) {
+      const response = await fetch(API_RULE_REVERT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ recordId }),
+      })
+      const data = await response.json()
+      if (data === null || typeof data !== 'object' || data.ok !== true) {
+        throw new Error(String(data?.error ?? 'revert failed'))
+      }
+      await policyStore.load()
+      return data
+    }
+
     /** 规则来源文案。 */
     function sourceLabel(source) {
       if (source === 'model') return t.sourceModel
@@ -941,14 +1001,32 @@ window.__ModuleLoader__.load({
     const MATCH_KIND_ORDER = ['command_prefix', 'signature', 'path_prefix']
 
     /**
-     * 规则草稿：默认用这次审查的模型建议（宿主管校验过，不覆盖本次动作的建议根本到不了这里），
-     * 没有建议就用本次动作的精确签名——精确签名是最窄、最安全的默认值。
+     * 模型建议能不能当表单默认值：**`signature`（权限指纹）类的建议必须逐字等于本次签名**——
+     * 与宿主 `suggestionUsable` 里「signature 必须等于本次签名 key」那道闸同口径。
+     * 前缀类建议这里不拦（对不对一眼能看出来，宿主提交时还会再验一次）。
+     * 真机实测（~/.dsh/dsh-auto-pass/records/*.json）：模型把「签名」写成了
+     * `danger-full-access` / `escalation=danger-full-access` 这类一句描述，当默认值填进表单后
+     * 既与详情里的权限指纹对不上，点按钮还会被宿主用 400 `not-covering` 拒掉。
+     * @param record 审批记录
+     * @param suggested 记录里的模型建议规则
+     * @returns {boolean} 能当默认值返回 true
+     */
+    function suggestedRuleFits(record, suggested) {
+      if (suggested?.match?.kind !== 'signature') return true
+      const key = record?.signature?.key
+      return typeof key === 'string' && key !== '' && String(suggested.match.value ?? '') === key
+    }
+
+    /**
+     * 规则草稿：默认用这次审查的模型建议（能覆盖本次动作的才行，见 suggestedRuleFits），
+     * 没有可用建议就用本次动作的权限指纹——它是最窄、最安全又耐用的默认值，
+     * 也正是详情里那一行「权限指纹」。
      * fromModel 只影响界面上的那句说明，用户改不改都行。
      */
     function ruleDraftOf(record) {
       const suggested = record?.suggestedRule
       if (suggested !== null && typeof suggested === 'object' && suggested.match !== undefined
-        && suggested.match !== null) {
+        && suggested.match !== null && suggestedRuleFits(record, suggested)) {
         return {
           kind: suggested.match.kind,
           value: String(suggested.match.value ?? ''),
@@ -974,7 +1052,7 @@ window.__ModuleLoader__.load({
 
     /**
      * 把一条已有规则的匹配值翻译成另一种条件的值（设置面板里改条件时用）：
-     * 精确签名 → 命令前缀，就从签名 key 的 `cmd:` 段里把命令取出来（同样砍掉管道之后）。
+     * 权限指纹 → 命令前缀，就从签名 key 的 `cmd:` 段里把命令取出来（同样砍掉管道之后）。
      * 翻译不出来就保留原值，绝不猜。
      */
     /**
@@ -1093,6 +1171,119 @@ window.__ModuleLoader__.load({
       return undefined
     }
 
+    /**
+     * 权限指纹的可视化：把机器串 `工具\u0000cmd:命令\u0000x:{额外参数}` 拆开。
+     * 指纹是给机器用的（规则匹配、连续计数），管理名单的人得看得懂它在授权什么——
+     * 界面上只读，并按这个结构摊开显示（用户 2026-09-16 要求）。
+     * **不在规则里另存一份渲染文本**：指纹本身就是唯一事实来源，渲染每次都从它现算。
+     * 解析不出来（老记录、手搓的值）返回 undefined，调用方退回显示原始值。
+     * @param value 指纹串（规则的 match.value 或记录里的 signature.key）
+     * @returns {{tool: string, command?: string, args?: string, extras: {key: string, value: string}[], short: string}|undefined}
+     */
+    function fingerprintOf(value) {
+      const parts = String(value ?? '').split('\u0000')
+      if (parts.length < 3) return undefined
+      const extraText = parts.slice(2).join('\u0000')
+      if (!extraText.startsWith('x:')) return undefined
+      let extra
+      try {
+        extra = JSON.parse(extraText.slice(2))
+      } catch (error) {
+        return undefined
+      }
+      if (extra === null || typeof extra !== 'object' || Array.isArray(extra)) return undefined
+      const base = parts[1]
+      let head
+      if (base.startsWith('cmd:')) head = { command: base.slice('cmd:'.length) }
+      else if (base.startsWith('args:')) head = { args: clipText(base.slice('args:'.length), 80) }
+      else return undefined
+      const extras = Object.keys(extra).sort().map(key => ({ key, value: clipText(fingerprintValue(extra[key]), 60) }))
+      const bits = [parts[0], head.command ?? head.args]
+      for (const item of extras) bits.push(item.key + '=' + item.value)
+      return { tool: parts[0], ...head, extras, short: bits.join(' · ') }
+    }
+
+    /** 指纹里某个参数值的显示文本：字符串直接给，其余压成 JSON。 */
+    function fingerprintValue(value) {
+      if (typeof value === 'string') return value
+      try {
+        return JSON.stringify(value)
+      } catch (error) {
+        return String(value)
+      }
+    }
+
+    /** 截断长文本（指纹里的命令与参数都可能很长，界面上只给一眼能看完的一段）。 */
+    function clipText(text, max) {
+      const value = String(text ?? '')
+      return value.length > max ? value.slice(0, max) + '…' : value
+    }
+
+    /** 一行紧凑的指纹文案（列表与表单里用）；解析不出来就退回原始值。 */
+    function fingerprintShort(value) {
+      const parsed = fingerprintOf(value)
+      return parsed === undefined ? clipText(value, 60) : parsed.short
+    }
+
+    /**
+     * 指纹的分行明细（详情里用）：工具 / 命令（或参数）/ 额外参数。
+     * 解析不出来就返回空数组，只留详情里那一行原始 key。
+     * @param value 指纹串
+     * @returns {Array} Field 元素数组
+     */
+    function fingerprintFields(value) {
+      const parsed = fingerprintOf(value)
+      if (parsed === undefined) return []
+      return [
+        react.createElement(Field, { key: 'fingerprint-tool', label: t.fingerprintTool, value: parsed.tool }),
+        react.createElement(Field, {
+          key: 'fingerprint-head',
+          label: parsed.command === undefined ? t.fingerprintArgs : t.fingerprintCommand,
+          value: parsed.command ?? parsed.args,
+          mono: true,
+        }),
+        ...(parsed.extras.length === 0 ? [] : [react.createElement(Field, {
+          key: 'fingerprint-extra',
+          label: t.fingerprintExtra,
+          value: parsed.extras.map(item => item.key + '=' + item.value).join(' / '),
+          mono: true,
+        })]),
+      ]
+    }
+
+    /**
+     * 把文本写进剪贴板。**原始指纹含 NUL 分隔符**，只有走剪贴板 API 才能整串复制：
+     * 在界面上选中那段文字再复制，NUL 会被吃掉，粘出来是 `pwshcmd:pnpm testx:{…}` 这种废串
+     * （真机反馈过），所以显示走渲染、复制走 API。拿不到 clipboard 时返回 false，调用方提示一句。
+     */
+    async function copyText(text) {
+      const clipboard = typeof navigator === 'object' && navigator !== null ? navigator.clipboard : undefined
+      if (clipboard === undefined || clipboard === null || typeof clipboard.writeText !== 'function') return false
+      try {
+        await clipboard.writeText(String(text ?? ''))
+        return true
+      } catch (error) {
+        return false
+      }
+    }
+
+    /**
+     * 权限指纹的只读展示：一行可视化 + 「复制指纹」按钮，原始串只挂 title。
+     * **不把原始串塞进输入框**：那串里全是 NUL 分隔符，浏览器把每个 NUL 画成一个方框（真机反馈
+     * 「像乱码」），而且选中复制会丢分隔符——所以显示走渲染，整串复制走剪贴板 API。
+     */
+    function FingerprintValue({ value }) {
+      const raw = String(value ?? '')
+      const [note, setNote] = react.useState('')
+      const copy = () => {
+        void copyText(raw).then(ok => setNote(ok ? t.copiedFingerprint : t.copyFingerprintFailed))
+      }
+      return react.createElement('span', { className: 'ap-fingerprintValue', title: raw },
+        react.createElement('span', { className: 'ap-mono ap-fingerprintShort' }, fingerprintShort(raw)),
+        react.createElement('button', { type: 'button', className: 'ap-btn', onClick: copy }, t.copyFingerprint),
+        note !== '' && react.createElement('span', { className: 'ap-note' }, note))
+    }
+
     /** 匹配条件文案。 */
     function kindLabel(kind) {
       if (kind === 'command_prefix') return t.kindCommandPrefix
@@ -1105,12 +1296,15 @@ window.__ModuleLoader__.load({
       return scope === 'project' ? t.scopeProject : t.scopeGlobal
     }
 
-    /** 把一组字段渲染成详情行。 */
-    function Field({ label, value, mono }) {
+    /** 把一组字段渲染成详情行。title 用来挂那些**不适合直接显示**的原始值（比如含 NUL 的指纹）。 */
+    function Field({ label, value, mono, title }) {
       if (value === undefined || value === null || value === '') return null
       return react.createElement('div', { className: 'ap-field' },
         react.createElement('span', { className: 'ap-fieldKey' }, label),
-        react.createElement('span', { className: 'ap-fieldVal' + (mono === true ? ' ap-mono' : '') }, String(value)))
+        react.createElement('span', {
+          className: 'ap-fieldVal' + (mono === true ? ' ap-mono' : ''),
+          ...(title === undefined ? {} : { title: String(title) }),
+        }, String(value)))
     }
 
     /**
@@ -1251,7 +1445,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = react.useState(false)
       const [error, setError] = react.useState('')
       const [done, setDone] = react.useState(undefined)
-      // 可调草稿：默认模型建议 / 本次精确签名，用户不满意就直接改（用户 2026-09-15 要求）
+      // 可调草稿：默认模型建议 / 本次动作的权限指纹，用户不满意就直接改（用户 2026-09-15 要求）
       const [draft, setDraft] = react.useState(() => ruleDraftOf(record))
       const draftProblem = ruleDraftProblem(draft)
       const patch = next => setDraft(previous => ({ ...previous, ...next }))
@@ -1311,15 +1505,19 @@ window.__ModuleLoader__.load({
           .catch(cause => setError(String(cause?.message ?? cause)))
           .finally(() => setBusy(false))
       }
-      // 规则文本一定经过模型，但可能走的是「审查时的建议」或「精确签名兜底」，如实写出来；
+      // 规则文本可能来自「审查时的建议」「现场模型优化」或「权限指纹兜底」，如实写出来；
       // 查重结果也如实写出来（三选一）：已有规则覆盖了这次动作（没写新条目）/ 更新了同一条规则 /
       // 顺带合并掉了几条被新规则覆盖的窄规则——用户一眼能看出「为什么名单没变或变少了」
+      // 被这次写入顶掉的旧规则（同名更新掉的那条 + 被覆盖掉的窄规则）**点名列出来**：
+      // 「我的规则明明不一样，为什么被覆盖/合并了」必须一眼看明白（用户 2026-09-16）
+      const dropped = Array.isArray(done?.dropped) ? done.dropped.map(label => String(label)) : []
+      const droppedText = dropped.filter(label => label !== '').join(' / ')
       const dedupeNote = done === undefined
         ? ''
         : done.covered === true
           ? t.appliedCovered
-          : (done.replaced === true ? t.appliedReplaced : '')
-            + (typeof done.merged === 'number' && done.merged > 0 ? t.appliedMerged(done.merged) : '')
+          : (done.replaced === true ? t.appliedReplaced(droppedText) : '')
+            + (typeof done.merged === 'number' && done.merged > 0 ? t.appliedMerged(done.merged, droppedText) : '')
       const doneText = done === undefined
         ? undefined
         : (done.optimizedBy === 'signature'
@@ -1336,7 +1534,7 @@ window.__ModuleLoader__.load({
         onClick: () => run(list, scope),
       }, scope === 'project' ? t.scopeProject : t.scopeGlobal))
       return react.createElement('div', { className: 'ap-actions' },
-        // 匹配条件 / 值 / 标签都能改：默认填的是模型建议或本次精确签名，按钮按这里的内容写入。
+        // 匹配条件 / 值 / 标签都能改：默认填的是模型建议或本次动作的权限指纹，按钮按这里的内容写入。
         // 匹配条件用自带的分段按钮，不用原生 <select>：原生下拉的弹层在深色主题下是白底黑字（用户反馈）
         react.createElement('span', { className: 'ap-actionsLabel' }, t.ruleDraftLabel),
         react.createElement('div', { className: 'ap-ruleBlock' },
@@ -1353,14 +1551,17 @@ window.__ModuleLoader__.load({
                 title: kindApplicable(record, kind) === true ? undefined : t.ruleKindUnavailable(kindLabel(kind)),
                 onClick: () => chooseKind(kind),
               }, kindLabel(kind)))),
-            react.createElement('input', {
-              className: 'ap-input ap-inputWide',
-              'aria-label': t.ruleValue,
-              // 签名 key 很长，输入框放不下：title 兜住完整内容
-              title: draft.value,
-              value: draft.value,
-              onChange: event => patch({ value: event.target.value }),
-            }),
+            // 权限指纹：显示渲染后的可视化 + 一键复制（原始串含 NUL，塞进输入框会显示成方框）；
+            // 别的条件才是可编辑的输入框
+            draft.kind === 'signature'
+              ? react.createElement(FingerprintValue, { value: draft.value })
+              : react.createElement('input', {
+                className: 'ap-input ap-inputWide',
+                'aria-label': t.ruleValue,
+                title: draft.value,
+                value: draft.value,
+                onChange: event => patch({ value: event.target.value }),
+              }),
             react.createElement('input', {
               className: 'ap-input ap-inputWide',
               'aria-label': t.ruleLabelField,
@@ -1368,6 +1569,8 @@ window.__ModuleLoader__.load({
               value: draft.label,
               onChange: event => patch({ label: event.target.value }),
             })),
+          draft.kind === 'signature'
+            && react.createElement('span', { className: 'ap-note' }, t.fingerprintReadonly),
           react.createElement('span', { className: 'ap-note', title: draft.error === '' ? undefined : draft.error },
             draftHintText(draft)),
           // 选了路径前缀就说明一下通配符口径：只支持单层 *（** 会被宿主拒绝）
@@ -1397,6 +1600,54 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 「本次加入的规则」那一行：说明这次写了什么、顶掉了哪些旧规则，并可一键撤销。
+     * 凭据在记录里（`ruleApplied`），所以刷新页面后照样能撤销；撤销过（`ruleReverted`）就不再给按钮。
+     * 「已有规则覆盖这次动作」（covered）没有写入任何东西，**不给撤销**——那种 ruleId 指的是别人的规则。
+     */
+    function UndoRule({ record, onDone }) {
+      const applied = record?.ruleApplied
+      const [busy, setBusy] = react.useState(false)
+      const [error, setError] = react.useState('')
+      const [undone, setUndone] = react.useState(record?.ruleReverted !== undefined)
+      if (applied === undefined || applied === null || typeof applied.ruleId !== 'string'
+        || applied.ruleId === '' || applied.covered === true) return null
+      const dropped = []
+      if (applied.previousRule !== undefined && applied.previousRule !== null) {
+        dropped.push(String(applied.previousRule.label ?? applied.previousRule.id ?? ''))
+      }
+      for (const rule of Array.isArray(applied.mergedRules) ? applied.mergedRules : []) {
+        dropped.push(String(rule?.label ?? rule?.id ?? ''))
+      }
+      const droppedText = dropped.filter(label => label !== '').join(' / ')
+      const run = () => {
+        setBusy(true)
+        setError('')
+        revertRecord(record.id)
+          .then(() => {
+            setUndone(true)
+            if (typeof onDone === 'function') onDone()
+          })
+          .catch(cause => setError(String(cause?.message ?? cause)))
+          .finally(() => setBusy(false))
+      }
+      return react.createElement('div', { className: 'ap-actionRow ap-undo' },
+        react.createElement('span', { className: 'ap-actionsLabel' }, t.ruleUndoLabel),
+        react.createElement('span', { className: 'ap-note' },
+          scopeLabel(applied.scope) + ' / ' + (applied.list === 'allow' ? t.allowList : t.denyList)
+          + ' · ' + String(applied.label ?? '')),
+        droppedText !== '' && react.createElement('span', { className: 'ap-note ap-warn' }, t.ruleDropped(droppedText)),
+        undone
+          ? react.createElement('span', { className: 'ap-note' }, t.ruleUndone)
+          : react.createElement('button', {
+            type: 'button',
+            className: 'ap-btn',
+            disabled: busy || typeof record.id !== 'string',
+            onClick: run,
+          }, busy ? t.working : t.undoRule),
+        error !== '' && react.createElement('span', { className: 'ap-note ap-warn' }, error))
+    }
+
+    /**
      * 把记录里的 token 用量格式化成详情里一行的值文本。
      * 只显示记录里确实存在的数字字段：审查失败或提供方不给用量时整行不显示。
      * @param {object|undefined} usage 宿主写入的用量
@@ -1423,6 +1674,8 @@ window.__ModuleLoader__.load({
       const applied = record.ruleApplied === undefined
         ? undefined
         : scopeLabel(record.ruleApplied.scope) + ' / ' + (record.ruleApplied.list === 'allow' ? t.allowList : t.denyList) + ' · ' + String(record.ruleApplied.label ?? '')
+          // 覆盖命中：这次其实什么都没写，明细里说清楚，别让人以为名单多了这条
+          + (record.ruleApplied.covered === true ? t.appliedCovered : '')
           + (record.ruleApplied.optimizedBy === 'manual' ? '（你手填的匹配条件）' : '')
       const promoted = record.promotedRule === undefined
         ? undefined
@@ -1474,7 +1727,18 @@ window.__ModuleLoader__.load({
           react.createElement(Field, { label: t.rejectReason, value: record.rejectReason }),
           react.createElement(Field, { label: t.reason, value: record.reason }),
           react.createElement(Field, { label: t.action, value: record.action, mono: true }),
-          react.createElement(Field, { label: t.signature, value: record.signature === undefined ? undefined : record.signature.text, mono: true }),
+          // 「权限指纹」显示机器 key：与规则表单里生成的签名逐字一致（用户 2026-09-16 要求）；
+          // 可读文本另起一行，别让长 key 把「这次在授权什么」这件事盖住
+          // 权限指纹：显示渲染后的可视化，原始串（含 NUL）挂 title，别在详情里糊一串方框
+          react.createElement(Field, {
+            label: t.signature,
+            value: record.signature === undefined ? undefined : fingerprintShort(record.signature.key),
+            title: record.signature === undefined ? undefined : record.signature.key,
+            mono: true,
+          }),
+          // 指纹是机器串：紧跟着按它的结构摊开（工具 / 命令或参数 / 额外参数），人一眼看得出在授权什么
+          ...fingerprintFields(record.signature === undefined ? undefined : record.signature.key),
+          react.createElement(Field, { label: t.signatureText, value: record.signature === undefined ? undefined : record.signature.text }),
           react.createElement(Field, { label: t.suggestedRule, value: suggested }),
           react.createElement(Field, { label: t.policyHit, value: hitText }),
           react.createElement(Field, { label: t.applied, value: applied }),
@@ -1489,7 +1753,9 @@ window.__ModuleLoader__.load({
           react.createElement(Field, { label: t.time, value: record.time }),
           // 升级/降级需要记录的签名或模型建议；更早版本留下的老记录两者都没有，不显示死按钮
           (record.signature !== undefined || record.suggestedRule !== undefined)
-            && react.createElement(RuleActions, { record, onDone: onChanged })),
+            && react.createElement(RuleActions, { record, onDone: onChanged }),
+          // 「本次加入的规则」+ 撤销这次加入（记录里带撤销凭据、且没撤销过时才渲染）
+          react.createElement(UndoRule, { record, onDone: onChanged })),
         // 「全部会话」时在整条记录的最下面用小字标出会话名；title 挂完整 sessionId 便于核对
         sessionName !== undefined && react.createElement('div', {
           className: 'ap-session',
@@ -1515,6 +1781,8 @@ window.__ModuleLoader__.load({
           kind: rule.match?.kind ?? 'signature',
           value: String(rule.match?.value ?? ''),
           label: String(rule.label ?? ''),
+          // 这条规则原本是不是权限指纹：决定「值只读」与「能不能切成指纹」（见下面两个判断）
+          originalKind: rule.match?.kind ?? 'signature',
         })
       }
       /** 保存：本地先按宿主同口径校验，再把草稿交给面板写回。 */
@@ -1537,7 +1805,14 @@ window.__ModuleLoader__.load({
         react.createElement('span', { className: 'ap-ruleLabel', key: 'label' }, String(rule.label ?? '')),
         react.createElement('span', { className: 'ap-badge ap-badgeMuted', key: 'source' }, sourceLabel(rule.source)),
         react.createElement('span', { className: 'ap-badge ap-badgeMuted', key: 'kind' }, kindLabel(rule.match?.kind)),
-        react.createElement('span', { className: 'ap-mono', key: 'value' }, String(rule.match?.value ?? '').slice(0, 48)),
+        // 指纹是机器串（含 NUL 与参数 JSON），列表里给人看的是它摊开后的紧凑文案；原始值挂 title
+        react.createElement('span', {
+          className: 'ap-mono',
+          key: 'value',
+          title: String(rule.match?.value ?? ''),
+        }, rule.match?.kind === 'signature'
+          ? fingerprintShort(rule.match?.value)
+          : String(rule.match?.value ?? '').slice(0, 48)),
         react.createElement('button', {
           type: 'button', className: 'ap-btn', key: 'edit', onClick: () => begin(rule),
         }, t.edit),
@@ -1546,14 +1821,25 @@ window.__ModuleLoader__.load({
         }, t.remove),
       ]
       /**
-       * 换匹配条件：值也按新条件刷新一下（从精确签名切到命令前缀时，把签名 key 里的命令取出来当前缀），
+       * 换匹配条件：值也按新条件刷新一下（从权限指纹切到命令前缀时，把签名 key 里的命令取出来当前缀），
        * 免得留下「条件 = 命令前缀、值却是一串签名 key」这种组合。
        */
-      const chooseKind = kind => setDraft(previous => ({
-        ...previous,
-        kind,
-        value: ruleValueForKind(kind, previous.value),
-      }))
+      /**
+       * 设置面板里的两条指纹规则（用户 2026-09-16 要求「指纹不许手改」）：
+       * - 本来就是指纹的规则：值只读，只能改标签；
+       * - 不是指纹的规则：不能切成指纹——指纹只能由插件从时间线某条记录算出来，没有值可填。
+       * 判断依据是**草稿里记下的原始 kind**，不是当前选中的 kind（否则切走再切回来就绕过了）。
+       */
+      const isFingerprint = draft => (draft?.originalKind ?? 'signature') === 'signature'
+      const cannotSwitchToFingerprint = draft => isFingerprint(draft) !== true
+      const chooseKind = kind => setDraft(previous => (
+        kind === 'signature' && cannotSwitchToFingerprint(previous)
+          ? previous
+          : {
+            ...previous,
+            kind,
+            value: ruleValueForKind(kind, previous.value),
+          }))
       /** 一条规则的编辑行：匹配条件 / 值 / 标签，与时间线那块表单同一套控件（同样不用原生下拉）。 */
       const editorOf = rule => react.createElement('span', { className: 'ap-ruleEditor ap-ruleEditorRow' },
         react.createElement('span', { className: 'ap-seg', role: 'group', 'aria-label': t.ruleKind },
@@ -1563,14 +1849,21 @@ window.__ModuleLoader__.load({
             'data-kind': kind,
             'data-on': draft.kind === kind ? '1' : '0',
             'aria-pressed': draft.kind === kind,
+            // 权限指纹不能手填：非指纹规则切成指纹没有值可填，按钮直接禁用（用户 2026-09-16 要求）
+            disabled: kind === 'signature' && cannotSwitchToFingerprint(draft),
+            title: kind === 'signature' && cannotSwitchToFingerprint(draft) ? t.fingerprintLocked : undefined,
             onClick: () => chooseKind(kind),
           }, kindLabel(kind)))),
-        react.createElement('input', {
-          className: 'ap-input ap-inputWide',
-          'aria-label': t.ruleValue,
-          value: draft.value,
-          onChange: event => setDraft(previous => ({ ...previous, value: event.target.value })),
-        }),
+        draft.kind === 'signature'
+          ? react.createElement(FingerprintValue, { value: draft.value })
+          : react.createElement('input', {
+            className: 'ap-input ap-inputWide',
+            'aria-label': t.ruleValue,
+            title: draft.value,
+            value: draft.value,
+            onChange: event => setDraft(previous => ({ ...previous, value: event.target.value })),
+          }),
+        isFingerprint(draft) && react.createElement('span', { className: 'ap-note' }, t.fingerprintReadonly),
         react.createElement('input', {
           className: 'ap-input ap-inputWide',
           'aria-label': t.ruleLabelField,
@@ -1729,6 +2022,8 @@ window.__ModuleLoader__.load({
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
       const [cwd, setCwd] = react.useState(() => workspaceOf(sessionId))
       const [error, setError] = react.useState('')
+      // 编辑规则的结果（合并掉了哪些窄规则）：只影响这一行的提示，不影响列表本身
+      const [editNote, setEditNote] = react.useState('')
       const [saved, setSaved] = react.useState(false)
       const [thresholdDraft, setThresholdDraft] = react.useState({})
       const [revision, setRevision] = react.useState(0)
@@ -1787,13 +2082,28 @@ window.__ModuleLoader__.load({
       }
       const remove = (scope, list, id) => {
         setError('')
+        setEditNote('')
         policyStore.post({ op: 'remove', scope, list, id, cwd })
           .catch(cause => setError(String(cause?.message ?? cause)))
       }
-      /** 编辑一条已有规则（按 id 原地更新）：改完立刻写宿主并回读快照。 */
+      /**
+       * 编辑一条已有规则（按 id 原地更新）：改完立刻写宿主并回读快照。
+       * 改宽之后可能把别的窄规则盖住（宿主按同一套口径合并掉）——那样名单会少条目，
+       * 所以把被顶掉的规则标签如实显示出来（用户 2026-09-16 要求「说清楚」）。
+       */
       const editRule = (scope, list, id, rule) => {
         setError('')
+        setEditNote('')
         policyStore.post({ op: 'update', scope, list, id, rule, cwd })
+          .then(data => {
+            const dropped = Array.isArray(data.dropped)
+              ? data.dropped.map(label => String(label)).filter(label => label !== '')
+              : []
+            const merged = Number.isSafeInteger(data.merged) ? data.merged : 0
+            const note = (data.replaced === true ? t.appliedReplaced('') : '')
+              + (merged > 0 ? t.appliedMerged(merged, dropped.join(' / ')) : '')
+            setEditNote(note)
+          })
           .catch(cause => setError(String(cause?.message ?? cause)))
       }
       void revision
@@ -1830,6 +2140,7 @@ window.__ModuleLoader__.load({
                 react.createElement(RuleList, { scope: 'project', list: 'deny', title: t.denyList, rules: projectRules?.deny ?? [], onRemove: remove, onEdit: editRule }),
               ]),
             react.createElement(SettingsCard, { tag: 'section' }),
+            editNote !== '' && react.createElement('div', { className: 'ap-note' }, editNote),
             (error !== '' || policyStore.error !== '')
               && react.createElement('div', { className: 'ap-note' }, error !== '' ? error : policyStore.error))))
     }

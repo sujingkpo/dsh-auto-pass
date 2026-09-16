@@ -18,6 +18,12 @@ const SESSION_UNKNOWN = 'session-2b7d4c11-0000-4000-8000-000000000002'
 /** 快捷筛选 chip 的 data-filter 顺序：全部 + 四个筛选键。 */
 const FILTER_CHIPS = ['all', 'allow', 'deny', 'auto', 'human']
 
+/**
+ * 策略快照里那条指纹规则的值：形态与真实权限指纹一致（工具\u0000cmd:命令\u0000x:额外参数）。
+ * 界面上不该直接显示这串机器码，而要显示摊开后的「bash · npm test · sandbox_permissions=…」。
+ */
+const FINGERPRINT_KEY = 'bash\u0000cmd:npm test\u0000x:{"sandbox_permissions":"danger-full-access"}'
+
 /** 时间线样例记录：白名单命中、黑名单命中、人工放行、模型自动放行各一条，用来验证行内展示与筛选口径。 */
 function sampleRecords() {
   return [
@@ -134,6 +140,15 @@ let ruleResponder = null
 /** POST /rule/draft（换条件后让模型按该条件重新生成）的回执，同样可被单个用例接管。 */
 let draftResponder = null
 
+/** POST /rule/revert（撤销这次加入）的回执，同样可被单个用例接管。 */
+let revertResponder = null
+
+/** 剪贴板替身收到的文本：指纹的「复制指纹」按钮要把**原始串**（含 NUL）整串写进去。 */
+let clipboardWrites = []
+
+/** POST /policy（改阈值 / 加删改规则）的回执：用例接管它验证「已更新 / 已合并」文案。 */
+let policyResponder = null
+
 /** 渲染帧之间的「等一轮」：默认真时钟；观察器用例切到假时钟后必须改写，否则永远等不到。 */
 const defaultWaitTick = () => new Promise(resolve => setTimeout(resolve, 0))
 let waitTick = defaultWaitTick
@@ -195,6 +210,8 @@ function installBrowserStubs() {
   logResponder = null
   ruleResponder = null
   draftResponder = null
+  revertResponder = null
+  policyResponder = null
   const store = new Map()
   globalThis.localStorage = {
     getItem: key => (store.has(key) ? store.get(key) : null),
@@ -202,21 +219,36 @@ function installBrowserStubs() {
     removeItem: key => { store.delete(key) },
   }
   domStub = installDocumentStub()
-  globalThis.fetch = vi.fn(async url => {
+  // 界面语言与剪贴板：语言写死 zh-CN（不依赖跑测试那台机器的 locale），剪贴板用它断言「复制的是完整指纹」
+  clipboardWrites = []
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: {
+      language: 'zh-CN',
+      clipboard: { writeText: async text => { clipboardWrites.push(String(text)) } },
+    },
+  })
+  globalThis.fetch = vi.fn(async (url, options) => {
     const target = String(url)
     if (target.includes('/policy')) {
+      // 写策略（改阈值 / 加删改规则）：用例可以接管回执，验证「已更新 / 已合并了哪些」的文案
+      if (options?.method === 'POST') {
+        const payload = typeof policyResponder === 'function' ? policyResponder(target) : { ok: true }
+        return { json: async () => payload }
+      }
       // 规则带上 source：命中 chip 的「自动 / 手动」由它反查出来
       return {
         json: async () => ({
           ok: true,
           thresholds: { allow: 3, deny: 3 },
           global: {
-            allow: [{ id: 'rule-1', source: 'model', list: 'allow', scope: 'global', tool: 'bash', label: 'bash · npm test', match: { kind: 'signature', value: 'k' } }],
+            allow: [{ id: 'rule-1', source: 'model', list: 'allow', scope: 'global', tool: 'bash', label: 'bash · npm test', match: { kind: 'signature', value: FINGERPRINT_KEY } }],
             deny: [],
           },
           project: {
             allow: [],
-            deny: [{ id: 'rule-2', source: 'user', list: 'deny', scope: 'project', tool: 'bash', label: 'bash · rm -rf', match: { kind: 'signature', value: 'k2' } }],
+            deny: [{ id: 'rule-2', source: 'user', list: 'deny', scope: 'project', tool: 'bash', label: 'bash · rm -rf', match: { kind: 'command_prefix', value: 'rm -rf' } }],
           },
         }),
       }
@@ -231,6 +263,13 @@ function installBrowserStubs() {
       const payload = typeof draftResponder === 'function'
         ? draftResponder(target)
         : { ok: false, error: 'no draft responder' }
+      return { json: async () => payload }
+    }
+    // 撤销这次加入（POST /rule/revert）：必须排在 /rule 之前，否则会被那条分支吃掉
+    if (target.includes('/rule/revert')) {
+      const payload = typeof revertResponder === 'function'
+        ? revertResponder(target)
+        : { ok: true, restored: [] }
       return { json: async () => payload }
     }
     // 时间线的升级/降级 POST /rule：用例可以接管回执，验证「已更新 / 已被覆盖 / 已合并」三种文案
@@ -328,14 +367,16 @@ function evaluate(element, depth = 0) {
 }
 
 /**
- * 渲染一个面板到稳定状态：反复求值并跑副作用，直到没有新的 setState（最多 5 轮）。
+ * 渲染一个面板到稳定状态：反复求值并跑副作用，直到没有新的 setState（最多 8 轮）。
  * 时间线的记录是异步拉回来的，不求到稳定状态就只会看到「加载中」。
+ * 上限给到 8：规则表单里「切匹配条件 → 填值 → 点按钮 → 渲染结果」各占一轮，
+ * 而权限指纹那档没有值输入框，必须先切条件才拿得到输入框（5 轮会不够）。
  */
 async function renderStable(react, component, props, interact) {
   const frame = react.__pushFrame()
   let tree
   try {
-    for (let pass = 0; pass < 5; pass += 1) {
+    for (let pass = 0; pass < 8; pass += 1) {
       frame.dirty = false
       react.__resetCursor()
       tree = evaluate(component(props))
@@ -367,6 +408,13 @@ function findNodes(node, predicate, found = []) {
   if (predicate(node) === true) found.push(node)
   findNodes(node.children, predicate, found)
   return found
+}
+
+/** 展开详情里某个字段的值（Field 渲染成 .ap-field：键 span + 值 span）。 */
+function fieldValue(node, label) {
+  const field = findNodes(node, candidate => candidate?.props?.className === 'ap-field'
+    && candidate.children?.[0]?.children?.[0] === label)[0]
+  return field?.children?.[1]?.children?.[0]
 }
 
 /** 找文案完全匹配的 button：用于点开「全部会话」。 */
@@ -639,6 +687,294 @@ describe('客户端半加载与注册', () => {
     expect(dump).toContain('这次不需要提权，先别动。')
   })
 
+  it('详情里的「权限指纹」就是规则表单生成的签名，可读文本另起一行「签名摘要」', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    const key = 'pwsh\u0000cmd:pnpm test\u0000x:{"sandbox_permissions":"danger-full-access"}'
+    logResponder = () => [{
+      id: 'record-key',
+      time: '2026-09-16T01:00:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'allow',
+      outcome: 'allowed-once',
+      decidedBy: 'auto',
+      rationale: '只读测试命令。',
+      signature: { toolName: 'pwsh', key, text: 'pwsh: pnpm test', command: 'pnpm test', paths: [] },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let clicked = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (clicked) return
+      const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+      if (head === undefined) return
+      clicked = true
+      head.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    expect(clicked).toBe(true)
+
+    // 详情里的「权限指纹」显示**渲染后的可视化**（原始串含 NUL，糊在界面上会被浏览器画成方框＝乱码），
+    // 原始串挂 title 供悬停/复制核对
+    expect(fieldValue(rendered.tree, '权限指纹')).toBe('pwsh · pnpm test · sandbox_permissions=danger-full-access')
+    const fingerprintField = findNodes(rendered.tree, node => node?.props?.className === 'ap-field'
+      && node.children?.[0]?.children?.[0] === '权限指纹')[0]
+    expect(fingerprintField.children?.[1]?.props?.title).toBe(key)
+    expect(fieldValue(rendered.tree, '签名摘要')).toBe('pwsh: pnpm test')
+    // 指纹是机器串，详情里同时按它的结构摊开给人看（工具 / 命令 / 额外参数），人才能管理名单
+    expect(fieldValue(rendered.tree, '工具')).toBe('pwsh')
+    expect(fieldValue(rendered.tree, '命令')).toBe('pnpm test')
+    expect(fieldValue(rendered.tree, '额外参数')).toBe('sandbox_permissions=danger-full-access')
+    // 表单里：指纹**没有**可编辑的值输入框（不许手改），而是一个「复制指纹」按钮 + 一行说明
+    expect(findNodes(rendered.tree, node => node?.type === 'input'
+      && node?.props?.['aria-label'] === '匹配值')).toHaveLength(0)
+    expect(JSON.stringify(rendered.tree)).toContain('pwsh · pnpm test · sandbox_permissions=danger-full-access')
+    expect(JSON.stringify(rendered.tree)).toContain('权限指纹由插件算出、不能手改')
+  })
+
+  it('「复制指纹」复制的是完整原始串（含 NUL），不是在界面上选中那行渲染', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    const key = 'pwsh\u0000cmd:pnpm test\u0000x:{"sandbox_permissions":"danger-full-access"}'
+    logResponder = () => [{
+      id: 'record-copy',
+      time: '2026-09-16T01:02:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'deny',
+      outcome: 'allowed-once',
+      decidedBy: 'human',
+      rationale: '这次先放行。',
+      signature: { toolName: 'pwsh', key, text: 'pwsh: pnpm test', command: 'pnpm test', paths: [] },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let expanded = false
+    let copied = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded === false) {
+        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+        if (head === undefined) return
+        expanded = true
+        head.props.onClick()
+        return
+      }
+      if (copied) return
+      const button = findButton(tree, '复制指纹')
+      if (button === undefined) return
+      copied = true
+      button.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    expect(copied).toBe(true)
+
+    // 整串写进剪贴板：NUL 分隔符一个不少（界面上的渲染文案是另一回事）
+    expect(clipboardWrites).toEqual([key])
+    expect(clipboardWrites[0]).toContain('\u0000cmd:pnpm test\u0000x:')
+    expect(JSON.stringify(rendered.tree)).toContain('已复制完整指纹')
+  })
+
+  it('设置面板：指纹规则的值只读，列表与编辑行都给出摊开后的文案', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const view = slot(slotRegistrations, 'conversation.view', 'dsh-auto-pass')
+
+    let listDump = ''
+    let clicked = false
+    const rendered = await renderStable(react, view.component, { sessionId: SESSION_KNOWN }, tree => {
+      const row = findNodes(tree, node => node?.props?.className === 'ap-rule'
+        && JSON.stringify(node).includes('bash · npm test'))[0]
+      // 规则列表里直接显示摊开后的指纹（机器码含 NUL，人读不了）
+      if (row !== undefined && listDump === '') listDump = JSON.stringify(tree)
+      if (clicked || row === undefined) return
+      const edit = findNodes(row, node => node?.type === 'button' && node.children?.[0] === '编辑')[0]
+      if (edit === undefined) return
+      clicked = true
+      edit.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    expect(clicked).toBe(true)
+    expect(listDump).toContain('bash · npm test · sandbox_permissions=danger-full-access')
+
+    // 指纹规则：值只读（可以选中复制），指纹按钮本身就是当前条件、不禁用；说明与紧凑文案都在
+    // 指纹规则：编辑行里没有值输入框（不许手改），给的是渲染后的可视化 + 「复制指纹」
+    expect(findNodes(rendered.tree, node => node?.type === 'input'
+      && node?.props?.['aria-label'] === '匹配值')).toHaveLength(0)
+    expect(findButton(rendered.tree, '复制指纹')).toBeDefined()
+    const fingerprintButton = findNodes(rendered.tree, node => node?.type === 'button'
+      && node?.props?.['data-kind'] === 'signature')[0]
+    expect(fingerprintButton.props.disabled).toBeFalsy()
+    const dump = JSON.stringify(rendered.tree)
+    expect(dump).toContain('bash · npm test · sandbox_permissions=danger-full-access')
+    expect(dump).toContain('权限指纹由插件算出、不能手改')
+  })
+
+  it('设置面板：命令前缀规则切不成「权限指纹」（没有指纹可填，按钮禁用且点了也不动）', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const view = slot(slotRegistrations, 'conversation.view', 'dsh-auto-pass')
+
+    let editing = false
+    let clicked = false
+    let rerendered = false
+    const rendered = await renderStable(react, view.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (editing === false) {
+        const row = findNodes(tree, node => node?.props?.className === 'ap-rule'
+          && JSON.stringify(node).includes('bash · rm -rf'))[0]
+        if (row === undefined) return
+        const edit = findNodes(row, node => node?.type === 'button' && node.children?.[0] === '编辑')[0]
+        if (edit === undefined) return
+        editing = true
+        edit.props.onClick()
+        return
+      }
+      if (clicked === false) {
+        const fingerprintButton = findNodes(tree, node => node?.type === 'button'
+          && node?.props?.['data-kind'] === 'signature')[0]
+        if (fingerprintButton === undefined) return
+        clicked = true
+        // 按钮是禁用的；这里直接调 handler，等于绕过浏览器兜一层——守卫必须自己挡住
+        fingerprintButton.props.onClick()
+        return
+      }
+      rerendered = true
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    expect(editing).toBe(true)
+    expect(clicked).toBe(true)
+    expect(rerendered).toBe(true)
+
+    const fingerprintButton = findNodes(rendered.tree, node => node?.type === 'button'
+      && node?.props?.['data-kind'] === 'signature')[0]
+    expect(fingerprintButton.props.disabled).toBe(true)
+    // 条件仍是命令前缀，值也仍可改（它是手写的条件）
+    const prefixButton = findNodes(rendered.tree, node => node?.type === 'button'
+      && node?.props?.['data-kind'] === 'command_prefix')[0]
+    expect(prefixButton.props['data-on']).toBe('1')
+    const value = findNodes(rendered.tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
+    expect(value.props.readOnly).toBeFalsy()
+  })
+
+  it('模型建议里的假签名不当默认值：回落到本次动作的权限指纹，与详情那一行一致', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    const key = 'pwsh\u0000cmd:pnpm vitest run\u0000x:{"sandbox_permissions":"danger-full-access"}'
+    logResponder = () => [{
+      id: 'record-fake-signature',
+      time: '2026-09-16T01:05:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'defer',
+      outcome: 'allowed-once',
+      decidedBy: 'human',
+      rationale: '这次先放行。',
+      signature: { toolName: 'pwsh', key, text: 'pwsh: pnpm vitest run', command: 'pnpm vitest run', paths: [] },
+      // 真机里的样子（~/.dsh/dsh-auto-pass/records）：模型把「签名」写成了一句描述，一个动作都命不中
+      suggestedRule: { tool: 'pwsh', match: { kind: 'signature', value: 'escalation=danger-full-access' }, label: '提权重试' },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let clicked = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (clicked) return
+      const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+      if (head === undefined) return
+      clicked = true
+      head.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    expect(clicked).toBe(true)
+
+    // 假签名不当默认值：条件仍是权限指纹，值回落到本次签名 key（点了才不会被宿主 400 not-covering 拒）
+    const kind = findNodes(rendered.tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'signature')[0]
+    expect(kind.props['data-on']).toBe('1')
+    // 指纹没有输入框（不许手改），界面上是渲染后的文案；点「复制指纹」拿到的才是原始 key
+    expect(findNodes(rendered.tree, node => node?.type === 'input'
+      && node?.props?.['aria-label'] === '匹配值')).toHaveLength(0)
+    expect(fieldValue(rendered.tree, '权限指纹')).toBe('pwsh · pnpm vitest run · sandbox_permissions=danger-full-access')
+    // 那条建议仍如实展示在「模型建议规则」里，只是不再填空
+    expect(JSON.stringify(rendered.tree)).toContain('escalation=danger-full-access')
+    expect(JSON.stringify(rendered.tree)).toContain('默认是本次动作的权限指纹')
+  })
+
+  it('模型建议里的签名等于本次签名时，照旧当默认值', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    const key = 'pwsh\u0000cmd:pnpm test\u0000x:{}'
+    logResponder = () => [{
+      id: 'record-real-signature',
+      time: '2026-09-16T01:10:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'defer',
+      outcome: 'allowed-once',
+      decidedBy: 'human',
+      rationale: '只读测试命令。',
+      signature: { toolName: 'pwsh', key, text: 'pwsh: pnpm test', command: 'pnpm test', paths: [] },
+      suggestedRule: { tool: 'pwsh', match: { kind: 'signature', value: key }, label: '只跑这条测试' },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let clicked = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (clicked) return
+      const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+      if (head === undefined) return
+      clicked = true
+      head.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    expect(clicked).toBe(true)
+
+    // 建议确实覆盖本次动作：照旧当默认值（连标签一起），提示语也仍是「来自模型建议」
+    // 指纹条件的值不给手改，界面上显示的是渲染后的文案（原始串可由「复制指纹」复制）
+    expect(JSON.stringify(rendered.tree)).toContain('pwsh · pnpm test')
+    const label = findNodes(rendered.tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '规则标签')[0]
+    expect(label.props.value).toBe('只跑这条测试')
+    expect(JSON.stringify(rendered.tree)).toContain('默认来自这次审查的模型建议')
+  })
+
   it('快捷筛选：点亮「白名单」后只剩命中白名单的那条', async () => {
     const registration = await loadClient()
     const react = fakeReact()
@@ -787,6 +1123,7 @@ describe('升级/降级的查重文案', () => {
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
     let expanded = false
+    let switched = false
     let edited = false
     let clicked = false
     const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
@@ -797,14 +1134,19 @@ describe('升级/降级的查重文案', () => {
         head.props.onClick()
         return
       }
-      if (edited === false) {
-        // 这一条没有模型建议：草稿默认是本次精确签名；这里把条件改成命令前缀并填上值
-        // 匹配条件是我们自己的分段按钮（不用原生 <select>：它的弹层在深色主题下是白底）
+      if (switched === false) {
+        // 这一条没有模型建议：草稿默认是本次动作的权限指纹（**没有可编辑的值输入框**），
+        // 先把条件切到命令前缀（我们自己的分段按钮），下一轮才有输入框可以填
         const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
-        const value = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
-        if (kindButton === undefined || value === undefined) return
-        edited = true
+        if (kindButton === undefined) return
+        switched = true
         kindButton.props.onClick()
+        return
+      }
+      if (edited === false) {
+        const value = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
+        if (value === undefined) return
+        edited = true
         value.props.onChange({ target: { value: 'npm test' } })
         return
       }
@@ -966,6 +1308,7 @@ describe('升级/降级的查重文案', () => {
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
     let expanded = false
+    let switched = false
     let edited = false
     const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
       if (expanded === false) {
@@ -975,12 +1318,18 @@ describe('升级/降级的查重文案', () => {
         head.props.onClick()
         return
       }
+      // 草稿默认是权限指纹（没有值输入框）：先切到路径前缀，下一轮再填值
+      if (switched === false) {
+        const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'path_prefix')[0]
+        if (kindButton === undefined) return
+        switched = true
+        kindButton.props.onClick()
+        return
+      }
       if (edited) return
-      const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'path_prefix')[0]
       const value = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
-      if (kindButton === undefined || value === undefined) return
+      if (value === undefined) return
       edited = true
-      kindButton.props.onClick()
       value.props.onChange({ target: { value: 'D:/repo/**/*.js' } })
     })
     for (const cleanup of rendered.cleanups) cleanup()
@@ -1062,6 +1411,7 @@ describe('升级/降级的查重文案', () => {
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
     let expanded = false
+    let switched = false
     let edited = false
     const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
       if (expanded === false) {
@@ -1071,12 +1421,18 @@ describe('升级/降级的查重文案', () => {
         head.props.onClick()
         return
       }
+      // 草稿默认是权限指纹（没有值输入框）：先切到命令前缀，下一轮再填值
+      if (switched === false) {
+        const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
+        if (kindButton === undefined) return
+        switched = true
+        kindButton.props.onClick()
+        return
+      }
       if (edited) return
-      const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
       const value = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
-      if (kindButton === undefined || value === undefined) return
+      if (value === undefined) return
       edited = true
-      kindButton.props.onClick()
       value.props.onChange({ target: { value: 'pnpm vitest run tests/*' } })
     })
     for (const cleanup of rendered.cleanups) cleanup()
@@ -1093,6 +1449,8 @@ describe('升级/降级的查重文案', () => {
       throw new Error('unexpected require: ' + specifier)
     })
     const { ctx, slotRegistrations } = harness()
+    // 改宽之后宿主把被它盖住的窄规则合并掉了：面板要把这件事说出来（名单为什么少了一条）
+    policyResponder = () => ({ ok: true, replaced: false, merged: 1, dropped: ['运行 policy.spec.js 单测'] })
     moduleExports.apply(ctx)
     const view = slot(slotRegistrations, 'conversation.view', 'dsh-auto-pass')
 
@@ -1130,8 +1488,11 @@ describe('升级/降级的查重文案', () => {
       scope: 'global',
       list: 'allow',
       id: 'rule-1',
-      rule: { tool: 'bash', match: { kind: 'signature', value: 'k' }, label: '改过的标签' },
+      rule: { tool: 'bash', match: { kind: 'signature', value: FINGERPRINT_KEY }, label: '改过的标签' },
     })
+    // 顺带告知被顶掉的窄规则（按名字）：名单变少时用户一眼知道是哪条
+    expect(JSON.stringify(rendered.tree)).toContain('已合并 1 条被它覆盖的窄规则：运行 policy.spec.js 单测')
+    policyResponder = null
   })
 
   /**
@@ -1167,6 +1528,114 @@ describe('升级/降级的查重文案', () => {
     return rendered.tree
   }
 
+  it('详情里列出被顶掉的规则，并能一键撤销这次加入', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    let reverted = false
+    logResponder = () => [{
+      id: 'record-undo',
+      time: '2026-09-16T02:00:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'defer',
+      outcome: 'allowed-once',
+      decidedBy: 'human',
+      rationale: '这次先放行。',
+      signature: { toolName: 'pwsh', key: 'k', text: 'pwsh: pnpm test', command: 'pnpm test', paths: [] },
+      // 这次加入顶掉了一条更窄的旧规则（命令前缀把那条精确签名的规则盖住了）——记录里带着它的快照
+      ruleApplied: {
+        scope: 'project',
+        list: 'allow',
+        ruleId: 'rule-new',
+        label: '跑测试',
+        optimizedBy: 'signature',
+        match: { kind: 'command_prefix', value: 'pnpm test' },
+        mergedRules: [{ id: 'rule-old', label: '只跑这一条', match: { kind: 'signature', value: 'k' } }],
+      },
+      ...(reverted ? { ruleReverted: { at: '2026-09-16T02:01:00.000Z', restored: ['只跑这一条'] } } : {}),
+    }]
+    // 撤销成功后记录里就带上 ruleReverted（宿主写回），界面据此不再显示按钮
+    revertResponder = () => {
+      reverted = true
+      return { ok: true, restored: ['只跑这一条'] }
+    }
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let expanded = false
+    let undone = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded === false) {
+        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+        if (head === undefined) return
+        expanded = true
+        head.props.onClick()
+        return
+      }
+      if (undone) return
+      const button = findButton(tree, '撤销这次加入')
+      if (button === undefined) return
+      undone = true
+      button.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    revertResponder = null
+    expect(undone).toBe(true)
+
+    // 撤销只报 recordId：凭据只认记录里那一份，浏览器不指定要恢复什么
+    expect(bodiesOf('/rule/revert')).toEqual([{ recordId: 'record-undo' }])
+    const dump = JSON.stringify(rendered.tree)
+    expect(dump).toContain('本次加入的规则')
+    expect(dump).toContain('只跑这一条')
+    expect(dump).toContain('已撤销，名单已还原')
+  })
+
+  it('「已有规则覆盖这次动作」没有写入任何条目：详情里说清楚，也不给撤销按钮', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    logResponder = () => [{
+      id: 'record-covered',
+      time: '2026-09-16T02:05:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'defer',
+      outcome: 'allowed-once',
+      decidedBy: 'human',
+      rationale: '这次先放行。',
+      signature: { toolName: 'pwsh', key: 'k', text: 'pwsh: pnpm test', command: 'pnpm test', paths: [] },
+      // 覆盖命中：ruleId 指的是那条**已有**的规则，所以不给撤销入口
+      ruleApplied: { scope: 'project', list: 'allow', ruleId: 'rule-existing', label: '跑测试', covered: true },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let expanded = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded) return
+      const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+      if (head === undefined) return
+      expanded = true
+      head.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    expect(expanded).toBe(true)
+    const dump = JSON.stringify(rendered.tree)
+    expect(dump).toContain('已有规则已覆盖这个动作，未重复添加')
+    expect(findButton(rendered.tree, '撤销这次加入')).toBeUndefined()
+  })
+
   it('分别提示「已更新同名规则 / 已被已有规则覆盖 / 已合并窄规则」', async () => {
     const registration = await loadClient()
     const react = fakeReact()
@@ -1196,9 +1665,9 @@ describe('升级/降级的查重文案', () => {
 
     // 新规则顺带合并掉了更窄的旧规则：告诉用户名单为什么少了一条
     const mergedTree = JSON.stringify(await promoteOnce(react, pane, {
-      optimizedBy: 'signature', replaced: false, covered: false, merged: 2, rule: { label: '跑测试（精确签名）' },
+      optimizedBy: 'signature', replaced: false, covered: false, merged: 2, rule: { label: '跑测试（权限指纹）' },
     }))
-    expect(mergedTree).toContain('已加入（没有可用的模型建议，已回落到默认条件')
+    expect(mergedTree).toContain('已加入（没有可用的模型建议，已回落到本次动作的权限指纹）')
     expect(mergedTree).toContain('（已合并 2 条被它覆盖的窄规则）')
     ruleResponder = null
   })

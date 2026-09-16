@@ -12,6 +12,7 @@ import { workspaceSlug } from '../src/records.js'
 import {
   canonicalizeCounters,
   canonicalizeMemoryCounters,
+  canonicalizeRules,
   canonicalMemoryKey,
   createPolicyStore,
   DEFAULT_MAX_COUNTERS,
@@ -56,15 +57,16 @@ describe('signatureOf', () => {
     expect(pwshSignature('git status').key).not.toBe(pwshSignature('git diff').key)
   })
 
-  it('噪声参数只影响精确签名，不影响记忆键', () => {
-    // description / justification / timeoutMs 只影响展示与管道，不该拆散「连续」
+  it('噪声参数不进权限指纹（用户 2026-09-16：指纹要通用，但不放宽授权面）', () => {
+    // description / justification / timeoutMs 只影响展示与执行管道，不该把同一个动作拆成两种权限
     const first = pwshSignature('pnpm test', { description: '跑测试', justification: '理由一', timeoutMs: 300000 })
     const second = pwshSignature('pnpm test', { description: '再跑一次', justification: '完全不同的理由', timeoutMs: 60000 })
-    expect(first.key).not.toBe(second.key)
-    expect(first.memoryKey).toBe(second.memoryKey)
-    // 提权标记改变的是授权范围，必须留在记忆键里：提权重试不与普通调用混计
+    expect(first.key).toBe(second.key)
+    // key（规则的匹配单位）与 memoryKey（连续计数）本来就是同一个串
+    expect(first.key).toBe(first.memoryKey)
+    // 提权标记改变的是授权范围，必须留在指纹里：提权重试不与普通调用混为一谈
     const elevated = pwshSignature('pnpm test', { description: '跑测试', justification: '理由一', sandbox_permissions: 'danger-full-access' })
-    expect(elevated.memoryKey).not.toBe(first.memoryKey)
+    expect(elevated.key).not.toBe(first.key)
   })
 
   it('计数键把管道之后当噪声：同一条命令的不同输出截断算同一条', () => {
@@ -74,16 +76,17 @@ describe('signatureOf', () => {
     const first = pwshSignature('pnpm vitest run tests/client.spec.js 2>&1 | Select-Object -Last 60')
     const second = pwshSignature('pnpm vitest run tests/client.spec.js 2>&1 | Select-Object -Last 30')
     const third = pwshSignature("pnpm vitest run tests/client.spec.js 2>&1 | Select-String -Pattern 'Tests ' | Out-String")
-    // 精确签名仍然各不相同：规则匹配必须逐字，计数才做归并
-    expect(first.key).not.toBe(second.key)
-    expect(first.key).not.toBe(third.key)
+    // 管道之后只决定怎么显示输出：三种写法是同一个权限指纹（也不再是三条计数）
+    expect(first.key).toBe(second.key)
+    expect(first.key).toBe(third.key)
     expect(first.memoryKey).toBe(second.memoryKey)
-    expect(first.memoryKey).toBe(third.memoryKey)
     // 结尾的纯输出重定向也当噪声：`pnpm test 2>&1` 与 `pnpm test` 是同一条权限
-    expect(first.memoryKey).toContain('cmd:pnpm vitest run tests/client.spec.js')
-    expect(first.memoryKey).not.toContain('Select-Object')
-    // 没有管道的命令整条保留
-    expect(pwshSignature('git status --short').memoryKey).toContain('cmd:git status --short')
+    expect(first.key).toContain('cmd:pnpm vitest run tests/client.spec.js')
+    expect(first.key).not.toContain('Select-Object')
+    // 没有管道的命令整条保留（参数不同就是不同指纹：换个测试文件仍是两条权限）
+    expect(pwshSignature('git status --short').key).toContain('cmd:git status --short')
+    expect(pwshSignature('pnpm vitest run tests/a.spec.js').key)
+      .not.toBe(pwshSignature('pnpm vitest run tests/b.spec.js').key)
   })
 
   it('结尾的纯输出重定向也算噪声（2>&1 / >nul / 2>/dev/null）', () => {
@@ -95,17 +98,14 @@ describe('signatureOf', () => {
     expect(pwshSignature('node x.js > out.txt').memoryKey).not.toBe(pwshSignature('node x.js').memoryKey)
   })
 
-  it('workdir 不进计数键（同一工作区里的目录差异算同一条），精确签名仍按目录区分', () => {
+  it('workdir 不进权限指纹（同一动作换个目录写法仍是同一条权限）', () => {
     const back = pwshSignature('pnpm test 2>&1', { workdir: 'D:\\work\\dsh-auto' })
     const forward = pwshSignature('pnpm test 2>&1 | Select-Object -Last 12', { workdir: 'D:/work/dsh-auto' })
     const absent = pwshSignature('pnpm test', {})
-    expect(back.memoryKey).toBe(forward.memoryKey)
-    expect(forward.memoryKey).toBe(absent.memoryKey)
-    // 精确签名只归一化分隔符、不丢目录：规则匹配不会因此放宽
-    expect(pwshSignature('pnpm test', { workdir: 'D:\\work\\x' }).key)
-      .toBe(pwshSignature('pnpm test', { workdir: 'D:/work/x' }).key)
-    expect(pwshSignature('pnpm test', { workdir: 'D:/work/x' }).key)
-      .not.toBe(pwshSignature('pnpm test', {}).key)
+    // 分隔符写法、有没有写、写没写清目录都不该把同一条命令拆成两条权限
+    expect(back.key).toBe(forward.key)
+    expect(forward.key).toBe(absent.key)
+    expect(back.memoryKey).toBe(back.key)
   })
 
   it('引号内的竖线不算管道（正则里的 | 不该截断计数键）', () => {
@@ -520,6 +520,177 @@ describe('policy store', () => {
     expect(rules[0].match.kind).toBe('command_prefix')
     // 合并是落盘的：新实例（模拟重启）看到的同样只有一条
     expect(store().snapshot(cwd).global.allow).toHaveLength(1)
+  })
+
+  it('合并窄规则的回执带上被顶掉的快照，revertRule 把名单还原成写入前的样子', () => {
+    const instance = store()
+    const narrow = instance.addRule(signatureRule('global', 'allow', pwshSignature('pnpm test 2>&1 | Select-Object -Last 12')), cwd)
+    const added = instance.addRule({
+      scope: 'global',
+      list: 'allow',
+      rule: { tool: 'pwsh', label: '跑测试', match: { kind: 'command_prefix', value: 'pnpm test' } },
+    }, cwd)
+    expect(added.merged).toBe(1)
+    // 回执里带着被删掉那条的完整快照：界面据此说清楚，撤销据此还原
+    expect(added.mergedRules).toHaveLength(1)
+    expect(added.mergedRules[0].id).toBe(narrow.rule.id)
+    expect(added.mergedRules[0].match.kind).toBe('signature')
+    expect(instance.snapshot(cwd).global.allow).toHaveLength(1)
+
+    const reverted = instance.revertRule({
+      scope: 'global',
+      list: 'allow',
+      ruleId: added.rule.id,
+      match: added.rule.match,
+      mergedRules: added.mergedRules,
+    }, cwd)
+    expect(reverted.ok).toBe(true)
+    expect(reverted.restored).toEqual([String(narrow.rule.label)])
+    // 宽的那条被删掉、窄的回来了；落盘（模拟重启）也看得到
+    expect(instance.snapshot(cwd).global.allow.map(rule => rule.id)).toEqual([narrow.rule.id])
+    expect(store().snapshot(cwd).global.allow.map(rule => rule.id)).toEqual([narrow.rule.id])
+  })
+
+  it('同名更新的回执带上被顶掉的那条，revertRule 把它换回来', () => {
+    const instance = store()
+    const first = instance.addRule({
+      scope: 'global',
+      list: 'allow',
+      rule: { tool: 'pwsh', label: '旧标签', match: { kind: 'command_prefix', value: 'pnpm test' } },
+    }, cwd)
+    // 只差一个尾部空格 = 同一条：这次是更新（新的顶掉旧的），撤销要把旧的换回来
+    const second = instance.addRule({
+      scope: 'global',
+      list: 'allow',
+      rule: { tool: 'pwsh', label: '新标签', match: { kind: 'command_prefix', value: 'pnpm test ' } },
+    }, cwd)
+    expect(second.replaced).toBe(true)
+    expect(second.previousRule.id).toBe(first.rule.id)
+    expect(second.previousRule.label).toBe('旧标签')
+
+    const reverted = instance.revertRule({
+      scope: 'global',
+      list: 'allow',
+      ruleId: second.rule.id,
+      match: second.rule.match,
+      previousRule: second.previousRule,
+    }, cwd)
+    expect(reverted.ok).toBe(true)
+    const rules = instance.snapshot(cwd).global.allow
+    expect(rules).toHaveLength(1)
+    expect(rules[0].id).toBe(first.rule.id)
+    expect(rules[0].label).toBe('旧标签')
+    expect(rules[0].match.value).toBe('pnpm test')
+  })
+
+  it('updateRule 也会回报被顶掉的快照，revertRule 能撤掉这次编辑', () => {
+    const instance = store()
+    const narrow = instance.addRule({
+      scope: 'global',
+      list: 'allow',
+      rule: { tool: 'pwsh', label: '窄规则', match: { kind: 'command_prefix', value: 'pnpm vitest run tests/policy.spec.js' } },
+    }, cwd)
+    const edited = instance.updateRule({
+      scope: 'global',
+      list: 'allow',
+      id: narrow.rule.id,
+      rule: { tool: 'pwsh', label: '宽规则', match: { kind: 'command_prefix', value: 'pnpm vitest run' } },
+    }, cwd)
+    expect(edited.ok).toBe(true)
+    // previousRule 是这次编辑前的同一个 id；撤销后标签/值都回到编辑前
+    expect(edited.previousRule.id).toBe(narrow.rule.id)
+    expect(edited.previousRule.label).toBe('窄规则')
+    const reverted = instance.revertRule({
+      scope: 'global',
+      list: 'allow',
+      ruleId: edited.rule.id,
+      match: edited.rule.match,
+      previousRule: edited.previousRule,
+      mergedRules: edited.mergedRules,
+    }, cwd)
+    expect(reverted.ok).toBe(true)
+    const rules = instance.snapshot(cwd).global.allow
+    expect(rules).toHaveLength(1)
+    expect(rules[0].label).toBe('窄规则')
+    expect(rules[0].match.value).toBe('pnpm vitest run tests/policy.spec.js')
+  })
+
+  it('canonicalizeRules：老形状的精确签名规则折算成权限指纹，同义的合并成一条', () => {
+    const doc = {
+      rules: {
+        allow: [
+          { id: 'a', tool: 'pwsh', match: { kind: 'signature', value: 'pwsh\u0000cmd:pnpm test 2>&1\u0000x:{}' } },
+          { id: 'b', tool: 'pwsh', match: { kind: 'signature', value: 'pwsh\u0000cmd:pnpm test\u0000x:{}' } },
+          { id: 'c', tool: 'pwsh', match: { kind: 'command_prefix', value: 'pnpm test' } },
+        ],
+        deny: [],
+      },
+    }
+    const result = canonicalizeRules(doc)
+    // a 是旧形状（管道 + 2>&1）要折算；b 折算后与 a 同义，被合并掉；c 不是签名规则，原样保留
+    expect(result.moved).toBe(1)
+    expect(result.dropped).toBe(1)
+    expect(doc.rules.allow.map(rule => rule.id)).toEqual(['a', 'c'])
+    expect(doc.rules.allow[0].match.value).toBe(pwshSignature('pnpm test').key)
+  })
+
+  it('读取策略文件时自动折算老签名规则：折算后落盘，并且真的命中同一个动作', () => {
+    mkdirSync(dirname(globalFile), { recursive: true })
+    writeFileSync(globalFile, JSON.stringify({
+      version: 1,
+      rules: {
+        allow: [{
+          id: 'legacy',
+          scope: 'global',
+          list: 'allow',
+          tool: 'pwsh',
+          match: {
+            kind: 'signature',
+            value: 'pwsh\u0000cmd:pnpm test 2>&1 | Select-Object -Last 8\u0000x:{"description":"跑测试","workdir":"D:\\\\w"}',
+          },
+          label: '跑测试',
+          source: 'user',
+        }],
+        deny: [],
+      },
+      counters: {},
+      thresholds: {},
+    }), 'utf8')
+    const instance = store()
+    expect(instance.snapshot(cwd).global.allow[0].match.value).toBe(pwshSignature('pnpm test').key)
+    // 折算结果落盘：下一次启动读到的就是折算好的（不会再折一次）
+    expect(JSON.parse(readFileSync(globalFile, 'utf8')).rules.allow[0].match.value).toBe(pwshSignature('pnpm test').key)
+    // 折算后的规则仍然命中同一个动作（换个输出截断/换个说明都算同一次）
+    expect(instance.match({ signature: pwshSignature('pnpm test | Out-String'), cwd })?.list).toBe('allow')
+  })
+
+  it('revertRule：规则已被改动或已不在名单里就拒绝（撤销只还原这一次写入）', () => {
+    const instance = store()
+    const added = instance.addRule({
+      scope: 'global',
+      list: 'allow',
+      rule: { tool: 'pwsh', label: 'x', match: { kind: 'command_prefix', value: 'pnpm test' } },
+    }, cwd)
+    const changed = instance.updateRule({
+      scope: 'global',
+      list: 'allow',
+      id: added.rule.id,
+      rule: { tool: 'pwsh', label: 'x', match: { kind: 'command_prefix', value: 'pnpm vitest run' } },
+    }, cwd)
+    expect(changed.ok).toBe(true)
+    // 写入之后又被改过：撤销不该顺手删掉后来的改动
+    const refused = instance.revertRule({
+      scope: 'global', list: 'allow', ruleId: added.rule.id, match: added.rule.match,
+    }, cwd)
+    expect(refused.ok).toBe(false)
+    expect(instance.snapshot(cwd).global.allow).toHaveLength(1)
+    // 已经不在名单里（手动删掉 / 已撤销过）同样拒绝
+    expect(instance.removeRule({ scope: 'global', list: 'allow', id: added.rule.id }, cwd)).toBe(true)
+    const missing = instance.revertRule({
+      scope: 'global', list: 'allow', ruleId: added.rule.id, match: changed.rule.match,
+    }, cwd)
+    expect(missing.ok).toBe(false)
+    expect(instance.snapshot(cwd).global.allow).toHaveLength(0)
   })
 
   it('项目与全局两级各自查重，互不干扰', () => {

@@ -22,6 +22,7 @@ import {
   ruleFromRecord,
   RULE_DRAFT_PATH,
   RULE_PATH,
+  RULE_REVERT_PATH,
   suggestionUsable,
 } from '../src/index.js'
 import { createPolicyStore } from '../src/policy.js'
@@ -433,7 +434,7 @@ describe('权限记忆（达阈值后询问用户）', () => {
     expect(ctx.llmCalls).toHaveLength(2)
   })
 
-  it('没有可用的模型建议时，兜底写的是命令前缀（不是逐字的精确签名）', async () => {
+  it('没有可用的模型建议时，兜底写的是这次动作的权限指纹', async () => {
     const root = tempDir()
     const projectDir = join(root, 'project')
     const policies = policyStore(root, 2)
@@ -457,10 +458,15 @@ describe('权限记忆（达阈值后询问用户）', () => {
     await flush()
 
     expect(asked).toHaveLength(1)
-    expect(asked[0].questions[0].question).toContain('命令前缀')
+    // 询问文案里如实写出默认条件：这次动作的权限指纹；
+    // 给人看的**不是**那串机器指纹（含 NUL 与参数 JSON），而是这次动作的可读摘要
+    expect(asked[0].questions[0].question).toContain('权限指纹')
+    expect(asked[0].questions[0].question).toContain('权限指纹：bash: npm test')
+    expect(asked[0].questions[0].question).not.toContain('\u0000')
     const rules = policies.snapshot(projectDir).project.allow
     expect(rules).toHaveLength(1)
-    expect(rules[0].match).toEqual({ kind: 'command_prefix', value: 'npm test' })
+    expect(rules[0].match.kind).toBe('signature')
+    expect(rules[0].match.value).toBe(signatureOf(requestWith({ command: 'npm test' }), exactAction(requestWith({ command: 'npm test' }))).key)
   })
 
   it('人工拒绝打断连续计数', async () => {
@@ -671,16 +677,22 @@ describe('升级/降级规则', () => {
     expect(ruleFromRecord({ cwd: '/p' })).toBeUndefined()
   })
 
-  it('ruleFromRecord 的兜底默认是命令前缀：换个参数不再命不中', () => {
-    const withCommand = ruleFromRecord({
-      cwd: '/p',
-      signature: signatureOf({ toolName: 'pwsh' }, {
-        arguments: { command: 'pnpm test 2>&1 | Select-Object -Last 12', sandbox_permissions: 'danger-full-access' },
-      }),
+  it('ruleFromRecord 的兜底默认是权限指纹：同一个动作换个输出截断仍命得中，换参数仍分得开', () => {
+    const signature = signatureOf({ toolName: 'pwsh' }, {
+      arguments: { command: 'pnpm test 2>&1 | Select-Object -Last 12', sandbox_permissions: 'danger-full-access' },
     })
-    expect(withCommand.match).toEqual({ kind: 'command_prefix', value: 'pnpm test' })
-    expect(withCommand.note).toContain('默认为命令前缀')
-    // 这次动作没有命令（write 之类）：前缀条件用不上，仍回落精确签名
+    const withCommand = ruleFromRecord({ cwd: '/p', signature })
+    expect(withCommand.match).toEqual({ kind: 'signature', value: signature.key })
+    expect(withCommand.note).toContain('权限指纹')
+    // 同一个动作换个输出截断：指纹一致（这条规则仍然命得中）
+    expect(signatureOf({ toolName: 'pwsh' }, {
+      arguments: { command: 'pnpm test | Out-String', sandbox_permissions: 'danger-full-access' },
+    }).key).toBe(signature.key)
+    // 换了参数就是另一条权限：规则不会顺带放行
+    expect(signatureOf({ toolName: 'pwsh' }, {
+      arguments: { command: 'pnpm test --filter a', sandbox_permissions: 'danger-full-access' },
+    }).key).not.toBe(signature.key)
+    // 动作没有命令（write 之类）时同样是权限指纹
     const noCommand = ruleFromRecord({
       cwd: '/p',
       signature: signatureOf({ toolName: 'write' }, { arguments: { file_path: '/p/a.txt' } }),
@@ -688,10 +700,17 @@ describe('升级/降级规则', () => {
     expect(noCommand.match.kind).toBe('signature')
   })
 
-  it('defaultRuleOf：有命令给命令前缀，命令太短或没有命令才给精确签名', () => {
-    expect(defaultRuleOf(signatureOf({ toolName: 'pwsh' }, { arguments: { command: 'pnpm test 2>&1' } })).match)
-      .toEqual({ kind: 'command_prefix', value: 'pnpm test' })
-    expect(defaultRuleOf(signatureOf({ toolName: 'pwsh' }, { arguments: { command: 'ls' } })).match.kind).toBe('signature')
+  it('defaultRuleOf：默认就是这次动作的权限指纹，提权仍是另一条权限', () => {
+    const plain = defaultRuleOf(signatureOf({ toolName: 'pwsh' }, { arguments: { command: 'pnpm test 2>&1' } }))
+    expect(plain.match.kind).toBe('signature')
+    // 同一动作换个输出截断/换句说明仍是同一个指纹
+    expect(plain.match.value)
+      .toBe(signatureOf({ toolName: 'pwsh' }, { arguments: { command: 'pnpm test' } }).key)
+    // 提权是另一条权限：普通调用的默认规则不会顺手把提权重试也放行
+    const elevated = signatureOf({ toolName: 'pwsh' }, {
+      arguments: { command: 'pnpm test', sandbox_permissions: 'danger-full-access' },
+    })
+    expect(defaultRuleOf(elevated).match.value).not.toBe(plain.match.value)
     expect(defaultRuleOf(signatureOf({ toolName: 'write' }, { arguments: { file_path: '/p/a.txt' } })).match.kind)
       .toBe('signature')
     expect(defaultRuleOf(undefined)).toBeUndefined()
@@ -936,6 +955,77 @@ describe('策略 HTTP 入口', () => {
     expect(JSON.parse(bogus.state.body).code).toBe('not-covering')
     const store = createPolicyStore({ globalFile: join(root, 'home', 'policy.json'), warn: () => {} })
     expect(store.snapshot(projectDir).project.allow).toHaveLength(1)
+  })
+
+  it('加入名单可撤销：/rule 写进撤销凭据、日志点名被顶掉的规则，/rule/revert 把名单还原', async () => {
+    const root = tempDir()
+    const logFile = join(root, 'approvals.json')
+    const projectDir = join(root, 'project')
+    const command = 'pnpm test 2>&1 | Select-Object -Last 12'
+    const signature = signatureOf({ toolName: 'pwsh' }, { arguments: { command } })
+    writeFileSync(logFile, JSON.stringify({
+      version: 1,
+      records: [{
+        id: 'rec-undo',
+        sessionId: 'session-1',
+        cwd: projectDir,
+        toolName: 'pwsh',
+        signature: { toolName: 'pwsh', key: signature.key, text: signature.text, command, paths: [] },
+      }],
+    }), 'utf8')
+    const policyFile = join(root, 'home', 'policy.json')
+    // 用户之前确认过的窄规则（这条动作的精确签名）：即将加入的命令前缀会把它盖住
+    const seed = createPolicyStore({ globalFile: policyFile, warn: () => {} })
+    const narrow = seed.addRule({
+      scope: 'project',
+      list: 'allow',
+      rule: { tool: 'pwsh', match: { kind: 'signature', value: signature.key }, label: '只跑这一条' },
+    }, projectDir)
+    expect(narrow.ok).toBe(true)
+
+    const { ctx, routes } = fakeContext()
+    apply(ctx, { logFile, policyFile })
+    const handler = routes[0].handler
+    /** 现读磁盘的策略仓库（模拟另一次运行看到的名单）。 */
+    const store = () => createPolicyStore({ globalFile: policyFile, warn: () => {} })
+
+    // 用户手填一条更宽的「命令前缀」：它会把上面那条精确签名的窄规则盖住（真机里的那种合并）
+    const promote = fakeHttp('POST', RULE_PATH, JSON.stringify({
+      recordId: 'rec-undo',
+      scope: 'project',
+      list: 'allow',
+      rule: { tool: 'pwsh', match: { kind: 'command_prefix', value: 'pnpm test' }, label: '跑 pnpm 测试' },
+    }))
+    await handler(promote.req, promote.res)
+    const result = JSON.parse(promote.state.body)
+    expect(result.ok).toBe(true)
+    expect(result.merged).toBe(1)
+    // 被合并掉的窄规则**点了名**：界面与日志都据此说清楚「名单为什么少了一条」
+    expect(result.dropped).toEqual(['只跑这一条'])
+    expect(store().snapshot(projectDir).project.allow).toHaveLength(1)
+    expect(ctx.logger.info.mock.calls.map(call => String(call[0])).join('\n')).toContain('dropped=只跑这一条')
+
+    // 记录里带着撤销凭据：被顶掉那条的完整快照 + 这次写入那条的身份（match）
+    const applied = JSON.parse(readFileSync(logFile, 'utf8')).records[0].ruleApplied
+    expect(applied.mergedRules[0].id).toBe(narrow.rule.id)
+    expect(applied.match).toEqual(result.rule.match)
+    expect(applied.ruleId).toBe(result.rule.id)
+
+    const undo = fakeHttp('POST', RULE_REVERT_PATH, JSON.stringify({ recordId: 'rec-undo' }))
+    await handler(undo.req, undo.res)
+    const undone = JSON.parse(undo.state.body)
+    expect(undone.ok, JSON.stringify(undone)).toBe(true)
+    expect(undone.restored).toEqual(['只跑这一条'])
+    // 名单还原：宽的那条没了，窄的回来了
+    expect(store().snapshot(projectDir).project.allow.map(rule => rule.id)).toEqual([narrow.rule.id])
+    // 记录标记已撤销（界面据此不再显示撤销按钮）
+    expect(JSON.parse(readFileSync(logFile, 'utf8')).records[0].ruleReverted.restored).toEqual(['只跑这一条'])
+
+    // 同一条记录不能撤销两次
+    const again = fakeHttp('POST', RULE_REVERT_PATH, JSON.stringify({ recordId: 'rec-undo' }))
+    await handler(again.req, again.res)
+    expect(again.state.code).toBe(400)
+    expect(store().snapshot(projectDir).project.allow.map(rule => rule.id)).toEqual([narrow.rule.id])
   })
 
   it('设置面板能按 id 改一条已有规则（op=update），id 不变', async () => {

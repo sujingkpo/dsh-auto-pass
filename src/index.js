@@ -13,6 +13,8 @@
  * @modify 2026-09-15 规则可微调：/rule 接受手填的 rule（optimizedBy=manual、手填同样要覆盖本次动作）、/policy 支持 op=update；新增 suggestionUsable——模型建议必须覆盖本次动作，写成一句描述的假签名一律丢弃并回落到精确签名
  * @modify 2026-09-15 条件必须配得上动作：signatureFromRecord 不再伪造空 paths、新增 kindApplicable、/rule/draft 对不搭的 kind 直接 400、提示词显式给出 command/paths
  * @modify 2026-09-15 规则默认命令前缀：没有可用模型建议时用 defaultRuleOf（有命令就 command_prefix）；审批记录按工作区分文件
+ * @modify 2026-09-16 加入名单可撤销：addRule/updateRule 回执带上被顶掉的旧规则快照，记录写进 ruleApplied，
+ *   新增 POST /api/dsh-auto-pass/rule/revert 还原；日志与界面都把被删/被改的规则列清楚
  */
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -24,6 +26,7 @@ import {
   noopRecordStore,
 } from './records.js'
 import {
+  canonicalMemoryKey,
   countingCommand,
   createPolicyStore,
   DEFAULT_AUTO_APPROVE_AFTER,
@@ -113,6 +116,11 @@ export const RULE_PATH = '/api/dsh-auto-pass/rule'
  * 让模型**按那个条件**重新生成一遍。用户选的条件会写进提示词，见 buildRulePrompt。
  */
 export const RULE_DRAFT_PATH = '/api/dsh-auto-pass/rule/draft'
+/**
+ * 撤销一次「加入名单」：删掉那次写进去的规则，并把它顶掉的旧规则放回去（凭据取自记录的
+ * `ruleApplied`，见 buildRuleApplied）。用于「一条更宽的前缀把之前手工确认过的窄规则合并掉」的回退。
+ */
+export const RULE_REVERT_PATH = '/api/dsh-auto-pass/rule/revert'
 /** 时间轴可选的放置位置；auto 表示优先右侧栏座位、没有座位时退回对话标签页。 */
 export const PLACEMENTS = Object.freeze(['auto', 'tab', 'sidebar', 'all'])
 /** 设置命名空间：宿主 settings 注册与浏览器端设置卡片靠这个名字对齐。 */
@@ -339,7 +347,8 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
     const url = new URL(req.url ?? '/', 'http://dsh.local')
     const pathname = url.pathname.replace(/\/+$/, '')
     if (pathname !== RECORD_LOG_PATH && pathname !== RECORD_CONFIG_PATH && pathname !== RECORD_BEACON_PATH
-      && pathname !== POLICY_PATH && pathname !== RULE_PATH && pathname !== RULE_DRAFT_PATH) {
+      && pathname !== POLICY_PATH && pathname !== RULE_PATH && pathname !== RULE_DRAFT_PATH
+      && pathname !== RULE_REVERT_PATH) {
       writeJson(404, { ok: false, error: 'not found' })
       return
     }
@@ -388,6 +397,10 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
     }
     if (pathname === RULE_DRAFT_PATH) {
       await serveRuleDraftRequest(ctx, req, writeJson, records, config)
+      return
+    }
+    if (pathname === RULE_REVERT_PATH) {
+      await serveRuleRevertRequest(ctx, req, writeJson, policies, records)
       return
     }
     if (pathname === RULE_PATH) {
@@ -517,14 +530,19 @@ async function servePolicyRequest(req, url, writeJson, policies) {
   }
   if (body.op === 'add') {
     const added = policies.addRule({ scope: body.scope, list: body.list, rule: body.rule }, target)
-    // added 里带 replaced：同一条规则已存在时是更新，客户端据此提示「已更新」而不是「已加入」
-    writeJson(added.ok === true ? 200 : 400, added)
+    // added 里带 replaced：同一条规则已存在时是更新，客户端据此提示「已更新」而不是「已加入」；
+    // dropped 列出被这次写入顶掉的旧规则标签（合并掉窄规则时名单会少条目，得说清楚）
+    writeJson(added.ok === true ? 200 : 400, added.ok === true ? { ...added, dropped: droppedRuleLabels(added) } : added)
     return
   }
   if (body.op === 'update') {
     // 面板里微调一条已有规则的匹配条件/标签：按 id 原地更新（id 不变，记录里的 ruleId 仍指得回来）
     const updated = policies.updateRule({ scope: body.scope, list: body.list, id: body.id, rule: body.rule }, target)
-    writeJson(updated.ok === true ? 200 : 400, updated)
+    // 编辑是**原地**改那一条：编辑前的那版是给撤销用的，不算「被顶掉」——
+    // 只有被新条件盖住的窄规则才是这次真的从名单里少掉的条目
+    const dropped = (Array.isArray(updated.mergedRules) ? updated.mergedRules : [])
+      .map(rule => String(rule?.label ?? rule?.id ?? ''))
+    writeJson(updated.ok === true ? 200 : 400, updated.ok === true ? { ...updated, dropped } : updated)
     return
   }
   writeJson(400, { ok: false, error: 'unknown op' })
@@ -613,10 +631,13 @@ export function suggestionUsable(rule, signature) {
 function signatureFromRecord(record) {
   const signature = record?.signature
   if (signature === undefined || typeof signature.key !== 'string' || signature.key === '') return undefined
+  // 老记录（2026-09-16 之前）里的 key 是**逐字签名**：折算成当前的权限指纹，
+  // 否则从老记录一键加进名单的规则永远命不中（指纹算法改过一次：见 canonicalizeRules）
+  const key = canonicalMemoryKey(signature.key) ?? signature.key
   return {
     toolName: signature.toolName ?? record.toolName,
-    key: signature.key,
-    memoryKey: signature.memoryKey ?? signature.key,
+    key,
+    memoryKey: signature.memoryKey ?? key,
     text: signature.text ?? String(record.toolName ?? ''),
     ...(signature.command === undefined ? {} : { command: signature.command }),
     ...(Array.isArray(signature.paths) ? { paths: signature.paths } : {}),
@@ -689,6 +710,51 @@ async function serveRuleDraftRequest(ctx, req, writeJson, records, config) {
  * 没有建议（审查失败 / 无审查路由 / 命中名单）就现场起一次只读的规则优化调用；两者都拿不到
  * 时才精确回落到本次签名——宁可窄、不要宽，并在响应里如实说明走的是哪条路。
  */
+/**
+ * 这次写入顶掉了哪些旧规则（标签数组）：同名被更新掉的那条排最前，随后是被它覆盖掉的窄规则。
+ * 日志与界面都按它把「名单为什么变了」说清楚。
+ * @param added addRule / updateRule 的回执
+ * @returns {string[]} 被顶掉的规则标签
+ */
+function droppedRuleLabels(added) {
+  const labels = []
+  if (added?.previousRule !== undefined && added.previousRule !== null) {
+    labels.push(String(added.previousRule.label ?? added.previousRule.id ?? ''))
+  }
+  for (const rule of Array.isArray(added?.mergedRules) ? added.mergedRules : []) {
+    labels.push(String(rule?.label ?? rule?.id ?? ''))
+  }
+  return labels
+}
+
+/**
+ * 写进审批记录的 `ruleApplied`：展示字段之外还带**撤销凭据**——这条规则的身份（`match`，
+ * 撤销前核对它有没有被后人改过）与被它顶掉的旧规则快照（`previousRule` / `mergedRules`）。
+ * `covered === true` 时没有「这次写入」可撤销（`rule` 指的是那条已有的覆盖规则），
+ * 所以**不带凭据**——硬撤销会把别人的规则删掉。
+ * @param added addRule / updateRule 的回执
+ * @param list allow / deny
+ * @param optimizedBy 规则文本来自哪条路（model / record / manual / signature）
+ * @returns {object} 写进记录的 ruleApplied
+ */
+function buildRuleApplied(added, list, optimizedBy) {
+  const applied = {
+    scope: added.scope,
+    list,
+    ruleId: added.rule.id,
+    label: added.rule.label,
+    ...(optimizedBy === undefined ? {} : { optimizedBy }),
+  }
+  // 覆盖命中：这次没写任何东西，如实标上 covered —— 界面据此说明「未重复添加」，也不给撤销入口
+  if (added.covered === true) return { ...applied, covered: true }
+  if (added.rule.match !== undefined && added.rule.match !== null) {
+    applied.match = { kind: added.rule.match.kind, value: added.rule.match.value }
+  }
+  if (added.previousRule !== undefined && added.previousRule !== null) applied.previousRule = added.previousRule
+  if (Array.isArray(added.mergedRules) && added.mergedRules.length > 0) applied.mergedRules = added.mergedRules
+  return applied
+}
+
 async function serveRuleRequest(ctx, req, writeJson, policies, records, config) {
   if (req.method !== 'POST' && req.method !== 'PUT') {
     writeJson(405, { ok: false, error: 'method not allowed' })
@@ -733,23 +799,20 @@ async function serveRuleRequest(ctx, req, writeJson, policies, records, config) 
     writeJson(400, { ok: false, error: added.error ?? 'policy write failed' })
     return
   }
+  const dropped = droppedRuleLabels(added)
   if (typeof records.update === 'function') {
-    // optimizedBy 一起写进记录：时间线据此显示这条规则是模型给的、模型现场优化的、还是你手填的
+    // optimizedBy 一起写进记录：时间线据此显示这条规则是模型给的、模型现场优化的、还是你手填的；
+    // 同时写入撤销凭据（这条规则的身份 + 被它顶掉的旧规则快照）
     records.update(record.id, {
-      ruleApplied: {
-        scope: added.scope,
-        list: body.list,
-        ruleId: added.rule.id,
-        label: added.rule.label,
-        optimizedBy: chosen?.optimizedBy ?? 'signature',
-      },
+      ruleApplied: buildRuleApplied(added, body.list, chosen?.optimizedBy ?? 'signature'),
     })
   }
   // 查重结果如实回报：replaced=更新了同一条规则；covered=已有规则完整覆盖这次动作（没写新条目）；
-  // merged=这次写入顺带合并掉的更窄旧规则条数。日志里各留一行，方便事后核对名单为什么变/没变。
+  // merged=这次写入顺带合并掉的更窄旧规则条数；dropped=被顶掉的那些规则标签（名单为什么变一眼可见）。
   ctx.logger.info('dsh-auto-pass: 规则写入 list=' + String(body.list) + ' scope=' + String(added.scope)
     + ' replaced=' + String(added.replaced === true) + ' covered=' + String(added.covered === true)
-    + ' merged=' + String(added.merged ?? 0) + ' label=' + safeLogValue(String(added.rule.label ?? '')))
+    + ' merged=' + String(added.merged ?? 0) + ' dropped=' + safeLogValue(dropped.join(' | '))
+    + ' label=' + safeLogValue(String(added.rule.label ?? '')))
   writeJson(200, {
     ok: true,
     rule: added.rule,
@@ -761,8 +824,72 @@ async function serveRuleRequest(ctx, req, writeJson, policies, records, config) 
     covered: added.covered === true,
     // 这次写入顺带合并掉的窄规则条数（同一名单里不再有互相覆盖的两条）
     merged: added.merged ?? 0,
+    // 被这次写入顶掉的旧规则标签（同名更新的那条 + 被覆盖掉的窄规则）：界面列出来，并可撤销
+    dropped,
     // 客户端据此说明这条规则是「审查时的模型建议」「现场模型优化」还是「精确签名兜底」
     optimizedBy: chosen?.optimizedBy ?? 'signature',
+  })
+}
+
+/**
+ * 撤销一次「加入名单」（用户 2026-09-16 要求）：删掉那次写进去的规则，并把它顶掉的旧规则放回去。
+ * 凭据只认**记录里**的 `ruleApplied`（浏览器不回传规则快照，宿主不让客户端指定要恢复什么）；
+ * 撤销成功后把 `ruleReverted` 写回记录，界面据此不再显示撤销按钮。
+ */
+async function serveRuleRevertRequest(ctx, req, writeJson, policies, records) {
+  if (req.method !== 'POST' && req.method !== 'PUT') {
+    writeJson(405, { ok: false, error: 'method not allowed' })
+    return
+  }
+  if (typeof policies.revertRule !== 'function') {
+    writeJson(400, { ok: false, error: 'policy store disabled' })
+    return
+  }
+  const body = await readJsonBody(req)
+  if (body === undefined) {
+    writeJson(400, { ok: false, error: 'invalid json' })
+    return
+  }
+  const record = typeof records.get === 'function' ? records.get(body.recordId) : undefined
+  if (record === undefined || record === null) {
+    writeJson(404, { ok: false, error: 'approval record not found' })
+    return
+  }
+  const applied = record.ruleApplied
+  if (applied === undefined || applied === null || typeof applied.ruleId !== 'string' || applied.ruleId === '') {
+    writeJson(400, { ok: false, error: 'this record has no rule to revert' })
+    return
+  }
+  if (record.ruleReverted !== undefined) {
+    writeJson(400, { ok: false, error: 'this rule was already reverted' })
+    return
+  }
+  const reverted = policies.revertRule({
+    scope: applied.scope,
+    list: applied.list,
+    ruleId: applied.ruleId,
+    match: applied.match,
+    previousRule: applied.previousRule,
+    mergedRules: applied.mergedRules,
+  }, record.cwd)
+  if (reverted.ok !== true) {
+    writeJson(400, { ok: false, error: reverted.error ?? 'revert failed' })
+    return
+  }
+  if (typeof records.update === 'function') {
+    records.update(record.id, {
+      ruleReverted: { at: new Date().toISOString(), restored: reverted.restored ?? [] },
+    })
+  }
+  ctx.logger.info('dsh-auto-pass: 已撤销加入名单 list=' + String(applied.list) + ' scope=' + String(applied.scope)
+    + ' label=' + safeLogValue(String(applied.label ?? ''))
+    + ' restored=' + safeLogValue((reverted.restored ?? []).join(' | ')))
+  writeJson(200, {
+    ok: true,
+    scope: applied.scope,
+    list: applied.list,
+    file: reverted.file,
+    restored: reverted.restored ?? [],
   })
 }
 
@@ -792,15 +919,16 @@ export function ruleFromRecord(record) {
     : '模型建议规则不覆盖本次动作，已忽略'
   return {
     ...fallback,
-    note: (fallback.match.kind === 'command_prefix' ? '默认为命令前缀（' : '精确到本次动作签名（') + reason + '）',
+    note: (fallback.match.kind === 'command_prefix' ? '默认为命令前缀（' : '本次动作的权限指纹（') + reason + '）',
     cwd: record.cwd,
   }
 }
 
 /**
- * 由权限签名直接构造一条精确规则（**不经过模型**）：达阈值询问的兜底，
- * 以及「模型没给建议」时的手动升级兜底都用它。
- * @param {object|undefined} signature 权限签名（signatureOf 的产物）
+ * 由**权限指纹**直接构造一条规则（**不经过模型**）：达阈值询问的兜底，
+ * 以及「模型没给建议」时的手动升级兜底都用它。指纹已经归一化（噪声参数、输出截断、
+ * workdir 写法都不参与），所以它既是「这一次动作」也是最窄的通用形式（2026-09-16 用户要求）。
+ * @param {object|undefined} signature 权限签名（signatureOf 的产物，key 就是权限指纹）
  * @returns {object|undefined} 规则输入；拿不到签名时返回 undefined
  */
 export function exactRuleOf(signature) {
@@ -810,7 +938,7 @@ export function exactRuleOf(signature) {
     match: { kind: 'signature', value: signature.key },
     label: signature.text ?? signature.key,
     source: 'user',
-    note: '精确到这次动作的签名（没有模型建议，直接固化这一次）',
+    note: '这次动作的权限指纹（没有模型建议，直接固化这一类动作）',
   }
 }
 
@@ -827,24 +955,16 @@ export function commandPrefixOfSignature(signature) {
 }
 
 /**
- * 没有模型建议时的兜底规则（用户要求 2026-09-15：**默认用命令前缀**）。
- * 精确签名把整条命令逐字钉死（换个 `-Last 30` 就命不中），而命令前缀覆盖同一命令族；
- * 兜底前缀一定覆盖本次动作（前缀按分隔符切出来），因此总能通过 addRule 的校验。
- * 动作没有命令（write / edit 之类）时退回精确签名——那时前缀条件根本用不上。
+ * 没有模型建议时的兜底规则（用户 2026-09-16 改口径：**默认写这次动作的权限指纹**）。
+ * 指纹只在「不改变授权范围」的维度上归一（命令输出截断、噪声参数、workdir 写法），
+ * 换个参数、加了提权标记都还是各自一条，所以它比命令前缀窄、又比逐字 key 耐用；
+ * 想覆盖同一命令的其他参数时，用户可以在表单里自己切到命令前缀。
  * @param {object|undefined} signature 权限签名
  * @returns {object|undefined} 规则输入；拿不到签名时返回 undefined
  */
 export function defaultRuleOf(signature) {
   if (signature === undefined || signature === null) return undefined
-  const prefix = commandPrefixOfSignature(signature)
-  if (prefix === undefined) return exactRuleOf(signature)
-  return {
-    tool: signature.toolName,
-    match: { kind: 'command_prefix', value: prefix },
-    label: signature.toolName + ': ' + prefix,
-    source: 'user',
-    note: '默认为命令前缀（这条记录没有可用的模型建议规则）',
-  }
+  return exactRuleOf(signature)
 }
 
 /** 对 loader 或测试传入的配置做运行时边界校验。 */
@@ -1313,13 +1433,20 @@ function observeDecision(ctx, policies, { signature, cwd, settled, decision }) {
   }
 }
 
-/** 规则的可读描述（询问文案与日志共用）：标签 + 匹配条件。 */
-function describeRuleText(rule, language) {
+/**
+ * 规则的可读描述（询问文案与日志共用）：标签 + 匹配条件。
+ * 权限指纹是机器算出来的整串 key（含 NUL 与参数 JSON），人看不懂——所以这一条走**这次动作的
+ * 摘要**（signature.text，同一个动作的自然语言描述）来展示；其余条件照旧显示匹配值。
+ */
+function describeRuleText(rule, language, signature) {
   const kinds = language === 'zh'
-    ? { signature: '精确签名', command_prefix: '命令前缀', path_prefix: '路径前缀' }
-    : { signature: 'exact signature', command_prefix: 'command prefix', path_prefix: 'path prefix' }
+    ? { signature: '权限指纹', command_prefix: '命令前缀', path_prefix: '路径前缀' }
+    : { signature: 'permission fingerprint', command_prefix: 'command prefix', path_prefix: 'path prefix' }
   const kind = kinds[rule.match?.kind] ?? String(rule.match?.kind ?? '')
-  return rule.label + '（' + kind + '：' + String(rule.match?.value ?? '') + '）'
+  const readable = rule.match?.kind === 'signature' && typeof signature?.text === 'string' && signature.text !== ''
+    ? signature.text
+    : String(rule.match?.value ?? '')
+  return rule.label + '（' + kind + '：' + readable + '）'
 }
 
 /**
@@ -1350,9 +1477,12 @@ function buildRulePrompt({ signature, list, records, kind, draft }) {
       command: typeof signature.command === 'string' ? signature.command : null,
       paths: Array.isArray(signature.paths) ? signature.paths : null,
     }),
+    // 默认匹配条件：**这次动作的权限指纹**（逐字照抄上面给的 signature 即可，用户 2026-09-16 改口径）
+    '默认匹配条件：signature（逐字照抄上面给的 signature —— 那是这次动作的权限指纹；'
+      + '同一动作换个输出截断或换句说明仍是同一个）；动作没有命令时更是只能用它',
     ...(defaultPrefix === undefined
       ? []
-      : ['默认匹配条件：command_prefix = ' + defaultPrefix + '（有命令就用它，除非用户下文指定了别的）']),
+      : ['更宽的备选：command_prefix = ' + defaultPrefix + '（想覆盖同一命令的其他参数时才用）']),
     ...(kindText === undefined
       ? []
       : ['用户指定的匹配条件：' + kindText + '（match_kind 必须用 ' + kind + '，不要换成别的）']),
@@ -1453,7 +1583,7 @@ async function proposeRule(ctx, policies, records, request, options) {
     ctx.logger.warn('dsh-auto-pass: 没有可用的匹配条件，跳过规则确认 signature=' + safeLogValue(signature.text))
     return
   }
-  const ruleText = describeRuleText(rule, language)
+  const ruleText = describeRuleText(rule, language, signature)
   const scopes = typeof cwd === 'string' && cwd !== '' ? ['project', 'global'] : ['global']
   const choices = scopes.map(scope => ({
     scope,
@@ -1507,12 +1637,14 @@ async function proposeRule(ctx, policies, records, request, options) {
     ctx.logger.warn('dsh-auto-pass: 询问后写入规则失败：' + safeLogValue(String(added.error)))
     return
   }
+  // 与时间线那条路同一套凭据：达阈值确认写入的规则同样可以撤销
   updateRecord(ctx, records, recordId, {
-    ruleApplied: { scope: added.scope, list: suggestion.list, label: rule.label, ruleId: added.rule.id },
+    ruleApplied: buildRuleApplied(added, suggestion.list, undefined),
   })
   ctx.logger.info('dsh-auto-pass: 用户确认后已写入规则 list=' + suggestion.list + ' scope=' + added.scope
     + ' replaced=' + String(added.replaced === true) + ' covered=' + String(added.covered === true)
-    + ' merged=' + String(added.merged ?? 0) + ' label=' + safeLogValue(rule.label))
+    + ' merged=' + String(added.merged ?? 0) + ' dropped=' + safeLogValue(droppedRuleLabels(added).join(' | '))
+    + ' label=' + safeLogValue(rule.label))
 }
 
 /** 追问「拒绝理由」的问题 id：客户端按它取回答（自由文本优先，其次按选项 label 精确匹配）。 */
