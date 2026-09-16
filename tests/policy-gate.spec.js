@@ -351,53 +351,59 @@ describe('计数信号（decisionSignal）', () => {
   })
 })
 
-describe('权限记忆（达阈值后询问用户）', () => {
-  it('模型判 deny、你连续放行三次：按「连续放行」询问是否加入白名单', async () => {
+describe('权限记忆（白名单达阈值自动写入、黑名单询问用户）', () => {
+  it('模型判 deny、你连续放行三次：达阈值直接写进白名单，全程不问用户', async () => {
     const root = tempDir()
     const projectDir = join(root, 'project')
     const policies = policyStore(root, 3)
     const asked = []
+    const records = { add: vi.fn(() => ({ id: 'record-1' })), update: vi.fn(), list: () => [], size: () => 0 }
     const ctx = contextWith([denyRun(), denyRun(), denyRun(RULE_SUGGESTION)], {
       userQuestions: {
         ask: async request => {
           asked.push(request)
-          return { answers: [{ id: 'dsh-auto-pass:allow', selected: ['加入白名单（本项目）'] }] }
+          return { answers: [] }
         },
       },
     })
     const handler = createAutoApprovalHandler(
-      ctx, resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' }), undefined, policies)
+      ctx, resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' }), records, policies)
     /** 每次都是「模型 deny → 你在审批卡上点允许一次」。 */
     const approve = () => vi.fn().mockResolvedValue('allowed-once')
 
     expect(await handler(requestWith({ cwd: projectDir }), approve())).toBe('allowed-once')
     await flush()
-    expect(asked).toHaveLength(0)
+    expect(policies.snapshot(projectDir).project.allow).toHaveLength(0)
     expect(await handler(requestWith({ cwd: projectDir }), approve())).toBe('allowed-once')
     await flush()
-    expect(asked).toHaveLength(0)
+    expect(policies.snapshot(projectDir).project.allow).toHaveLength(0)
 
     expect(await handler(requestWith({ cwd: projectDir }), approve())).toBe('allowed-once')
     await flush()
-    // 第三次达到阈值：问的是**白名单**（你的放行被计成连续放行），黑名单一侧不该被计数
-    expect(asked).toHaveLength(1)
-    expect(asked[0].questions[0].id).toBe('dsh-auto-pass:allow')
-    expect(policies.snapshot(projectDir).project.allow).toHaveLength(1)
+    // 第三次达到阈值：你的放行被计成连续放行 → 规则直接写进**本项目白名单**，黑名单一侧不被计数
+    expect(asked).toHaveLength(0)
+    const rules = policies.snapshot(projectDir).project.allow
+    expect(rules).toHaveLength(1)
+    expect(rules[0].match).toEqual({ kind: 'command_prefix', value: 'npm test' })
     expect(policies.snapshot(projectDir).project.deny ?? []).toHaveLength(0)
+    // 记录里带上「自动写入」标记：时间线据此说明这条规则没问过用户，并且照样能一键撤销
+    const patch = records.update.mock.calls.at(-1)[1]
+    expect(patch.ruleApplied.auto).toBe(true)
+    expect(patch.ruleApplied.list).toBe('allow')
+    expect(patch.ruleApplied.ruleId).toBe(rules[0].id)
   })
 
-  it('连续放行达到阈值后询问用户，同意才写入白名单', async () => {
+  it('连续放行达到阈值后自动写入白名单：用审查那次的模型建议，不额外叫模型', async () => {
     const root = tempDir()
     const projectDir = join(root, 'project')
     const policies = policyStore(root, 2)
     const asked = []
-    // 两次审查 + 一次规则优化（队列顺序即调用顺序）：审查不放行名单，规则优化产出 command_prefix 条件
-    // 达阈值后不再另起「规则优化」调用：直接用审查那次给出的建议规则问用户
+    // 达阈值不再另起「规则优化」调用：直接用审查那次给出的建议规则自动写入
     const ctx = contextWith([allowRun(), allowRun(RULE_SUGGESTION)], {
       userQuestions: {
         ask: async request => {
           asked.push(request)
-          return { answers: [{ id: 'dsh-auto-pass:allow', selected: ['加入白名单（本项目）'] }] }
+          return { answers: [] }
         },
       },
     })
@@ -410,17 +416,11 @@ describe('权限记忆（达阈值后询问用户）', () => {
     expect(asked).toHaveLength(0)
     expect(policies.snapshot(projectDir).project.allow).toHaveLength(0)
 
-    // 第二次达到阈值：审批结论照常返回，询问在旁路进行
+    // 第二次达到阈值：审批结论照常返回，写入在旁路进行，用户全程没被问过
     expect(await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('allowed-once'))).toBe('allowed-once')
     await flush()
-    expect(asked).toHaveLength(1)
-    expect(asked[0].questions[0].options.map(option => option.label)).toEqual([
-      '加入白名单（本项目）',
-      '加入白名单（全局）',
-      '不加入（以后不再询问这类动作）',
-    ])
-    expect(asked[0].questions[0].question).toContain('npm test')
-    // 落盘的是模型优化后的条件（不是精确签名）
+    expect(asked).toHaveLength(0)
+    // 写进去的是审查那次的模型建议（不是精确签名）
     const rules = policies.snapshot(projectDir).project.allow
     expect(rules).toHaveLength(1)
     expect(rules[0].match).toEqual({ kind: 'command_prefix', value: 'npm test' })
@@ -444,7 +444,7 @@ describe('权限记忆（达阈值后询问用户）', () => {
       userQuestions: {
         ask: async request => {
           asked.push(request)
-          return { answers: [{ id: 'dsh-auto-pass:allow', selected: ['加入白名单（本项目）'] }] }
+          return { answers: [] }
         },
       },
     })
@@ -457,16 +457,39 @@ describe('权限记忆（达阈值后询问用户）', () => {
     expect(await handler(requestWith({ cwd: projectDir }), approve())).toBe('allowed-once')
     await flush()
 
-    expect(asked).toHaveLength(1)
-    // 询问文案里如实写出默认条件：这次动作的权限指纹；
-    // 给人看的**不是**那串机器指纹（含 NUL 与参数 JSON），而是这次动作的可读摘要
-    expect(asked[0].questions[0].question).toContain('权限指纹')
-    expect(asked[0].questions[0].question).toContain('权限指纹：bash: npm test')
-    expect(asked[0].questions[0].question).not.toContain('\u0000')
+    // 自动写入的兜底条件就是这次动作的权限指纹（机器算出来的整串 key），全程没问过用户
+    expect(asked).toHaveLength(0)
     const rules = policies.snapshot(projectDir).project.allow
     expect(rules).toHaveLength(1)
     expect(rules[0].match.kind).toBe('signature')
     expect(rules[0].match.value).toBe(signatureOf(requestWith({ command: 'npm test' }), exactAction(requestWith({ command: 'npm test' }))).key)
+  })
+
+  it('黑名单确认卡上写的是这次动作的可读摘要，不是含 NUL 的机器指纹', async () => {
+    const root = tempDir()
+    const projectDir = join(root, 'project')
+    const policies = policyStore(root, 3, 2)
+    const asked = []
+    // 两次拒绝、且模型不给建议：兜底条件是这次动作的权限指纹（机器串），卡上必须换成可读摘要
+    const ctx = contextWith([denyRun(), denyRun()], {
+      userQuestions: {
+        ask: async askRequest => {
+          asked.push(askRequest)
+          return { answers: [] }
+        },
+      },
+    })
+    const handler = createAutoApprovalHandler(
+      ctx, resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' }), undefined, policies)
+    await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('rejected'))
+    await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('rejected'))
+    await flush()
+
+    const suggestion = asked.find(ask => ask.questions[0].id === 'dsh-auto-pass:deny')
+    expect(suggestion).toBeDefined()
+    expect(suggestion.questions[0].question).toContain('权限指纹')
+    expect(suggestion.questions[0].question).toContain('权限指纹：bash: npm test')
+    expect(suggestion.questions[0].question).not.toContain('\u0000')
   })
 
   it('人工拒绝打断连续计数', async () => {
@@ -481,7 +504,7 @@ describe('权限记忆（达阈值后询问用户）', () => {
     expect(policies.snapshot(projectDir).project.allow).toHaveLength(0)
   })
 
-  it('插件自动放行同样计数：达到阈值一样询问，选「不加入」后不再打扰', async () => {
+  it('插件自动放行同样计数：阈值 1 时这一次就自动写入白名单', async () => {
     const root = tempDir()
     const projectDir = join(root, 'project')
     const policies = policyStore(root, 1)
@@ -501,7 +524,7 @@ describe('权限记忆（达阈值后询问用户）', () => {
       userQuestions: {
         ask: async askRequest => {
           asked.push(askRequest)
-          return { answers: [{ id: 'dsh-auto-pass:allow', selected: ['不加入（以后不再询问这类动作）'] }] }
+          return { answers: [] }
         },
       },
     })
@@ -510,18 +533,20 @@ describe('权限记忆（达阈值后询问用户）', () => {
 
     expect(await handler(request, vi.fn())).toBe('allowed-once')
     await flush()
-    expect(asked).toHaveLength(1)
-    // 选「不加入」：没有规则写进任何名单
-    expect(policies.snapshot(projectDir).project.allow ?? []).toHaveLength(0)
-    expect(policies.snapshot(projectDir).global.allow).toHaveLength(0)
+    // 插件自己放行的这一次就攒满阈值：模型给的权限指纹直接写进项目白名单，没问用户
+    expect(asked).toHaveLength(0)
+    const rules = policies.snapshot(projectDir).project.allow
+    expect(rules).toHaveLength(1)
+    expect(rules[0].match).toEqual({ kind: 'signature', value: signature.key })
 
-    // 再连续放行也不会再问：同一个动作已经被用户明确拒绝过一次
-    expect(await handler(requestWith({ cwd: projectDir }), vi.fn().mockResolvedValue('allowed-once'))).toBe('allowed-once')
-    await flush()
-    expect(asked).toHaveLength(1)
+    // 再来一次同一条动作：命中白名单，连模型都不叫了
+    const second = vi.fn()
+    expect(await handler(requestWith({ cwd: projectDir }), second)).toBe('allowed-once')
+    expect(second).not.toHaveBeenCalled()
+    expect(ctx.llmCalls).toHaveLength(1)
   })
 
-  it('只换了理由与说明的同一条命令也算连续：第三次询问', async () => {
+  it('只换了理由与说明的同一条命令也算连续：第三次自动写入白名单', async () => {
     const root = tempDir()
     const projectDir = join(root, 'project')
     const policies = policyStore(root, 3)
@@ -530,7 +555,7 @@ describe('权限记忆（达阈值后询问用户）', () => {
       userQuestions: {
         ask: async askRequest => {
           asked.push(askRequest)
-          return { answers: [{ id: 'dsh-auto-pass:allow', selected: ['不加入（以后不再询问这类动作）'] }] }
+          return { answers: [] }
         },
       },
     })
@@ -548,8 +573,10 @@ describe('权限记忆（达阈值后询问用户）', () => {
       expect(await handler(request, vi.fn().mockResolvedValue('allowed-once'))).toBe('allowed-once')
       await flush()
     }
-    expect(asked).toHaveLength(1)
-    expect(asked[0].questions[0].question).toContain('连续通过 3 次')
+    expect(asked).toHaveLength(0)
+    const rules = policies.snapshot(projectDir).project.allow
+    expect(rules).toHaveLength(1)
+    expect(rules[0].match).toEqual({ kind: 'command_prefix', value: 'npm test' })
   })
 
   it('连续被拒达到阈值后询问是否加入黑名单', async () => {
@@ -590,16 +617,30 @@ describe('权限记忆（达阈值后询问用户）', () => {
     expect(ctx.llmCalls).toHaveLength(2)
   })
 
-  it('没有 userQuestions 服务时只记日志，不写任何规则', async () => {
+  it('白名单不需要 ask 通道就能自动写入；黑名单没有 ask 通道时只记日志', async () => {
     const root = tempDir()
     const projectDir = join(root, 'project')
-    const policies = policyStore(root, 1)
-    const ctx = contextWith([allowRun()])
     const config = resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' })
-    expect(await createAutoApprovalHandler(ctx, config, undefined, policies)(requestWith({ cwd: projectDir }), vi.fn())).toBe('allowed-once')
+
+    // 白名单这条路**不经过 userQuestions**：问不到人（子 Agent / 无人应答）也照样写入，
+    // 因为连续放行已经由用户自己或插件放行了三次，不需要再确认一次
+    const allowPolicies = policyStore(root, 1)
+    const allowCtx = contextWith([allowRun()])
+    expect(await createAutoApprovalHandler(allowCtx, config, undefined, allowPolicies)(
+      requestWith({ cwd: projectDir }), vi.fn())).toBe('allowed-once')
     await flush()
-    expect(policies.snapshot(projectDir).project.allow ?? []).toHaveLength(0)
-    expect(policies.snapshot(projectDir).global.allow).toHaveLength(0)
+    expect(allowPolicies.snapshot(projectDir).project.allow).toHaveLength(1)
+
+    // 黑名单仍然要用户拍板：没有 ask 服务就只记日志、不写规则
+    const denyRoot = tempDir()
+    const denyDir = join(denyRoot, 'project')
+    const denyPolicies = policyStore(denyRoot, 3, 1)
+    const denyCtx = contextWith([denyRun()])
+    expect(await createAutoApprovalHandler(denyCtx, config, undefined, denyPolicies)(
+      requestWith({ cwd: denyDir }), vi.fn().mockResolvedValue('rejected'))).toBe('rejected')
+    await flush()
+    expect(denyPolicies.snapshot(denyDir).global.deny).toHaveLength(0)
+    expect(denyCtx.logger.warn).toHaveBeenCalledWith(expect.stringContaining('没有 userQuestions 服务'))
   })
 
   it('拿不到精确动作时不建立签名，不会被记忆升级', async () => {

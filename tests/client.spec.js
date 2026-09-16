@@ -1636,6 +1636,53 @@ describe('升级/降级的查重文案', () => {
     expect(findButton(rendered.tree, '撤销这次加入')).toBeUndefined()
   })
 
+  it('达阈值自动写入的记录：详情里说明它是自动加入的，撤销入口照旧给', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    logResponder = () => [{
+      id: 'record-auto',
+      time: '2026-09-16T18:00:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'allow',
+      outcome: 'allow',
+      decidedBy: 'auto',
+      rationale: '连续放行达阈值。',
+      signature: { toolName: 'pwsh', key: 'k', text: 'pwsh: pnpm test', command: 'pnpm test', paths: [] },
+      // 达阈值自动写入（没问过用户）：记录里带 auto 标记与撤销凭据
+      ruleApplied: {
+        scope: 'project',
+        list: 'allow',
+        ruleId: 'rule-auto',
+        label: '跑测试',
+        auto: true,
+        match: { kind: 'command_prefix', value: 'pnpm test' },
+      },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    let expanded = false
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded) return
+      const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
+      if (head === undefined) return
+      expanded = true
+      head.props.onClick()
+    })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    const dump = JSON.stringify(rendered.tree)
+    // 「没问过你」这件事必须在界面上说清楚，免得看起来像自己加的；撤销入口照旧给
+    expect(dump).toContain('连续放行达阈值，自动加入，未询问')
+    expect(findButton(rendered.tree, '撤销这次加入')).toBeDefined()
+  })
+
   it('分别提示「已更新同名规则 / 已被已有规则覆盖 / 已合并窄规则」', async () => {
     const registration = await loadClient()
     const react = fakeReact()

@@ -1557,21 +1557,44 @@ function updateRecord(ctx, records, recordId, patch) {
 }
 
 /**
- * 达到阈值后的升级建议：**先让 DSH 模型把这次动作优化成匹配条件**，再用 userQuestions
- * 把优化结果连选项一起交给用户确认，用户同意才落盘。任何失败（没有 ask 通道、调用方是
- * 子 Agent、模型优化失败、用户不答）都只导致「规则没被写入」，绝不改变任何审批结论。
+ * 把一条规则写进名单，并把「本次加入的规则」回写进审批记录。两条路共用：达阈值自动写入（白名单）
+ * 与用户确认后写入（黑名单）。写入失败只记日志，绝不改变已经确定的审批结论。
+ * @param ctx 宿主上下文
+ * @param policies 策略存储
+ * @param records 审批记录存储
+ * @param options cwd / recordId / rule / list / scope / auto（true = 达阈值自动写入，没问过用户）
+ * @returns {object|undefined} addRule 的回执（写失败时 undefined）
+ */
+function enrollRule(ctx, policies, records, { cwd, recordId, rule, list, scope, auto }) {
+  const added = policies.addRule({ scope, list, rule: { ...rule, source: rule.source ?? 'model' } }, cwd)
+  if (added.ok !== true) {
+    ctx.logger.warn('dsh-auto-pass: 写入规则失败：' + safeLogValue(String(added.error)))
+    return undefined
+  }
+  const applied = buildRuleApplied(added, list, undefined)
+  // auto 标记只给时间线看：这条规则是**没问过用户**直接写进去的，同样带撤销凭据
+  updateRecord(ctx, records, recordId, { ruleApplied: auto === true ? { ...applied, auto: true } : applied })
+  ctx.logger.info('dsh-auto-pass: ' + (auto === true ? '连续计数达阈值，自动写入规则' : '用户确认后已写入规则')
+    + ' list=' + list + ' scope=' + added.scope
+    + ' replaced=' + String(added.replaced === true) + ' covered=' + String(added.covered === true)
+    + ' merged=' + String(added.merged ?? 0) + ' dropped=' + safeLogValue(droppedRuleLabels(added).join(' | '))
+    + ' label=' + safeLogValue(rule.label))
+  return added
+}
+
+/**
+ * 达到阈值后的升级建议。**白名单自动写入、黑名单仍然弹卡问用户**（用户 2026-09-16 要求）：
+ * 同一个动作已经连续放行了整整一个阈值（插件自动放行与你点「允许一次」都算），
+ * 直接把匹配条件写进（优先本项目的）白名单，不再人工确认；而「把这类请求钉死成永远转人工」
+ * 是收紧动作，仍旧弹卡等用户拍板。
+ * 整条流程是**旁路**：在审批结论已经确定之后异步执行，既不改变结论，也不阻塞这次工具调用。
  */
 async function proposeRule(ctx, policies, records, request, options) {
   const { config, language, signature, cwd, suggestion, decision, recordId } = options
   const messages = HOST_MESSAGES[language]
-  const userQuestions = typeof ctx.get === 'function' ? ctx.get('userQuestions') : undefined
-  if (userQuestions === undefined || typeof userQuestions.ask !== 'function') {
-    ctx.logger.warn('dsh-auto-pass: 没有 userQuestions 服务，跳过规则确认 signature=' + safeLogValue(signature.text))
-    return
-  }
   // 匹配条件优先用本次审查里模型给出的建议（同一次调用产出，零额外开销），但**必须覆盖本次动作**；
-  // 建议不可用（或本来就没有）就用**命令前缀**兜底（用户要求 2026-09-15），
-  // 动作没有命令时才退回精确签名 —— 不再为「固化」单起一次模型调用。
+  // 建议不可用（或本来就没有）就用 `defaultRuleOf` 兜底——**就是这次动作的权限指纹**（用户 2026-09-16 改口径；
+  // 此前是「有命令给命令前缀」）—— 不再为「固化」单起一次模型调用。
   const suggested = decision?.suggestedRule
   const usable = suggested !== undefined && suggestionUsable(suggested, signature)
   if (suggested !== undefined && usable !== true) {
@@ -1581,6 +1604,24 @@ async function proposeRule(ctx, policies, records, request, options) {
   const rule = (usable === true ? suggested : undefined) ?? defaultRuleOf(signature)
   if (rule === undefined) {
     ctx.logger.warn('dsh-auto-pass: 没有可用的匹配条件，跳过规则确认 signature=' + safeLogValue(signature.text))
+    return
+  }
+  // 白名单：不再问用户，直接写入。有工作区就写项目名单，没有就写全局（与原来问卡时的首选一致）
+  if (suggestion.list === 'allow') {
+    enrollRule(ctx, policies, records, {
+      cwd,
+      recordId,
+      rule,
+      list: 'allow',
+      scope: typeof cwd === 'string' && cwd !== '' ? 'project' : 'global',
+      auto: true,
+    })
+    return
+  }
+  // 黑名单仍然要用户拍板：没有 ask 通道（无人应答 / 子 Agent）就只记日志，不写任何规则
+  const userQuestions = typeof ctx.get === 'function' ? ctx.get('userQuestions') : undefined
+  if (userQuestions === undefined || typeof userQuestions.ask !== 'function') {
+    ctx.logger.warn('dsh-auto-pass: 没有 userQuestions 服务，跳过规则确认 signature=' + safeLogValue(signature.text))
     return
   }
   const ruleText = describeRuleText(rule, language, signature)
@@ -1628,23 +1669,15 @@ async function proposeRule(ctx, policies, records, request, options) {
     ctx.logger.info('dsh-auto-pass: 用户未加入名单 list=' + suggestion.list + ' label=' + safeLogValue(rule.label))
     return
   }
-  const added = policies.addRule({
-    scope: chosen.scope,
-    list: suggestion.list,
-    rule: { ...rule, source: rule.source ?? 'model' },
-  }, cwd)
-  if (added.ok !== true) {
-    ctx.logger.warn('dsh-auto-pass: 询问后写入规则失败：' + safeLogValue(String(added.error)))
-    return
-  }
   // 与时间线那条路同一套凭据：达阈值确认写入的规则同样可以撤销
-  updateRecord(ctx, records, recordId, {
-    ruleApplied: buildRuleApplied(added, suggestion.list, undefined),
+  enrollRule(ctx, policies, records, {
+    cwd,
+    recordId,
+    rule,
+    list: suggestion.list,
+    scope: chosen.scope,
+    auto: false,
   })
-  ctx.logger.info('dsh-auto-pass: 用户确认后已写入规则 list=' + suggestion.list + ' scope=' + added.scope
-    + ' replaced=' + String(added.replaced === true) + ' covered=' + String(added.covered === true)
-    + ' merged=' + String(added.merged ?? 0) + ' dropped=' + safeLogValue(droppedRuleLabels(added).join(' | '))
-    + ' label=' + safeLogValue(rule.label))
 }
 
 /** 追问「拒绝理由」的问题 id：客户端按它取回答（自由文本优先，其次按选项 label 精确匹配）。 */

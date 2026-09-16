@@ -159,6 +159,7 @@ window.__ModuleLoader__.load({
         appliedFallback: '已加入（没有可用的模型建议，已回落到本次动作的权限指纹）',
         appliedReplaced: labels => '（已更新同名规则' + (labels === '' || labels === undefined ? '' : '：' + labels) + '）',
         appliedCovered: '（已有规则已覆盖这个动作，未重复添加）',
+        appliedAuto: '（连续放行达阈值，自动加入，未询问）',
         appliedMerged: (count, labels) => '（已合并 ' + String(count) + ' 条被它覆盖的窄规则'
           + (labels === '' || labels === undefined ? '' : '：' + labels) + '）',
         appliedManual: '已按你填写的条件加入',
@@ -206,13 +207,13 @@ window.__ModuleLoader__.load({
         kindCommandPrefix: '命令前缀',
         kindPathPrefix: '路径前缀',
         settingsTitle: '审批设置',
-        settingsDesc: '连续通过或连续被拒达到阈值后，插件会先让 DSH 模型把这次动作优化成一条匹配条件，再询问你是否加入白名单/黑名单——你确认了才会写入。',
+        settingsDesc: '连续放行达到阈值后，插件会把这次动作的匹配条件直接自动加入白名单，不再询问；连续被拒达到阈值后，仍会先让 DSH 模型把动作优化成一条匹配条件，再询问你是否加入黑名单。',
         thresholdLabel: '连续放行阈值',
         thresholdLabelDeny: '连续被拒阈值',
-        thresholdHintAllow: '达到后询问是否加入白名单',
+        thresholdHintAllow: '达到后自动加入白名单（不再询问）',
         thresholdHintDeny: '达到后询问是否加入黑名单',
         thresholdUnit: '次',
-        ruleAskNote: '自动审批与你本人的放行都计入「连续放行」（哪怕模型原本判了拒绝，只要你点了允许一次就算放行）；最终没被批准才计入「连续被拒」。计数只看命令本身，管道 | 后面的输出截断不参与区分。问过一次并选择「不加入」后，这个动作不会再被询问。',
+        ruleAskNote: '自动审批与你本人的放行都计入「连续放行」（哪怕模型原本判了拒绝，只要你点了允许一次就算放行）；最终没被批准才计入「连续被拒」。计数只看命令本身，管道 | 后面的输出截断不参与区分。白名单那侧达阈值直接写入、不再询问；黑名单那侧问过一次并选择「不加入」后，这个动作不会再被询问。',
         save: '保存',
         saved: '已保存',
         globalScope: '全局（所有项目）',
@@ -313,6 +314,7 @@ window.__ModuleLoader__.load({
         appliedFallback: 'Added (no usable model suggestion; fell back to this action\u2019s permission fingerprint)',
         appliedReplaced: labels => ' (updated the existing rule' + (labels === '' || labels === undefined ? '' : ': ' + labels) + ')',
         appliedCovered: ' (already covered by an existing rule; nothing added)',
+        appliedAuto: ' (auto-added after the consecutive-approval threshold, no prompt)',
         appliedMerged: (count, labels) => ' (merged ' + String(count) + ' narrower rule(s) it covers'
           + (labels === '' || labels === undefined ? '' : ': ' + labels) + ')',
         appliedManual: 'Added with the condition you wrote',
@@ -358,13 +360,13 @@ window.__ModuleLoader__.load({
         kindCommandPrefix: 'command prefix',
         kindPathPrefix: 'path prefix',
         settingsTitle: 'Approval policy',
-        settingsDesc: 'After this many consecutive approvals or denials the plugin first has the DSH model turn the action into a match condition, then asks whether to add it to the allowlist/denylist — nothing is written until you confirm.',
+        settingsDesc: 'Once the consecutive-approval threshold is reached the plugin adds the match condition to the allowlist automatically (no prompt); after the consecutive-denial threshold it still has the DSH model turn the action into a match condition and asks whether to add it to the denylist.',
         thresholdLabel: 'Consecutive approval threshold',
         thresholdLabelDeny: 'Consecutive denial threshold',
-        thresholdHintAllow: 'ask to allowlist after this many',
+        thresholdHintAllow: 'allowlisted automatically after this many (no prompt)',
         thresholdHintDeny: 'ask to denylist after this many',
         thresholdUnit: 'times',
-        ruleAskNote: 'Auto-approved calls and your own approvals (that includes clicking "allow once" over a model denial) both count as approvals; only a request that ends up unapproved counts as a denial. Counting looks at the command itself, ignoring the output plumbing after a |. After you answer "do not add" once, that action is never asked about again.',
+        ruleAskNote: 'Auto-approved calls and your own approvals (that includes clicking "allow once" over a model denial) both count as approvals; only a request that ends up unapproved counts as a denial. Counting looks at the command itself, ignoring the output plumbing after a |. The allowlist side is written automatically at the threshold; on the denylist side, after you answer "do not add" once, that action is never asked about again.',
         save: 'Save',
         saved: 'Saved',
         globalScope: 'Global (all projects)',
@@ -1676,6 +1678,8 @@ window.__ModuleLoader__.load({
         : scopeLabel(record.ruleApplied.scope) + ' / ' + (record.ruleApplied.list === 'allow' ? t.allowList : t.denyList) + ' · ' + String(record.ruleApplied.label ?? '')
           // 覆盖命中：这次其实什么都没写，明细里说清楚，别让人以为名单多了这条
           + (record.ruleApplied.covered === true ? t.appliedCovered : '')
+          // 达阈值自动写入（没问过用户）：详情里说清楚它是怎么来的，免得看起来像自己加的
+          + (record.ruleApplied.auto === true ? t.appliedAuto : '')
           + (record.ruleApplied.optimizedBy === 'manual' ? '（你手填的匹配条件）' : '')
       const promoted = record.promotedRule === undefined
         ? undefined
