@@ -16,6 +16,14 @@ Select the `自动审批` permission preset (DSH 0.1.5-rc.1, English UI):
 
 ![Auto Approve permission preset in the English UI](docs/images/auto-approve-permission.en.jpg)
 
+The "Approval policy" panel — both thresholds plus the **global** and **project** allow/deny lists (conversation tab):
+
+![Approval policy panel: both thresholds and the project/global allow and deny lists](docs/images/auto-approve-policy.zh.png)
+
+The "Approval timeline" panel — one row per decision, filterable by All / Allowlist / Denylist / Auto / Human (right sidebar):
+
+![Approval timeline panel: record list and quick filters](docs/images/auto-approve-timeline.zh.png)
+
 ## How it works
 
 ```mermaid
@@ -60,7 +68,7 @@ The "Approval timeline" has **quick filters** at the top — five chips (`All` /
 - A settings card (`settings.plugin.item`, under Settings → Plugins) switches the placement at runtime; the choice is written to the DSH settings namespace `dsh-auto-pass`, survives restarts, and overrides the `placement` config value. Note that Settings only renders cards for plugins that registered a settings namespace host-side, so the host half registers one (the client card's key must equal that namespace).
 - Each row shows time, **the turn and step it happened in**, tool name, the verdict (`auto-approved` / `handed to user` / `rejected outright` / `review incomplete`), a review-opinion excerpt, and the matched allowlist/denylist rule when one matched, plus how you answered for a hand-off; expanding it shows risk level, user authorization, turn/step, rationale, approval reason, the rejection reason you gave, action arguments (truncated to 500 characters), latency, and token usage. Under "All sessions" each row also names its session.
 - Records persist as JSON, survive restarts, and are **split per workspace**: `$DSH_HOME/dsh-auto-pass/records/<workspace>.json` (default `~/.dsh/dsh-auto-pass/records/`; records without a cwd go to `unknown.json`), newest 1000 kept per workspace and written atomically, while the panels read all workspaces merged into one timeline. Upgrading splits the old single `$DSH_HOME/dsh-auto-pass/approvals.json` per workspace (the original is deleted only after every write succeeded; duplicate ids are collapsed). Setting `logFile` explicitly falls back to single-file mode; `maxRecords` caps each workspace. The log stores local approval data only and is served on localhost.
-- Policy lives in two files: global `$DSH_HOME/dsh-auto-pass/policy.json` (thresholds, global lists, consecutive counters) and project `<session cwd>/.dsh-auto-pass/policy.json` (project lists). Counters always live in the global file and are keyed by `cwd`, so a project directory gains a `.dsh-auto-pass/` directory only once you actually write a project rule for it (that directory is in this repository's `.gitignore`; consider ignoring it in yours too). A failed write only warns: a project rule that cannot be written degrades to a global rule, and policy I/O never changes an approval outcome.
+- Policy and counters live in three kinds of files: the global policy `$DSH_HOME/dsh-auto-pass/policy.json` (thresholds + global lists), the project policy `<session cwd>/.dsh-auto-pass/policy.json` (project lists), and the **per-workspace** counters `$DSH_HOME/dsh-auto-pass/counters/<workspace>.json` (same slug scheme as the approval records; records without a cwd go to `unknown.json`). A project directory therefore gains a `.dsh-auto-pass/` directory only once you actually write a project rule for it (that directory is in this repository's `.gitignore`; consider ignoring it in yours too). Each counter file is **capped at 500 entries** (a counter key embeds the arguments JSON, so it would otherwise grow forever): past the cap the least recently used active entries go first and `dismissed` entries last, while entries with both sides at zero that were never dismissed are dropped at startup; an approval rewrites only its own workspace file, never the global policy file. A failed write only warns: a project rule that cannot be written degrades to a global rule, and policy I/O never changes an approval outcome.
 
 ## Install
 
@@ -110,7 +118,7 @@ Below are the keys from the bundled `cordis.patch.yml` that belong in a config f
 - `maxOutputTokens` — the token cap on the review reply (2048 by default).
 - `logFile` — the approval-record file; **empty** means one file per workspace (`$DSH_HOME/dsh-auto-pass/records/<workspace>.json`), while an explicit path falls back to single-file mode (every workspace in one file, useful for debugging).
 - `maxRecords` — how many records are kept **per workspace**, 1000 by default.
-- `policyFile` — the global policy file (thresholds, global lists, consecutive counters); empty means `$DSH_HOME/dsh-auto-pass/policy.json`.
+- `policyFile` — the global policy file (**thresholds and global lists only**); empty means `$DSH_HOME/dsh-auto-pass/policy.json`. Consecutive counters live elsewhere, **one file per workspace** (`$DSH_HOME/dsh-auto-pass/counters/<workspace>.json`, same slug scheme as the approval records; no cwd means `unknown.json`). Each counter file holds **at most 500** entries: past the cap the least recently used active entries are evicted first and `dismissed` entries last, while entries with both sides at zero that were never dismissed are dropped at startup. Upgrading splits the `cwd`-prefixed counters of an older global file into those files, removing them from the global file only after every write succeeded.
 
 Numeric keys must be **positive integers** and `logFile` / `policyFile` must be strings — a wrong type fails plugin load outright, and setting only one of `reviewerProvider` / `reviewerModel` does too.
 

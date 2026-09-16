@@ -16,6 +16,14 @@
 
 ![中文界面的 自动审批 权限档位](docs/images/auto-approve-permission.zh.png)
 
+「审批设置」面板——连续放行 / 连续被拒两个阈值，以及**全局**与**项目**两级的白名单、黑名单（对话区标签页）：
+
+![审批设置面板：两侧阈值与项目/全局两级的白名单、黑名单](docs/images/auto-approve-policy.zh.png)
+
+「审批时间线」面板——每次审批一条记录，顶部可按 全部 / 白名单 / 黑名单 / 自动 / 人工 筛选（右侧栏）：
+
+![审批时间线面板：记录列表与快捷筛选](docs/images/auto-approve-timeline.zh.png)
+
 ## 工作方式
 
 ```mermaid
@@ -60,7 +68,7 @@ flowchart TD
 - 设置页卡片（`settings.plugin.item`，位于 设置 → 插件）可即时切换位置，选择写进 DSH 设置命名空间 `dsh-auto-pass`、跨重启保留，并优先于 `placement` 配置值。**注意**：设置页只为宿主侧注册过设置命名空间的插件渲染卡片，所以插件的 host 半会注册这个命名空间（客户端卡片的 key 必须与它同名）。
 - 每行显示时间、**第几轮第几步**、工具名、结论（`自动批准` / `转人工` / `直接拒绝` / `审查未完成`）、审批意见摘要，以及命中名单时的白/黑名单标记；转人工的还会显示你最终的选择；展开可见风险等级、用户授权、轮次/步数、理由、审批原因、你写的人工拒绝理由、动作参数（裁剪到 500 字符）、耗时与 token 用量。选「全部会话」时，每行底部还会用小字标出所属会话。
 - 记录以 JSON 落盘、跨重启保留，并且**按工作区分文件**：`$DSH_HOME/dsh-auto-pass/records/<工作区>.json`（默认 `~/.dsh/dsh-auto-pass/records/`，没有 cwd 的记录进 `unknown.json`），每个工作区各自保留最新 1000 条，先写临时文件再改名；面板把各工作区合并成一条时间线读。升级到本版本时会自动把旧的单文件 `$DSH_HOME/dsh-auto-pass/approvals.json` 按工作区拆开（全部写成功才删原文件，重复 id 只留一条）。`logFile` 显式指定路径可退回单文件模式，`maxRecords` 改每个工作区的上限。记录只存本地审批数据，并且只在 localhost 上提供。
-- 策略分两个文件：全局 `$DSH_HOME/dsh-auto-pass/policy.json`（两侧阈值、全局名单、连续计数），项目 `<会话 cwd>/.dsh-auto-pass/policy.json`（项目名单）。计数统一记在全局文件里并用 `cwd` 前缀区分项目，所以项目目录只在你真的给它写了项目规则之后才会多出一个 `.dsh-auto-pass/` 目录（该目录已列进本仓库的 `.gitignore`，建议你也忽略它）。写盘失败只告警：项目规则写不进去会自动降级写全局，绝不因为策略落盘失败而改变审批结论。
+- 策略与计数分三类文件：全局策略 `$DSH_HOME/dsh-auto-pass/policy.json`（两侧阈值 + 全局名单）、项目策略 `<会话 cwd>/.dsh-auto-pass/policy.json`（项目名单），以及**按工作区分文件**的连续计数 `$DSH_HOME/dsh-auto-pass/counters/<工作区>.json`（与审批记录同一套 slug，没有 cwd 的进 `unknown.json`）。所以项目目录只在你真的给它写了项目规则之后才会多出一个 `.dsh-auto-pass/` 目录（该目录已列进本仓库的 `.gitignore`，建议你也忽略它）。每个计数文件**最多 500 条**（计数键里含参数 JSON，不设上限会一直膨胀）：超限时先淘汰最久未用的活动条目、`dismissed` 条目最后才动，两侧都归零且未被「不加入」标记的死条目在启动时直接清理；**每次审批只重写本工作区那个计数文件**，不再动全局策略文件。写盘失败只告警：项目规则写不进去会自动降级写全局，绝不因为策略落盘失败而改变审批结论。
 
 ## 安装
 
@@ -110,7 +118,7 @@ dsh plugin --profile web add link:/path/to/dsh-auto-pass
 - `maxOutputTokens` —— 单次审查回复的 token 上限（默认 2048）。
 - `logFile` —— 审批记录文件；**留空**＝按工作区分文件（`$DSH_HOME/dsh-auto-pass/records/<工作区>.json`），显式给路径＝退回单文件模式（所有工作区写同一个文件，调试用）。
 - `maxRecords` —— **每个工作区**各保留多少条审批记录，默认 1000。
-- `policyFile` —— 全局策略文件路径（两侧阈值、全局名单、连续计数）；留空＝`$DSH_HOME/dsh-auto-pass/policy.json`。
+- `policyFile` —— 全局策略文件路径（**只放**两侧阈值与全局名单）；留空＝`$DSH_HOME/dsh-auto-pass/policy.json`。连续计数另存、**按工作区分文件**（不受这个键影响）：`$DSH_HOME/dsh-auto-pass/counters/<工作区>.json`，文件名与审批记录同一套 slug，没有 cwd 的进 `unknown.json`。每个计数文件**最多 500 条**：超出时先淘汰最久未用的活动条目、`dismissed`（「不加入」）条目最后才动，两侧都是 0 且未被 `dismissed` 的死条目在启动时清掉。升级时会把老全局文件里带 `cwd` 前缀的计数拆进这些文件，全部写成功才从全局文件里删掉。
 
 数值类键必须是**正整数**、`logFile` / `policyFile` 必须是字符串，写错会在插件加载时直接报错；只写 `reviewerProvider` 或只写 `reviewerModel` 同样直接报错。
 

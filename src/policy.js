@@ -13,11 +13,14 @@
  * @modify 2026-09-15 计数键继续归一化：结尾的纯输出重定向（2>&1 等）一并抹掉、workdir/cwd 不进计数键（精确签名里按路径归一化保留）；新增 canonicalMemoryKey + canonicalizeCounters 把历史死键折算到当前口径
  * @modify 2026-09-15 新增 updateRule：按 id 原地改一条已有规则（id/位置不变、source 记 user、与 addRule 同口径合并重复或更窄的规则）
  * @modify 2026-09-15 路径前缀支持单层通配：matchRule 认最后一段里的 *（不跨目录），validatePathPattern 明确拒绝 ** / ? / [] / 中段 * / 无目录的通配
+ * @modify 2026-09-16 连续计数不再无限膨胀：条目记 at（最后更新时刻），启动时清掉「双侧 0 且未 dismissed」的死条目，新增 pruneCounters 压到 DEFAULT_MAX_COUNTERS（500）以内（先淘汰最久未用的活动条目，dismissed 最后才动）
+ * @modify 2026-09-16 计数按工作区拆成 counters/<slug>.json（用户要求）：pruneCounters 改成单工作区口径、新增 canonicalizeMemoryCounters / defaultCounterDir / COUNTER_FILE_VERSION；启动时把老全局文件里的 `<cwd>\u0000<memoryKey>` 计数迁移过去并折算瘦身
  */
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { workspaceSlug } from './records.js'
 
 /** 策略文件格式版本，便于以后迁移。 */
 export const POLICY_FILE_VERSION = 1
@@ -27,6 +30,12 @@ export const DEFAULT_AUTO_APPROVE_AFTER = 3
 
 /** 连续被拒多少次后，询问是否加入黑名单（默认值，策略文件里可覆盖）。 */
 export const DEFAULT_AUTO_DENY_AFTER = 3
+
+/**
+ * 每个工作区最多保留多少条连续计数，也就是一个计数文件的条数上限。计数键含参数 JSON
+ * （实测平均 132 字符），不设上限文件会一直长下去；500 条约 100 KB。
+ */
+export const DEFAULT_MAX_COUNTERS = 500
 
 /** 前缀类条件的最短长度：太短的前缀等于全放行，必须挡住。 */
 export const MIN_PREFIX_CHARS = 3
@@ -525,7 +534,10 @@ export function canonicalMemoryKey(memoryKey) {
   return parts[0] + '\u0000' + canonicalBase + '\u0000x:' + stableJson(withoutNoise(withoutDirArgs(normalizeExtraArgs(extra))))
 }
 
-/** 把一个计数条目归一化成 { allow, deny, dismissed? }（兼容早期只有 count 的形态）。 */
+/**
+ * 把一个计数条目归一化成 { allow, deny, dismissed?, at? }（兼容早期只有 count 的形态）。
+ * `at` 是最后一次更新时刻，只服务于「超过上限时淘汰最久未用」；老条目没有它就按最旧处理。
+ */
 function counterValue(raw) {
   const entry = { allow: 0, deny: 0 }
   if (raw === null || typeof raw !== 'object') return entry
@@ -533,6 +545,7 @@ function counterValue(raw) {
   if (Number.isSafeInteger(raw.allow) && raw.allow > 0) entry.allow = raw.allow
   if (Number.isSafeInteger(raw.deny) && raw.deny > 0) entry.deny = raw.deny
   if (raw.dismissed !== null && typeof raw.dismissed === 'object') entry.dismissed = { ...raw.dismissed }
+  if (Number.isSafeInteger(raw.at) && raw.at > 0) entry.at = raw.at
   return entry
 }
 
@@ -543,6 +556,8 @@ function mergeCounterEntries(left, right) {
   if (left.dismissed !== undefined || right.dismissed !== undefined) {
     merged.dismissed = { ...(left.dismissed ?? {}), ...(right.dismissed ?? {}) }
   }
+  const at = Math.max(left.at ?? 0, right.at ?? 0)
+  if (at > 0) merged.at = at
   return merged
 }
 
@@ -565,6 +580,85 @@ export function canonicalizeCounters(counters) {
   return { counters: next, moved }
 }
 
+/**
+ * 折算一个**工作区计数文件**里的键（键就是裸 memoryKey）：历史形状（管道之后、未归一化
+ * workdir、结尾 `2>&1`）合并到当前口径，同一目标取较大值（不求和，免得凭空攒出连续次数）。
+ * @param counters 计数表
+ * @returns {{counters: object, moved: number}} 折算后的计数表与被折算掉的键数
+ */
+export function canonicalizeMemoryCounters(counters) {
+  const next = {}
+  let moved = 0
+  for (const [key, value] of Object.entries(counters ?? {})) {
+    const canonical = canonicalMemoryKey(key)
+    const target = canonical === undefined ? key : canonical
+    if (target !== key) moved += 1
+    next[target] = mergeCounterEntries(next[target], counterValue(value))
+  }
+  return { counters: next, moved }
+}
+
+/** 淘汰优先级：先淘汰活动条目（0），dismissed 条目（1）留到最后。 */
+function evictionRank(entry) {
+  return entry.dismissed === undefined ? 0 : 1
+}
+
+/**
+ * 一个工作区的计数表瘦身（一个工作区就是一个计数文件，所以这里不再按前缀分组）：
+ * 删掉「两侧都是 0、也没被 dismissed」的死条目，并把条数压到上限以内。淘汰顺序是
+ * 「最久未用的活动条目 → 最后才是 dismissed 条目」：dismissed 是用户「别再问我」的
+ * 明确意图，比一两次连续计数更值得留下。
+ * @param counters 计数表（键是裸 memoryKey）
+ * @param options.max 条数上限，默认 DEFAULT_MAX_COUNTERS
+ * @param options.protect 必须保留的键集合（正在更新的那一条）
+ * @returns {{counters: object, removed: number}} 瘦身后的计数表与被删掉的条数
+ */
+export function pruneCounters(counters, options = {}) {
+  const max = Number.isSafeInteger(options.max) && options.max >= 1 ? options.max : DEFAULT_MAX_COUNTERS
+  const protect = options.protect instanceof Set ? options.protect : undefined
+  const next = {}
+  const keep = []
+  let removed = 0
+  for (const [key, raw] of Object.entries(counters ?? {})) {
+    const entry = counterValue(raw)
+    if (entry.allow === 0 && entry.deny === 0 && entry.dismissed === undefined) {
+      removed += 1
+      continue
+    }
+    keep.push({ key, entry })
+  }
+  const dropped = new Set()
+  if (keep.length > max) {
+    const candidates = keep.filter(item => protect?.has(item.key) !== true)
+    candidates.sort((left, right) => evictionRank(left.entry) - evictionRank(right.entry)
+      || (left.entry.at ?? 0) - (right.entry.at ?? 0))
+    for (const item of candidates.slice(0, keep.length - max)) dropped.add(item.key)
+  }
+  for (const item of keep) {
+    if (dropped.has(item.key)) {
+      removed += 1
+      continue
+    }
+    next[item.key] = item.entry
+  }
+  return { counters: next, removed }
+}
+
+/** 计数文件格式版本，便于以后迁移。 */
+export const COUNTER_FILE_VERSION = 1
+
+/**
+ * 连续计数的默认目录：`$DSH_HOME/dsh-auto-pass/counters`，**一个工作区一个文件**
+ * （文件名用与审批记录同一套的 {@link workspaceSlug}，没有 cwd 的进 `unknown.json`）。
+ * 计数不再写进全局策略文件：那里只留阈值与全局名单，整份重写的代价也不再落在计数上。
+ */
+export function defaultCounterDir(env = process.env) {
+  const home = typeof env?.DSH_HOME === 'string' && env.DSH_HOME.trim() !== ''
+    ? env.DSH_HOME.trim()
+    : join(homedir(), '.dsh')
+  return join(home, 'dsh-auto-pass', 'counters')
+}
+
 /** 全局策略文件默认路径：`$DSH_HOME/dsh-auto-pass/policy.json`。 */
 export function defaultPolicyFile(env = process.env) {
   const home = typeof env?.DSH_HOME === 'string' && env.DSH_HOME.trim() !== ''
@@ -580,7 +674,7 @@ export function projectPolicyFile(cwd) {
     : undefined
 }
 
-/** 空策略文档。counters 的键是 `<cwd>\u0000<signatureKey>`，计数始终落在全局文件里。 */
+/** 空策略文档。`counters` 只在读老文件时出现（历史形态的计数全塞在全局文件里），迁走之后就不再写它。 */
 function emptyDoc() {
   return { version: POLICY_FILE_VERSION, rules: { allow: [], deny: [] }, counters: {}, thresholds: {} }
 }
@@ -589,6 +683,7 @@ function emptyDoc() {
 export const noopPolicyStore = Object.freeze({
   enabled: false,
   globalFile: undefined,
+  counterDir: undefined,
   threshold: list => (list === 'deny' ? DEFAULT_AUTO_DENY_AFTER : DEFAULT_AUTO_APPROVE_AFTER),
   match: () => undefined,
   observe: () => Object.freeze({ approvals: 0, denials: 0, suggestion: null }),
@@ -605,12 +700,14 @@ export const noopPolicyStore = Object.freeze({
 
 /**
  * 创建策略仓库。
- * @param options.globalFile 全局策略文件路径，默认 defaultPolicyFile()。
+ * @param options.globalFile 全局策略文件路径，默认 defaultPolicyFile()（只放阈值与全局名单）。
+ * @param options.counterDir 连续计数的目录，一个工作区一个文件，默认 defaultCounterDir()。
  * @param options.autoApproveAfter 阈值缺省值（全局文件里没写阈值时用它）。
  * @param options.warn 告警回调（读写失败时调用）。
  */
 export function createPolicyStore(options = {}) {
   const globalFile = options.globalFile ?? defaultPolicyFile()
+  const counterDir = options.counterDir ?? defaultCounterDir()
   const fallbackThresholds = {
     allow: Number.isSafeInteger(options.autoApproveAfter) && options.autoApproveAfter >= 1
       ? options.autoApproveAfter
@@ -622,15 +719,41 @@ export function createPolicyStore(options = {}) {
   const warn = typeof options.warn === 'function' ? options.warn : () => {}
   const info = typeof options.info === 'function' ? options.info : () => {}
   const docs = new Map([[globalFile, read(globalFile)]])
-  // 启动时折算一次历史计数键：老的形状（管道之后、未归一化的 workdir、结尾的 2>&1）
-  // 在当前算法下再也产不出来，留着只会让计数看着不准——折算到当前口径后原键即消失。
+  /** 计数文件缓存：file -> { version, counters }。 */
+  const counterDocs = new Map()
+  // 老形态：所有工作区的计数都塞在全局策略文件的 counters 里（键带 `<cwd>\u0000` 前缀）。
+  // 现在按工作区拆分：先折算并迁到 counters/<slug>.json，全部写成功才从全局文件里删掉。
   {
     const doc = docs.get(globalFile)
     const canonical = canonicalizeCounters(doc.counters)
-    if (canonical.moved > 0) {
-      doc.counters = canonical.counters
-      write(globalFile, doc)
-      info('dsh-auto-pass: 已折算 ' + String(canonical.moved) + ' 个历史计数键 ' + globalFile)
+    if (canonical.moved > 0) info('dsh-auto-pass: 已折算 ' + String(canonical.moved) + ' 个历史计数键')
+    const legacyKeys = Object.keys(canonical.counters).length
+    if (legacyKeys > 0) {
+      const migrated = migrateLegacyCounters(canonical.counters)
+      if (migrated !== undefined) {
+        delete doc.counters
+        write(globalFile, doc)
+        info('dsh-auto-pass: 已把 ' + String(migrated.keys) + ' 个计数键按工作区拆进 ' + String(migrated.files) + ' 个计数文件'
+          + (migrated.removed > 0 ? '（清掉 ' + String(migrated.removed) + ' 个零值/超限条目）' : '')
+          + ' ' + counterDir)
+      }
+    }
+  }
+  // 已有的计数文件也折算 + 瘦身一次：历史键、零值死条目、超过上限的尾巴。
+  {
+    let touched = 0
+    for (const file of listCounterFiles()) {
+      const doc = readCounters(file)
+      const canonical = canonicalizeMemoryCounters(doc.counters)
+      const pruned = pruneCounters(canonical.counters)
+      if (canonical.moved > 0 || pruned.removed > 0) {
+        doc.counters = pruned.counters
+        if (writeCounters(file, doc) === true) touched += 1
+      }
+    }
+    if (touched > 0) {
+      info('dsh-auto-pass: 已整理 ' + String(touched) + ' 个计数文件（历史键 / 零值 / 上限 '
+        + String(DEFAULT_MAX_COUNTERS) + '）' + counterDir)
     }
   }
 
@@ -680,6 +803,99 @@ export function createPolicyStore(options = {}) {
     }
   }
 
+  /** 读一个计数文件：缺失按空表处理；解析失败告警并重置，绝不让坏文件拦住审批。 */
+  function readCounters(file) {
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'))
+      const doc = { version: COUNTER_FILE_VERSION, counters: {} }
+      if (parsed !== null && typeof parsed === 'object' && parsed.counters !== null && typeof parsed.counters === 'object') {
+        doc.counters = { ...parsed.counters }
+      }
+      return doc
+    } catch (error) {
+      if (error?.code !== 'ENOENT') warn('dsh-auto-pass: 计数文件读取失败 ' + file + '：' + errorMessage(error))
+      return { version: COUNTER_FILE_VERSION, counters: {} }
+    }
+  }
+
+  /** 写一个计数文件：临时文件 + rename，避免半截 JSON；失败只告警并返回 false。 */
+  function writeCounters(file, doc) {
+    try {
+      mkdirSync(dirname(file), { recursive: true })
+      const temporary = file + '.tmp'
+      writeFileSync(temporary, JSON.stringify({ version: COUNTER_FILE_VERSION, counters: doc.counters }, null, 2) + '\n', 'utf8')
+      renameSync(temporary, file)
+      return true
+    } catch (error) {
+      warn('dsh-auto-pass: 计数文件写入失败 ' + file + '：' + errorMessage(error))
+      return false
+    }
+  }
+
+  /** 计数目录里已有的计数文件（目录不存在时为空数组）。 */
+  function listCounterFiles() {
+    try {
+      return readdirSync(counterDir).filter(name => name.endsWith('.json')).map(name => join(counterDir, name))
+    } catch {
+      return []
+    }
+  }
+
+  /** 取某个工作区的计数文件（懒加载并缓存）；没有 cwd 的进 unknown.json。 */
+  function counterDocFor(cwd) {
+    const file = join(counterDir, workspaceSlug(cwd) + '.json')
+    let doc = counterDocs.get(file)
+    if (doc === undefined) {
+      doc = readCounters(file)
+      counterDocs.set(file, doc)
+    }
+    return { file, doc }
+  }
+
+  /**
+   * 把老全局文件里的计数按键的 `<cwd>` 前缀拆进各工作区的计数文件。
+   * 任何一个文件写失败就整体放弃（返回 undefined）：老数据继续留在全局文件里，下次启动再试。
+   * @returns {{files: number, keys: number, removed: number}|undefined} 写成功的文件数 / 迁移的键数 / 顺手清掉的条数
+   */
+  function migrateLegacyCounters(counters) {
+    const byWorkspace = new Map()
+    for (const [key, value] of Object.entries(counters)) {
+      const cut = key.indexOf('\u0000')
+      const workspace = cut === -1 ? '' : key.slice(0, cut)
+      const memoryKey = cut === -1 ? key : key.slice(cut + 1)
+      let entries = byWorkspace.get(workspace)
+      if (entries === undefined) {
+        entries = {}
+        byWorkspace.set(workspace, entries)
+      }
+      entries[memoryKey] = value
+    }
+    let files = 0
+    let keys = 0
+    let removed = 0
+    for (const [workspace, entries] of byWorkspace) {
+      const target = counterDocFor(workspace === '' ? undefined : workspace)
+      for (const [memoryKey, value] of Object.entries(entries)) {
+        keys += 1
+        // 该工作区可能已经有自己的计数文件：合并取较大值（与折算历史同口径，不凭空攒连续次数）
+        target.doc.counters[memoryKey] = mergeCounterEntries(counterValue(target.doc.counters[memoryKey]), counterValue(value))
+      }
+      const pruned = pruneCounters(target.doc.counters)
+      if (pruned.removed > 0) target.doc.counters = pruned.counters
+      removed += pruned.removed
+      if (writeCounters(target.file, target.doc) !== true) return undefined
+      files += 1
+    }
+    return { files, keys, removed }
+  }
+
+  /** 给一个工作区的计数表瘦身；返回被删掉的条数（0 表示没有变化）。 */
+  function pruneCounterDoc(doc, protect) {
+    const pruned = pruneCounters(doc.counters, protect === undefined ? {} : { protect })
+    if (pruned.removed > 0) doc.counters = pruned.counters
+    return pruned.removed
+  }
+
   /** 取某个策略文件对应的文档（懒加载并缓存）。 */
   function docFor(file) {
     if (file === undefined) return undefined
@@ -711,14 +927,7 @@ export function createPolicyStore(options = {}) {
 
   /** 取计数条目；兼容早期 { count } 形态（当时只统计白名单一侧）。 */
   function counterEntry(doc, key) {
-    const raw = doc.counters[key]
-    const entry = { allow: 0, deny: 0 }
-    if (raw === null || typeof raw !== 'object') return entry
-    if (Number.isSafeInteger(raw.count) && raw.count > 0) entry.allow = raw.count
-    if (Number.isSafeInteger(raw.allow) && raw.allow > 0) entry.allow = raw.allow
-    if (Number.isSafeInteger(raw.deny) && raw.deny > 0) entry.deny = raw.deny
-    if (raw.dismissed !== null && typeof raw.dismissed === 'object') entry.dismissed = { ...raw.dismissed }
-    return entry
+    return counterValue(doc.counters[key])
   }
 
   /**
@@ -869,6 +1078,7 @@ export function createPolicyStore(options = {}) {
   return {
     enabled: true,
     globalFile,
+    counterDir,
     threshold: currentThreshold,
     /** 阈值写入全局文件（阈值是跨项目的用户偏好）。list 省略时写白名单阈值。 */
     setThreshold(value, list = 'allow') {
@@ -922,11 +1132,13 @@ export function createPolicyStore(options = {}) {
      */
     observe({ signature, cwd, signal }) {
       const steady = { approvals: 0, denials: 0, suggestion: null }
-      if (signature === undefined || memoryKeyOf(signature) === undefined) return steady
+      const memoryKey = signature === undefined ? undefined : memoryKeyOf(signature)
+      if (memoryKey === undefined) return steady
       if (signal !== 'pass' && signal !== 'reject') return steady
-      const doc = docs.get(globalFile)
-      const counterKey = (cwd ?? '') + '\u0000' + String(memoryKeyOf(signature))
-      const entry = counterEntry(doc, counterKey)
+      // 计数落在**本工作区**的计数文件里：不再整份重写全局策略文件。
+      const target = counterDocFor(cwd)
+      const counterKey = String(memoryKey)
+      const entry = counterEntry(target.doc, counterKey)
       const list = signal === 'pass' ? 'allow' : 'deny'
       if (entry.dismissed?.[list] === true) {
         return { approvals: entry.allow, denials: entry.deny, suggestion: null }
@@ -937,8 +1149,12 @@ export function createPolicyStore(options = {}) {
       const triggered = entry[list] >= threshold
       // 触发后清零：无论用户是否同意，都不该由同一次累积重复触发
       if (triggered) entry[list] = 0
-      doc.counters[counterKey] = entry
-      write(globalFile, doc)
+      // at 只服务于「超过上限时淘汰最久未用」；顺手给这个工作区的计数表瘦身。
+      entry.at = Date.now()
+      target.doc.counters[counterKey] = entry
+      const dropped = pruneCounterDoc(target.doc, new Set([counterKey]))
+      if (dropped > 0) info('dsh-auto-pass: 已清理 ' + String(dropped) + ' 个计数条目 ' + target.file)
+      writeCounters(target.file, target.doc)
       return {
         approvals: entry.allow,
         denials: entry.deny,
@@ -947,15 +1163,19 @@ export function createPolicyStore(options = {}) {
     },
     /** 用户在询问里选了「不加入」：该签名该名单不再计数、不再询问。 */
     dismiss({ signature, cwd, list }) {
-      if (signature === undefined || memoryKeyOf(signature) === undefined) return false
+      const memoryKey = signature === undefined ? undefined : memoryKeyOf(signature)
+      if (memoryKey === undefined) return false
       if (!POLICY_LISTS.includes(list)) return false
-      const doc = docs.get(globalFile)
-      const counterKey = (cwd ?? '') + '\u0000' + String(memoryKeyOf(signature))
-      const entry = counterEntry(doc, counterKey)
+      const target = counterDocFor(cwd)
+      const counterKey = String(memoryKey)
+      const entry = counterEntry(target.doc, counterKey)
       entry[list] = 0
       entry.dismissed = { ...(entry.dismissed ?? {}), [list]: true }
-      doc.counters[counterKey] = entry
-      return write(globalFile, doc)
+      entry.at = Date.now()
+      target.doc.counters[counterKey] = entry
+      const dropped = pruneCounterDoc(target.doc, new Set([counterKey]))
+      if (dropped > 0) info('dsh-auto-pass: 已清理 ' + String(dropped) + ' 个计数条目 ' + target.file)
+      return writeCounters(target.file, target.doc)
     },
   }
 }

@@ -4,18 +4,22 @@
  * @author simon300000
  * @date 2026-09-15
  */
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { workspaceSlug } from '../src/records.js'
 import {
   canonicalizeCounters,
+  canonicalizeMemoryCounters,
   canonicalMemoryKey,
   createPolicyStore,
+  DEFAULT_MAX_COUNTERS,
   matchRule,
   MIN_PREFIX_CHARS,
   normalizePath,
   projectPolicyFile,
+  pruneCounters,
   ruleCovers,
   signatureOf,
   validateRuleInput,
@@ -162,23 +166,99 @@ describe('计数键折算（canonicalMemoryKey / canonicalizeCounters）', () =>
     expect(migrated.counters[keys[0]]).toEqual({ allow: 2, deny: 3 })
   })
 
-  it('启动时折算并写回策略文件', () => {
+  it('计数文件里的裸 memoryKey 也能折算（同目标取较大值）', () => {
+    const current = pwshSignature('pnpm test 2>&1')
+    const migrated = canonicalizeMemoryCounters({
+      'pwsh\u0000cmd:pnpm test 2>&1 | Select-Object -Last 30\u0000x:{"workdir":"D:/w"}': { allow: 1, deny: 0 },
+      [current.memoryKey]: { allow: 2, deny: 0 },
+    })
+    expect(migrated.moved).toBe(1)
+    expect(Object.keys(migrated.counters)).toEqual([current.memoryKey])
+    expect(migrated.counters[current.memoryKey]).toEqual({ allow: 2, deny: 0 })
+  })
+
+  it('启动时把老全局文件里的计数拆到各工作区的计数文件，并从全局文件里删掉', () => {
     const root = newRoot()
-    const file = join(root, 'policy.json')
+    const file = join(root, 'home', 'policy.json')
+    const counterDir = join(root, 'home', 'counters')
     const current = pwshSignature('pnpm test 2>&1')
     const legacy = 'D:/w\u0000pwsh\u0000cmd:pnpm test 2>&1 | Select-Object -Last 30\u0000x:{"workdir":"D:/w"}'
     const canonical = 'D:/w\u0000' + current.memoryKey
+    mkdirSync(dirname(file), { recursive: true })
     writeFileSync(file, JSON.stringify({
       version: 1,
       rules: { allow: [], deny: [] },
-      counters: { [legacy]: { allow: 1, deny: 0 }, [canonical]: { allow: 2, deny: 0 } },
+      counters: {
+        [legacy]: { allow: 1, deny: 0 },
+        [canonical]: { allow: 2, deny: 0 },
+        ['D:/other\u0000' + current.memoryKey]: { allow: 1, deny: 0 },
+      },
     }), 'utf8')
     const info = vi.fn()
-    createPolicyStore({ globalFile: file, warn: () => {}, info })
+    createPolicyStore({ globalFile: file, counterDir, warn: () => {}, info })
+    // 折算（1 个历史键）与拆分（2 个工作区）各记一行
     expect(info).toHaveBeenCalledWith(expect.stringContaining('已折算 1 个历史计数键'))
+    expect(info).toHaveBeenCalledWith(expect.stringContaining('已把 2 个计数键按工作区拆进 2 个计数文件'))
     const persisted = JSON.parse(readFileSync(file, 'utf8'))
-    expect(Object.keys(persisted.counters)).toEqual([canonical])
-    expect(persisted.counters[canonical]).toEqual({ allow: 2, deny: 0 })
+    expect(persisted.counters).toBeUndefined()
+    // 同一个工作区的历史键与当前键合并（取较大值），键只留裸 memoryKey
+    const first = JSON.parse(readFileSync(join(counterDir, workspaceSlug('D:/w') + '.json'), 'utf8'))
+    expect(first.counters).toEqual({ [current.memoryKey]: { allow: 2, deny: 0 } })
+    const second = JSON.parse(readFileSync(join(counterDir, workspaceSlug('D:/other') + '.json'), 'utf8'))
+    expect(Object.keys(second.counters)).toEqual([current.memoryKey])
+  })
+})
+
+describe('pruneCounters（单工作区：死条目清理与上限）', () => {
+  /** 造一个计数键：一个工作区文件里的键就是裸 memoryKey。 */
+  const key = name => 'pwsh\u0000cmd:' + name + '\u0000x:{}'
+
+  it('删掉「两侧都是 0、也没被 dismissed」的死条目', () => {
+    const pruned = pruneCounters({
+      [key('pnpm test')]: { allow: 2, deny: 0 },
+      [key('pnpm lint')]: { allow: 0, deny: 0 },
+      [key('pnpm build')]: { count: 0 },
+    })
+    expect(Object.keys(pruned.counters)).toEqual([key('pnpm test')])
+    expect(pruned.removed).toBe(2)
+  })
+
+  it('dismissed 条目（哪怕两侧都是 0）不会被当死条目删掉', () => {
+    const dismissed = key('rm -rf /')
+    const pruned = pruneCounters({ [dismissed]: { allow: 0, deny: 0, dismissed: { deny: true } } })
+    expect(Object.keys(pruned.counters)).toEqual([dismissed])
+    expect(pruned.removed).toBe(0)
+  })
+
+  it('超过上限时先淘汰最久未用的活动条目，dismissed 最后才动', () => {
+    const pruned = pruneCounters({
+      [key('oldest')]: { allow: 1, deny: 0, at: 10 },
+      [key('middle')]: { allow: 1, deny: 0, at: 20 },
+      [key('newest')]: { allow: 1, deny: 0, at: 30 },
+      [key('dismissed')]: { allow: 0, deny: 0, dismissed: { deny: true }, at: 1 },
+    }, { max: 2 })
+    expect(Object.keys(pruned.counters).sort()).toEqual([key('newest'), key('dismissed')].sort())
+    expect(pruned.removed).toBe(2)
+  })
+
+  it('正在更新的那一条（protect）永不淘汰', () => {
+    const fresh = key('fresh')
+    const pruned = pruneCounters({
+      [key('a-1')]: { allow: 1, deny: 0, at: 1 },
+      [key('a-2')]: { allow: 1, deny: 0, at: 2 },
+      [fresh]: { allow: 1, deny: 0, at: 99 },
+    }, { max: 2, protect: new Set([fresh]) })
+    expect(Object.keys(pruned.counters)).toContain(fresh)
+    expect(pruned.removed).toBe(1)
+  })
+
+  it('保留 at（老条目缺 at 按最旧处理）', () => {
+    const pruned = pruneCounters({
+      [key('legacy')]: { allow: 1, deny: 0 },
+      [key('timed')]: { allow: 1, deny: 0, at: 7 },
+    }, { max: 1 })
+    expect(Object.keys(pruned.counters)).toEqual([key('timed')])
+    expect(pruned.counters[key('timed')].at).toBe(7)
   })
 })
 
@@ -333,16 +413,18 @@ describe('ruleCovers（规则之间的语义包含）', () => {
 describe('policy store', () => {
   let root
   let globalFile
+  let counterDir
   let cwd
 
   beforeEach(() => {
     root = newRoot()
     globalFile = join(root, 'home', 'policy.json')
+    counterDir = join(root, 'home', 'counters')
     cwd = join(root, 'project')
   })
 
   function store(options = {}) {
-    return createPolicyStore({ globalFile, warn: () => {}, ...options })
+    return createPolicyStore({ globalFile, counterDir, warn: () => {}, ...options })
   }
 
   it('项目规则落在项目目录，全局规则落在全局文件，且能重新读回', () => {
@@ -575,20 +657,21 @@ describe('policy store', () => {
 
   it('两侧阈值可读写，非法值被忽略', () => {
     const file = join(root, 'home', 'policy.json')
-    const instance = createPolicyStore({ globalFile: file, warn: () => {}, autoApproveAfter: 3, autoDenyAfter: 3 })
+    const counterDir = join(root, 'home', 'counters')
+    const instance = createPolicyStore({ globalFile: file, counterDir, warn: () => {}, autoApproveAfter: 3, autoDenyAfter: 3 })
     expect(instance.threshold()).toBe(3)
     expect(instance.threshold('deny')).toBe(3)
     expect(instance.setThreshold(5)).toBe(5)
     expect(instance.setThreshold(4, 'deny')).toBe(4)
     // 阈值是用户偏好：重启后从全局文件读回
-    const reopened = createPolicyStore({ globalFile: file, warn: () => {} })
+    const reopened = createPolicyStore({ globalFile: file, counterDir, warn: () => {} })
     expect(reopened.threshold()).toBe(5)
     expect(reopened.threshold('deny')).toBe(4)
     expect(instance.setThreshold(0)).toBe(5)
     expect(instance.setThreshold(0, 'deny')).toBe(4)
     // 早期版本只有一个 threshold 字段，按白名单阈值兼容读取
     writeFileSync(file, JSON.stringify({ version: 1, rules: { allow: [], deny: [] }, counters: {}, threshold: 7 }), 'utf8')
-    expect(createPolicyStore({ globalFile: file, warn: () => {} }).threshold()).toBe(7)
+    expect(createPolicyStore({ globalFile: file, counterDir, warn: () => {} }).threshold()).toBe(7)
   })
 })
 
@@ -606,6 +689,7 @@ describe('observe（连续计数与升级建议）', () => {
   function store(threshold = 3, denyThreshold = 3) {
     return createPolicyStore({
       globalFile: join(root, 'home', 'policy.json'),
+      counterDir: join(root, 'home', 'counters'),
       warn: () => {},
       autoApproveAfter: threshold,
       autoDenyAfter: denyThreshold,
@@ -689,3 +773,100 @@ describe('observe（连续计数与升级建议）', () => {
     expect(instance.observe({ signature, cwd, signal: 'pass' }).suggestion).not.toBeNull()
   })
 })
+
+describe('计数文件（按工作区拆分 / 清理 / 上限）', () => {
+  let root
+  let cwd
+  let other
+  let policyFile
+  let counterDir
+  let counterFile
+
+  /** 计数文件里的键：裸 memoryKey。 */
+  const entryKey = name => 'pwsh\u0000cmd:' + name + '\u0000x:{}'
+
+  beforeEach(() => {
+    root = newRoot()
+    cwd = join(root, 'project')
+    other = join(root, 'other')
+    policyFile = join(root, 'home', 'policy.json')
+    counterDir = join(root, 'home', 'counters')
+    counterFile = join(counterDir, workspaceSlug(cwd) + '.json')
+  })
+
+  function store(options = {}) {
+    return createPolicyStore({ globalFile: policyFile, counterDir, warn: () => {}, ...options })
+  }
+
+  /** 预置一份计数文件（父目录由仓库自己建，这里手动补齐）。 */
+  function seed(counters, target = counterFile) {
+    mkdirSync(dirname(target), { recursive: true })
+    writeFileSync(target, JSON.stringify({ version: 1, counters }), 'utf8')
+    return target
+  }
+
+  it('启动时整理已有计数文件：折算历史键并清掉死条目', () => {
+    const current = pwshSignature('pnpm test 2>&1')
+    const legacy = 'pwsh\u0000cmd:pnpm test 2>&1 | Select-Object -Last 30\u0000x:{"workdir":"D:/w"}'
+    seed({ [legacy]: { allow: 2, deny: 0 }, [entryKey('dead')]: { allow: 0, deny: 0 } })
+    const info = vi.fn()
+    store({ info })
+    expect(info).toHaveBeenCalledWith(expect.stringContaining('已整理 1 个计数文件'))
+    const persisted = JSON.parse(readFileSync(counterFile, 'utf8'))
+    expect(Object.keys(persisted.counters)).toEqual([current.memoryKey])
+    expect(persisted.counters[current.memoryKey]).toEqual({ allow: 2, deny: 0 })
+  })
+
+  it('observe 只写本工作区的计数文件（带最后更新时刻），计数不再进策略文件', () => {
+    const signature = pwshSignature('git status')
+    store().observe({ signature, cwd, signal: 'pass' })
+    const entry = JSON.parse(readFileSync(counterFile, 'utf8')).counters[signature.memoryKey]
+    expect(entry).toMatchObject({ allow: 1, deny: 0 })
+    expect(typeof entry.at).toBe('number')
+    // 计数不再进策略文件：observe 之后它甚至不该被创建
+    const policyText = existsSync(policyFile) ? readFileSync(policyFile, 'utf8') : ''
+    expect(policyText).not.toContain('counters')
+  })
+
+  it('不同工作区各写各的计数文件，互不牵连', () => {
+    const signature = pwshSignature('git status')
+    const instance = store()
+    instance.observe({ signature, cwd, signal: 'pass' })
+    instance.observe({ signature, cwd: other, signal: 'pass' })
+    const otherFile = join(counterDir, workspaceSlug(other) + '.json')
+    expect(Object.keys(JSON.parse(readFileSync(counterFile, 'utf8')).counters)).toEqual([signature.memoryKey])
+    expect(JSON.parse(readFileSync(otherFile, 'utf8')).counters[signature.memoryKey]).toMatchObject({ allow: 1 })
+  })
+
+  it('超过上限时淘汰最久未用的活动条目', () => {
+    const signature = pwshSignature('git status')
+    const counters = {}
+    for (let index = 0; index < DEFAULT_MAX_COUNTERS; index += 1) {
+      counters[entryKey('cmd-' + String(index))] = { allow: 1, deny: 0, at: index + 1 }
+    }
+    seed(counters)
+    const info = vi.fn()
+    store({ info }).observe({ signature, cwd, signal: 'pass' })
+    const persisted = Object.keys(JSON.parse(readFileSync(counterFile, 'utf8')).counters)
+    expect(persisted).toHaveLength(DEFAULT_MAX_COUNTERS)
+    expect(persisted).toContain(signature.memoryKey)
+    expect(persisted).not.toContain(entryKey('cmd-0'))
+    expect(info).toHaveBeenCalledWith(expect.stringContaining('已清理 1 个计数条目'))
+  })
+
+  it('同为最旧时，dismissed 条目比活动条目更晚被淘汰', () => {
+    const signature = pwshSignature('git status')
+    const dismissed = entryKey('rm -rf')
+    const counters = { [dismissed]: { allow: 0, deny: 0, dismissed: { deny: true }, at: 1 } }
+    for (let index = 1; index < DEFAULT_MAX_COUNTERS; index += 1) {
+      counters[entryKey('cmd-' + String(index))] = { allow: 1, deny: 0, at: index + 1 }
+    }
+    seed(counters)
+    store().observe({ signature, cwd, signal: 'pass' })
+    const persisted = Object.keys(JSON.parse(readFileSync(counterFile, 'utf8')).counters)
+    expect(persisted).toContain(dismissed)
+    expect(persisted).not.toContain(entryKey('cmd-1'))
+    expect(persisted).toHaveLength(DEFAULT_MAX_COUNTERS)
+  })
+})
+

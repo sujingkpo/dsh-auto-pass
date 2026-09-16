@@ -192,7 +192,8 @@ export function apply(ctx, config) {
     + ' placement=' + effectivePlacement(ctx, resolved)
     + ' autoApproveAfter=' + String(policies.threshold('allow'))
     + ' autoDenyAfter=' + String(policies.threshold('deny'))
-    + ' policy=' + String(policies.globalFile))
+    + ' policy=' + String(policies.globalFile)
+    + ' counters=' + String(policies.counterDir))
 }
 
 /**
