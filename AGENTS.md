@@ -138,6 +138,14 @@
 - 策略文件不在 profile 里，运行时才创建：全局 `C:\Users\czy\.dsh\dsh-auto-pass\policy.json`、项目 `<会话 cwd>\.dsh-auto-pass\policy.json`。调试时可以删掉全局文件让阈值与计数归零（项目名单会一起消失）。
 - 回滚来源：`%APPDATA%\DSH Desktop\health-snapshots\<hash>\slot-N\` 保存了 profile 的副本（含 `pnpm-lock.yaml`、`package.json`）。
 
+## 投稿到插件商店（awesome-dsh-plugin，2026-09-16 查证）
+
+- **一个文件就是全部投稿**：往 `awesome-dsh-plugin/awesome-dsh-plugin` 加 `data/plugins/<owner>__<repo>.yml`（slug 由 url 推出，本仓库 = `sujingkpo__dsh-auto-pass.yml`）。条目**只允许 5 个键** `url` / `name` / `category` / `description` / `tarball`（`scripts/lib/entries.mjs` 的 `ENTRY_KEYS`，多写任何一个都会被 CI 打回）；`description.en` 必填、单行、以 `.` 结尾，`zh` 可选但要么不写要么非空；含 `: ` 的标量必须加引号。`category` 必须是 `CAT_IDS` 之一，本项目取 **`security`**（与上游 `simon300000/dsh-auto`、`NanmiCoder/dsh-auto-mode`、`moon09300731/dsh-approval-gate` 同分类）。
+- **硬门槛**：① `package.json` 声明 `dsh.bundle`（我们根包已有；只声明 `dsh.client` 不算）；② 仓库创建满 **1 天**（本仓库 `created_at=2026-09-15T02:31:20Z`，即 2026-09-16T02:31Z 之后才过线；差一点点时 `regate.yml` 每 6 小时自动重跑，不要关 PR 重开）；③ 一个 PR 最多 3 条；④ awesome-lint + 站点构建。`dsh-plugin` topic 是文字要求、CI 不查（2026-09-16 本仓库 topics 仍为空，需在仓库首页 About 里补）。
+- **本地就能跑他们那套校验**（不必连他们的 npm）：解包他们的 tarball → 把 `C:\Program Files\DSH Desktop\resources\app\node_modules\js-yaml` 拷进解包目录的 `node_modules` → 用 `scripts/lib/entries.mjs` 的 `readEntries` / `validateEntries` 校验。**`writeEntry` 生成的就是维护者工具链的规范 YAML**（`dumpEntry`：`lineWidth:-1`、不加 `forceQuotes`），直接拿这段文本投稿就不会和生成器打架；`node scripts/generate-readme.mjs` 可本地预览自己那一行（会落在 `### Security & Permissions`）。
+- **市场截图放在自己仓库**：根目录 `screenshots.json` 列 1-8 张相对路径（不得以 `/` 开头、不得含 `..`）。本仓库已声明 `docs/images/auto-approve-{permission,policy,timeline}.zh.png`。往他们仓库的 `data/screenshots.json` 加键是旧做法，已被明确劝止。
+- **只改自己那一条**：评审会列出「这个 PR 动到的每个既有条目」，顺手改别人的描述会被追问。上游 `simon300000/dsh-auto` 的条目描述仍写着子代理审查（已过时），**不要**在我们的 PR 里改它。
+
 ## 工具坑（本机实测）
 
 - `read` 单次调用有上限：`limit` 最大 2000 行，且会被输出预算提前截断（96 KB 的 `pnpm-lock.yaml` 一次只返回约 1130 行）。**大文件必须按 600 行左右分块读并拼接**，否则写回会静默丢内容。
