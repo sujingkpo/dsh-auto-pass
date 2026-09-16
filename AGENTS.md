@@ -4,6 +4,7 @@
 
 ## 项目概览
 
+- **定位与出处（2026-09-16）**：本项目只解决「自动审批通过」（审查通过的动作自动放行），**不解决无人值守问题**——该转人工的仍然转人工、由用户拍板；本项目 fork / 参考自 <https://github.com/simon300000/dsh-auto/>。两个 README 的开头都要以醒目的引用块写明这两点。
 - `dsh-auto-pass`：给 DSH WebUI 增加 `自动审批` 权限档位（显示名在 `cordis.patch.yml` 的 `presets` 表里，预设 **id 固定为 `auto-approve`**，它是插件闸门）。入口 `src/index.js`，在 `approval/request` waterfall 上注册应答器。
 - **核心语义**：插件自动给出的结论有两种——`allowed-once`（只自动放行 Reviewer 判定 `outcome: allow` 的请求）与「设置页 `denyDirect` 打开时命中黑名单的 `rejected`」；其余情况（模型 deny、宿主安全降级 critical / high 授权不足、审查失败：超时 / 无审查路由 / 拿不到精确动作 / 模型调用失败或输出非法）一律调用 `next()` 转回 DSH 原生人工审批链（ask），由用户决定。**默认 `denyDirect: false`，即黑名单也只转人工**。
 - 审查提示词在 `prompts/review.md`（极简判定清单 + 一行 JSON 输出契约），规则优化提示词在 `prompts/rule.md`；旧的 `policy.md` / `policy-template.md` / `rule-template.md` 已删除。
@@ -130,6 +131,8 @@
 - 本机默认 `reviewerProvider: deepseek-official` 无凭证，必须由 profile 的 `cordis.patch.yml` 用 `- id: dsh-auto-pass` 覆盖审查模型；profile 层按 id 覆盖会**整体替换** config，所以要重述全部键。
 - 改插件代码、`cordis.patch.yml` 或策略后必须重启 DSH Desktop 才生效（客户端半也要重启，HMR 只在 dev:web 下生效）。
 - profile 的 `cordis.patch.yml` 覆盖里没有新键（`maxRecords`/`placement`/`autoApproveAfter`/`policyFile`）也无需改：profile 按 id 覆盖时未列出的键回落到代码默认值。
+- **仓库随包的 `cordis.patch.yml` 已同步为当前键集（2026-09-15 清理）**：config 现在只有真实被读的键——`language` / `reviewerProvider` / `reviewerModel` / `reviewerReasoningEffort` / `timeoutMs` / `maxEvidenceChars` / `maxActionChars` / `maxOutputTokens` / `logFile` / `maxRecords` / `autoApproveAfter` / `autoDenyAfter` / `policyFile` / `placement` / `notice` / `denyDirect` / `autoOpenTimeline` / `askRejectReason`。旧的 `maxInvestigationSteps` / `maxMessageTranscriptTokens` / `maxToolTranscriptTokens` / `maxMessageEntryTokens` / `maxToolEntryTokens` / `maxSystemInstructionTokens` / `maxAgentInstructionTokens` / `maxRecentNonUserEntries` 已从仓库文件里删除（全仓 grep 确认 `src` 里没有任何读取处）。两个 README 的 YAML 块**故意只列「适合写在配置文件里」的子集**（reviewer 路由三件套 + `language` + `timeoutMs` + `maxEvidenceChars`/`maxActionChars`/`maxOutputTokens` + `logFile`/`maxRecords`/`policyFile`），界面偏好（`placement`/`notice`/`denyDirect`/`autoOpenTimeline`/`askRejectReason`）与两侧阈值（`autoApproveAfter`/`autoDenyAfter`）改在正文里讲「可在界面改」。YAML 块后面紧跟 `### 参数说明`（英文 `### Key reference`）**逐键解释**——每个键的含义、默认值、类型/成对校验口径（数值键必须正整数、`logFile`/`policyFile` 必须字符串、reviewer 两键必须成对）都写在那一份列表里；**改键时这份列表与 `cordis.patch.yml` 一起改**。改键时以 `cordis.patch.yml` 为准：README 的子集允许少于它，但**不得出现它没有的键**。
+- **文档截图（2026-09-16 更新）**：`docs/images/auto-approve-permission.zh.png`（中文权限菜单里选中「自动审批」）与 `auto-approve-permission.en.jpg`（英文界面）是当前两份 README 唯二引用的图；旧的 `auto-approve-permission.zh.jpg`（被 png 取代）与 `auto-approve-allowed.png`（子代理时代的「上下文注入 · Reviewer 会话 / 调查步骤 1」卡片，已过期）**已删除**，别再引用。
 - **单轮审查后 profile 里那几个旧键（`maxInvestigationSteps` / `maxMessageTranscriptTokens` / `maxToolTranscriptTokens` / `maxMessageEntryTokens` / `maxToolEntryTokens` / `maxSystemInstructionTokens` / `maxAgentInstructionTokens` / `maxRecentNonUserEntries`）已经是惰性的**：`resolveConfig` 不再读它们，但也不会因为多出来就报错（内部是 `{...DEFAULTS, ...config}`），所以不必急着去改 profile；要精简就删掉那几行。新增可调的是 `maxEvidenceChars`（默认 400）。
 - 策略文件不在 profile 里，运行时才创建：全局 `C:\Users\czy\.dsh\dsh-auto-pass\policy.json`、项目 `<会话 cwd>\.dsh-auto-pass\policy.json`。调试时可以删掉全局文件让阈值与计数归零（项目名单会一起消失）。
 - 回滚来源：`%APPDATA%\DSH Desktop\health-snapshots\<hash>\slot-N\` 保存了 profile 的副本（含 `pnpm-lock.yaml`、`package.json`）。

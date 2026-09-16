@@ -11,6 +11,7 @@
       workspace-write:
         sandbox: workspace-write
         approval: ask
+      # 预设 id 固定为 auto-approve（插件用它当闸门），显示名保持纯中文
       auto-approve:
         sandbox: workspace-write
         approval: ask
@@ -24,22 +25,29 @@
     - id: dsh-auto-pass
       name: dsh-auto-pass
       config:
+        # auto（按用户直接消息里的汉字判断）/ zh / en；非法值回退 auto
         language: auto
+        # 审查模型路由：两者必须同时设置；都省略则用父会话当前的 provider/model
         reviewerProvider: deepseek-official
         reviewerModel: deepseek-v4-flash
         reviewerReasoningEffort: high
+        # 单轮审查（一次 llm.stream，不起子代理）的边界
         timeoutMs: 90000
-        maxInvestigationSteps: 4
-        maxMessageTranscriptTokens: 4000
-        maxToolTranscriptTokens: 3000
-        maxMessageEntryTokens: 1000
-        maxToolEntryTokens: 512
-        maxSystemInstructionTokens: 6000
-        maxAgentInstructionTokens: 6000
-        maxRecentNonUserEntries: 20
+        maxEvidenceChars: 400
         maxActionChars: 16000
-        maxOutputTokens: 8192
-        # 审批记录：落盘 JSON 的条数上限；placement=auto|tab|sidebar|all
-        # all（默认）两处都注册；auto 优先右侧栏 tab，没有座位时退回对话区标签页
+        maxOutputTokens: 2048
+        # 审批记录：按工作区分文件落盘；显式给 logFile 退回单文件模式（所有工作区同一个文件）
+        logFile: ''
         maxRecords: 1000
+        # 连续放行 / 连续被拒的缺省阈值（面板里改过的值存在策略文件里，优先于这里）
+        autoApproveAfter: 3
+        autoDenyAfter: 3
+        # 全局策略文件路径；留空 = $DSH_HOME/dsh-auto-pass/policy.json
+        policyFile: ''
+        # auto|tab|sidebar|all：all（默认）两处都注册；auto 优先右侧栏、没座位时退回对话区
         placement: all
+        # 界面/行为开关，都能在设置页卡片或「审批设置」面板里改，设置里的值优先
+        notice: true
+        denyDirect: false
+        autoOpenTimeline: true
+        askRejectReason: true
