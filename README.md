@@ -12,9 +12,9 @@ On top of that sit two layers of *permission memory*: an **allowlist** (allowed 
 
 ## Screenshots
 
-Select the `自动审批` permission preset (DSH 0.1.5-rc.1, English UI):
+Select the `自动审批` permission preset (DSH 0.1.5-rc.1):
 
-![Auto Approve permission preset in the English UI](docs/images/auto-approve-permission.en.jpg)
+![The 自动审批 permission preset selected in the permission menu](docs/images/auto-approve-permission.zh.png)
 
 The "Approval policy" panel — both thresholds plus the **global** and **project** allow/deny lists (conversation tab):
 
