@@ -18,6 +18,8 @@
 - **客户端半只有 `tests/client.spec.js` 覆盖**：它不进构建流水线。测试用假 `window.__ModuleLoader__` + 带「渲染帧」的假 react 加载 bundle，把组件**渲染到稳定状态**（反复求值 + 跑副作用 + 等微任务，直到没有新的 `setState`；**上限 8 轮**——规则表单里「切匹配条件 → 填值 → 点按钮 → 渲染结果」各占一轮，而权限指纹那档没有值输入框，必须先切条件才拿得到输入框）——漏定义变量、漏闭合花括号、以及「异步拉到记录之后」那一轮渲染里的问题就靠它兜住（都真的漏过）。
 - `tests/auto-approve.spec.js` 文件名沿用权限档位名 `auto-approve`，与包名 `dsh-auto-pass` 不同，改名时不要误删。
 - **受限沙箱下 `pnpm test` 会 `spawn EPERM`**（vite 会 `exec("net use")`、vitest 默认 forks 池也要 spawn 子进程）；需要以更宽权限运行，否则测试跑不起来。
+- **发布（release）流程（2026-09-16 实测 v0.1.2）**：① 改 `package.json` 的 `version`（仓库里只有这一处版本号，`git grep '0\.1\.1'` 只命中它），单独一笔 `chore(release): vX.Y.Z`（v0.1.1 那笔就只改了这一个文件）；② 在发布提交上打**附注 tag** 并把发布说明写进 tag message：`git tag -a vX.Y.Z -F <说明文件>`，风格照 v0.1.0 / v0.1.1 —— 首行 `## dsh-auto-pass vX.Y.Z`，随后 `### 新特性` / `### 兼容` / `### 验证`（`### 测试` 也行）几节 Markdown；③ `git push` 推分支、`git push origin vX.Y.Z` 推 tag（`git ls-remote --tags origin` 偶发 `Connection closed by 198.18.0.22 port 22`，重试即可）。
+- **推送必须 `danger-full-access`（2026-09-16 实测）**：远端是 SSH（`git@github.com:sujingkpo/dsh-auto-pass.git`），受限沙箱下 `git push` 直接失败 —— `ssh.exe: *** fatal error - couldn't create signal pipe, Win32 error 5` → `fatal: Could not read from remote repository.`（沙箱不让开命名管道，与上面 `spawn EPERM` 同一类）；提权后**命中全局白名单 `git push` 规则直接放行**（不需人工点卡）。
 
 ## 架构事实（读源码确认）
 
