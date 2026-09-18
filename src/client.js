@@ -48,6 +48,10 @@
  *      底部那行重复的文字入口（.ap-detailFoot / .ap-btnGhost）删除；正文用函数传入，收起时不构造元素
  *   ④ 移除「本次会话 / 全部会话」切换（面板固定看本次会话），记录字段与宿主 /log 接口一律保留——
  *      随之删掉会话名那行小字（.ap-session）与 t.scopeSession / t.scopeAll，sessionNameOf 成为死代码被删
+ * @modify 2026-09-18 「自动打开审批时间线」按钮按工作区区分（用户要求）：runtimeStore 多出
+ *   workspaceCwd / autoOpenWorkspace / autoOpenScoped 与 autoOpenFor(cwd)，load/save 接受 cwd
+ *   （POST 带 cwd 时宿主写该项目策略文件的 prefs）；面板里的开关读写本工作区那份，
+ *   设置页卡片仍是所有工作区的默认值
  */
 window.__ModuleLoader__.load({
   id: 'dsh-auto-pass',
@@ -291,7 +295,8 @@ window.__ModuleLoader__.load({
         denyDirectTitle: '黑名单直接拒绝',
         denyDirectHint: '命中黑名单时直接把这次调用判为拒绝（工具调用失败），不再弹人工审批卡',
         autoOpenTitle: '自动打开审批时间线',
-        autoOpenHint: '触发审批时自动展开审批时间线；已显示、或右侧栏正停在其他工具上时不打扰',
+        autoOpenHint: '触发审批时自动展开审批时间线；已显示、或右侧栏正停在其他工具上时不打扰（这里是所有工作区的默认值）',
+        autoOpenHintWorkspace: '本工作区：触发审批且右侧栏整栏收起时自动展开时间线；已显示、或停在其他工具上时不打扰',
         askReasonTitle: '拒绝后追问理由',
         askReasonHint: '你拒绝一次审批后，插件问一句拒绝理由并注入模型上下文（默认选项就是本次的模型审批意见）',
         saveFailed: '保存失败',
@@ -466,7 +471,8 @@ window.__ModuleLoader__.load({
         denyDirectTitle: 'Reject on denylist',
         denyDirectHint: 'A denylist hit fails the tool call outright instead of opening a human approval card',
         autoOpenTitle: 'Open the approval timeline automatically',
-        autoOpenHint: 'Open the approval timeline when an approval is triggered; it stays put while the timeline is visible or the sidebar is on another tool',
+        autoOpenHint: 'Open the approval timeline when an approval is triggered; it stays put while the timeline is visible or the sidebar is on another tool (this is the default for every workspace)',
+        autoOpenHintWorkspace: 'This workspace: expand the approval timeline when an approval is triggered while the sidebar is collapsed; it stays put when the timeline shows or another tool is on screen',
         askReasonTitle: 'Ask for a rejection reason',
         askReasonHint: 'After you reject an approval, the plugin asks for a reason and injects it into the model context (the model review note is the default answer)',
         saveFailed: 'Save failed',
@@ -822,13 +828,20 @@ window.__ModuleLoader__.load({
      * 界面偏好状态：唯一真值在宿主（config 默认值 + 设置命名空间覆盖）。
      * placement 决定面板挂在哪里（变更会广播出去重新挂载），notice / denyDirect 是两个行为开关
      * （关掉通知注入、开启黑名单直接拒绝）。设置页卡片与审批设置面板共用这一份状态。
+     * **「自动打开审批时间线」按工作区区分**（用户 2026-09-18）：设置页那份是所有工作区的默认值
+     * （`autoOpenTimeline`），每个工作区可以在「审批设置」面板里单独设一份（宿主存在该项目策略
+     * 文件的 prefs 里）；`load(cwd)` 拿回来的 `workspace` 段带着本工作区的生效值。
      */
     const runtimeStore = {
       placement: 'all',
       notice: true,
       denyDirect: false,
-      // 本会话第一次产生审批记录时自动打开右侧栏时间线（默认开）
+      // 设置页那份「自动打开审批时间线」= 所有工作区的默认值（默认开）
       autoOpenTimeline: true,
+      // 本工作区单独设过的那份（宿主回执里带 cwd 时才有）+ 它是哪个工作区的
+      workspaceCwd: undefined,
+      autoOpenWorkspace: undefined,
+      autoOpenScoped: false,
       // 人工拒绝后追问一句拒绝理由（默认开）
       askRejectReason: true,
       writable: false,
@@ -841,9 +854,22 @@ window.__ModuleLoader__.load({
       emit() {
         for (const listener of [...this.listeners]) listener(this.placement)
       },
-      /** 把宿主返回的 settings 对象套用到本地状态；认不出的值保持原样。 */
-      apply(settings) {
-        if (settings === null || typeof settings !== 'object') return
+      /**
+       * 某个工作区此刻**生效**的「自动打开审批时间线」：该工作区存过就用它的，否则用全局那份。
+       * 观察器与面板都只认它——所以声明式地要求「就是问这个 cwd 的值」，上一个工作区的值不会被借用。
+       * @param cwd 工作区目录（拿不到时只能回落到全局那份）
+       * @returns {boolean} 生效值
+       */
+      autoOpenFor(cwd) {
+        if (typeof cwd === 'string' && cwd !== '' && this.workspaceCwd === cwd
+          && typeof this.autoOpenWorkspace === 'boolean') return this.autoOpenWorkspace
+        return this.autoOpenTimeline
+      },
+      /** 把宿主回执（`settings` 全局 + `workspace` 本工作区）套用到本地状态；认不出的值保持原样。 */
+      apply(payload) {
+        if (payload === null || typeof payload !== 'object') return
+        // 兼容只给 settings 的老形状（宿主两处出口现在都给整个回执）
+        const settings = payload.settings !== null && typeof payload.settings === 'object' ? payload.settings : payload
         if (typeof settings.placement === 'string' && PLACEMENTS.includes(settings.placement)) {
           this.placement = settings.placement
         }
@@ -851,12 +877,25 @@ window.__ModuleLoader__.load({
         if (typeof settings.denyDirect === 'boolean') this.denyDirect = settings.denyDirect
         if (typeof settings.autoOpenTimeline === 'boolean') this.autoOpenTimeline = settings.autoOpenTimeline
         if (typeof settings.askRejectReason === 'boolean') this.askRejectReason = settings.askRejectReason
+        const workspace = payload.workspace
+        if (workspace !== null && typeof workspace === 'object' && typeof workspace.cwd === 'string' && workspace.cwd !== '') {
+          this.workspaceCwd = workspace.cwd
+          this.autoOpenWorkspace = typeof workspace.autoOpenTimeline === 'boolean' ? workspace.autoOpenTimeline : undefined
+          this.autoOpenScoped = workspace.scoped === true
+        } else {
+          // 不带 cwd 的回执：清掉工作区态，免得把上一个工作区的值当成这个工作区的
+          this.workspaceCwd = undefined
+          this.autoOpenWorkspace = undefined
+          this.autoOpenScoped = false
+        }
       },
-      async load() {
+      /** 读界面偏好；带 cwd 时一并拿回该工作区的生效值（自动打开时间线按工作区区分）。 */
+      async load(cwd) {
         try {
-          const response = await fetch(API_CONFIG, { headers: { accept: 'application/json' } })
+          const query = typeof cwd === 'string' && cwd !== '' ? '?cwd=' + encodeURIComponent(cwd) : ''
+          const response = await fetch(API_CONFIG + query, { headers: { accept: 'application/json' } })
           const data = await response.json()
-          this.apply(data?.settings)
+          this.apply(data)
           this.writable = data?.writable === true
         } catch (error) {
           console.warn(LOG, '读取宿主界面偏好失败，沿用本地默认值', error)
@@ -864,16 +903,20 @@ window.__ModuleLoader__.load({
         this.emit()
         return this.placement
       },
-      /** 写一个偏好（placement / notice / denyDirect）并套用宿主回执；失败抛出由调用方回滚。 */
-      async save(patch) {
+      /**
+       * 写一个偏好并套用宿主回执；失败抛出由调用方回滚。
+       * 带 cwd 的 `autoOpenTimeline` 写的是**该工作区**那份（宿主落进它的项目策略文件）。
+       */
+      async save(patch, cwd) {
+        const body = typeof cwd === 'string' && cwd !== '' ? { ...patch, cwd } : patch
         const response = await fetch(API_CONFIG, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(patch),
+          body: JSON.stringify(body),
         })
         const data = await response.json()
         if (data?.ok !== true) throw new Error(String(data?.error ?? 'save failed'))
-        this.apply(data.settings)
+        this.apply(data)
         this.emit()
       },
     }
@@ -902,8 +945,12 @@ window.__ModuleLoader__.load({
      */
     const mountState = { tab: undefined, sidebar: undefined, timelineShown: false }
 
-    /** 审批观察器：seen 记每个会话上一次看到的最新记录 id（判断有没有出现新审批），timer 是轮询句柄。 */
-    const approvalWatch = { seen: new Map(), timer: undefined }
+    /**
+     * 审批观察器：seen 记每个会话上一次看到的最新记录 id（判断有没有出现新审批），timer 是轮询句柄；
+     * sessionId / workspace 记上一次观测的会话与工作区——变了就重读一次界面偏好（自动打开时间线按
+     * 工作区区分，用户 2026-09-18）。
+     */
+    const approvalWatch = { seen: new Map(), timer: undefined, sessionId: undefined, workspace: undefined }
 
     /**
      * 右侧栏此刻是不是整栏展开着。
@@ -950,10 +997,17 @@ window.__ModuleLoader__.load({
      * @returns {Promise<void>} 无返回值；任何失败只记日志，绝不影响面板自身
      */
     async function watchApprovals() {
-      if (runtimeStore.autoOpenTimeline !== true) return
       if (mountState.sidebar === undefined) return
       const sessionId = currentSessionId()
       if (sessionId === undefined) return
+      // 换了会话/工作区就重读一次界面偏好：这个开关是按工作区存的，用上一个工作区的值会判错
+      const cwd = workspaceOf(sessionId)
+      if (approvalWatch.sessionId !== sessionId || approvalWatch.workspace !== cwd) {
+        approvalWatch.sessionId = sessionId
+        approvalWatch.workspace = cwd
+        await runtimeStore.load(cwd)
+      }
+      if (runtimeStore.autoOpenFor(cwd) !== true) return
       let newest = ''
       try {
         const response = await fetch(API_LOG + '?session=' + encodeURIComponent(sessionId) + '&limit=1', {
@@ -988,7 +1042,7 @@ window.__ModuleLoader__.load({
      * @returns {void} 无返回值；任何失败只影响这次自动展开
      */
     function maybeAutoOpenTimeline(sessionId) {
-      if (runtimeStore.autoOpenTimeline !== true) return
+      if (runtimeStore.autoOpenFor(workspaceOf(sessionId)) !== true) return
       if (mountState.sidebar === undefined) return
       if (mountState.timelineShown === true) return
       // 侧栏展开着 = 用户正在用侧栏里的别的东西（时间线没显示已经由上一行保证了）：
@@ -2355,48 +2409,71 @@ window.__ModuleLoader__.load({
         react.createElement('span', { className: 'ap-note' }, hint))
     }
 
-    /** 四个行为开关的键 + 文案（设置页卡片与「审批设置」面板共用同一份顺序）。 */
-    function behaviorSwitchSpecs() {
+    /**
+     * 四个行为开关的键 + 文案（设置页卡片与「审批设置」面板共用同一份顺序）。
+     * @param perWorkspace 面板里（知道 cwd）用「本工作区」那句说明——自动打开时间线按工作区区分
+     */
+    function behaviorSwitchSpecs(perWorkspace) {
       return [
         { key: 'notice', label: t.noticeTitle, hint: t.noticeHint },
         { key: 'denyDirect', label: t.denyDirectTitle, hint: t.denyDirectHint },
-        { key: 'autoOpenTimeline', label: t.autoOpenTitle, hint: t.autoOpenHint },
+        {
+          key: 'autoOpenTimeline',
+          label: t.autoOpenTitle,
+          hint: perWorkspace === true ? t.autoOpenHintWorkspace : t.autoOpenHint,
+        },
         { key: 'askRejectReason', label: t.askReasonTitle, hint: t.askReasonHint },
       ]
     }
 
     /**
      * 行为开关组：注入审批结果到上下文 / 黑名单直接拒绝 / 自动打开审批时间线 / 拒绝后追问理由。
-     * 四个值都来自宿主 /config（设置命名空间）；写回是**先乐观置本地值**，失败回滚并提示，
+     * 四个值都来自宿主 /config；写回是**先乐观置本地值**，失败回滚并提示，
      * 绝不让界面显示一个没写进宿主的状态。设置页卡片与「审批设置」面板都渲染这一个组件。
+     * **「自动打开审批时间线」按工作区区分**（用户 2026-09-18）：面板里知道 cwd，显示与写入的都是
+     * **本工作区**那份（落进该项目的策略文件）；设置页卡片没有工作区上下文，编辑的是全局默认值。
+     * @param props.scope 'workspace' = 面板（按工作区），其余 = 设置页（全局默认）
+     * @param props.cwd 当前工作区目录（scope=workspace 时用）
      */
-    function BehaviorSettings() {
+    function BehaviorSettings({ scope, cwd }) {
       const [, bump] = react.useState(0)
       const [saved, setSaved] = react.useState(false)
       const [error, setError] = react.useState('')
       react.useEffect(() => runtimeStore.subscribe(() => bump(value => value + 1)), [])
+      const perWorkspace = scope === 'workspace' && typeof cwd === 'string' && cwd !== ''
+      /** 这个开关此刻显示的值（自动打开时间线在面板里是本工作区的生效值）。 */
+      const valueOf = key => key === 'autoOpenTimeline' && perWorkspace
+        ? runtimeStore.autoOpenFor(cwd)
+        : runtimeStore[key]
       /** 写一个开关：乐观置值 → 写宿主 → 成功提示 / 失败回滚。 */
       const save = (key, next) => {
         setError('')
         setSaved(false)
-        const previous = runtimeStore[key]
-        runtimeStore[key] = next
+        const previous = valueOf(key)
+        const scoped = key === 'autoOpenTimeline' && perWorkspace
+        if (scoped) {
+          runtimeStore.workspaceCwd = cwd
+          runtimeStore.autoOpenWorkspace = next
+        } else {
+          runtimeStore[key] = next
+        }
         runtimeStore.emit()
-        runtimeStore.save({ [key]: next })
+        runtimeStore.save({ [key]: next }, scoped ? cwd : undefined)
           .then(() => { setSaved(true); bump(value => value + 1) })
           .catch(cause => {
             console.warn(LOG, '保存界面偏好失败', cause)
-            runtimeStore[key] = previous
+            if (scoped) runtimeStore.autoOpenWorkspace = previous
+            else runtimeStore[key] = previous
             runtimeStore.emit()
             setError(t.saveFailed + '：' + String(cause?.message ?? cause))
           })
       }
       return react.createElement('div', { className: 'ap-col' },
-        ...behaviorSwitchSpecs().map(spec => react.createElement(SwitchRow, {
+        ...behaviorSwitchSpecs(perWorkspace).map(spec => react.createElement(SwitchRow, {
           key: spec.key,
           label: spec.label,
           hint: spec.hint,
-          value: runtimeStore[spec.key],
+          value: valueOf(spec.key),
           onChange: next => save(spec.key, next),
         })),
         saved && react.createElement('div', { className: 'ap-note' }, t.savedTip),
@@ -2426,11 +2503,12 @@ window.__ModuleLoader__.load({
      * 设置页（容器是 ul，所以必须是 li）与「审批设置」面板共用同一套内容。
      * @param props.tag 宿主标签（设置页传 'li'，对话区面板传 'section'）
      * @param props.desc 卡片说明（设置页多一句：这里还能开关通知与黑名单行为）
+     * @param props.scope / props.cwd 见 BehaviorSettings（面板传 workspace + 当前工作区目录）
      */
-    function SettingsCard({ tag, desc }) {
+    function SettingsCard({ tag, desc, scope, cwd }) {
       return card(tag ?? 'section', t.cardName, desc ?? t.placementDesc, react.createElement('div', { className: 'ap-col' },
         react.createElement(PlacementControl, null),
-        react.createElement(BehaviorSettings, null)))
+        react.createElement(BehaviorSettings, { scope, cwd })))
     }
 
     /**
@@ -2468,6 +2546,8 @@ window.__ModuleLoader__.load({
           }
           if (!alive) return
           setCwd(next)
+          // 工作区变了就重读一次界面偏好：「自动打开审批时间线」按工作区区分，面板要显示本工作区那份
+          if (runtimeStore.workspaceCwd !== next) await runtimeStore.load(next)
           await policyStore.load(next)
         }
         void resolve()
@@ -2558,7 +2638,8 @@ window.__ModuleLoader__.load({
                 react.createElement(RuleList, { scope: 'project', list: 'allow', title: t.allowList, rules: projectRules?.allow ?? [], onRemove: remove, onEdit: editRule }),
                 react.createElement(RuleList, { scope: 'project', list: 'deny', title: t.denyList, rules: projectRules?.deny ?? [], onRemove: remove, onEdit: editRule }),
               ]),
-            react.createElement(SettingsCard, { tag: 'section' }),
+            // 面板里知道当前工作区：自动打开时间线这个开关按工作区读/写（设置页那份是全局默认）
+            react.createElement(SettingsCard, { tag: 'section', scope: 'workspace', cwd }),
             editNote !== '' && react.createElement('div', { className: 'ap-note' }, editNote),
             (error !== '' || policyStore.error !== '')
               && react.createElement('div', { className: 'ap-note' }, error !== '' ? error : policyStore.error))))

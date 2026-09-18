@@ -193,6 +193,39 @@ let clipboardWrites = []
 /** POST /policy（改阈值 / 加删改规则）的回执：用例接管它验证「已更新 / 已合并」文案。 */
 let policyResponder = null
 
+/**
+ * /config 的请求流水（断言「这个开关写的是本工作区还是全局」用）：
+ * 每项 { method, cwd, body }；body 只在 POST 时有。
+ */
+let configRequests = []
+
+/**
+ * 模拟「某个工作区在项目策略文件里单独存过 prefs.autoOpenTimeline」：cwd -> boolean。
+ * /config 带 cwd 时据此给出 workspace 段（与宿主的 configSnapshot 同口径）。
+ */
+let workspaceAutoOpen = {}
+
+/** 观察器用例里那个当前会话的工作区（harness 的 sessions 快照里的 cwd）。 */
+const WORKSPACE_CWD = 'D:\\work\\github\\dsh-auto'
+
+/** /config 的回执替身：全局那份 + （带 cwd 时）本工作区的生效值。 */
+function configPayload(cwd) {
+  const globalAuto = true
+  const scoped = cwd === undefined ? undefined : workspaceAutoOpen[cwd]
+  return {
+    ok: true,
+    settings: { placement: 'all', notice: true, denyDirect: false, autoOpenTimeline: globalAuto, askRejectReason: true },
+    ...(cwd === undefined ? {} : {
+      workspace: {
+        cwd,
+        autoOpenTimeline: typeof scoped === 'boolean' ? scoped : globalAuto,
+        scoped: typeof scoped === 'boolean',
+      },
+    }),
+    writable: true,
+  }
+}
+
 /** 渲染帧之间的「等一轮」：默认真时钟；观察器用例切到假时钟后必须改写，否则永远等不到。 */
 const defaultWaitTick = () => new Promise(resolve => setTimeout(resolve, 0))
 let waitTick = defaultWaitTick
@@ -256,6 +289,8 @@ function installBrowserStubs() {
   draftResponder = null
   revertResponder = null
   policyResponder = null
+  configRequests = []
+  workspaceAutoOpen = {}
   const store = new Map()
   globalThis.localStorage = {
     getItem: key => (store.has(key) ? store.get(key) : null),
@@ -321,14 +356,21 @@ function installBrowserStubs() {
       const payload = typeof ruleResponder === 'function' ? ruleResponder(target) : { ok: true }
       return { json: async () => payload }
     }
-    // 界面偏好：placement + 四个行为开关（notice / denyDirect / autoOpenTimeline / askRejectReason）
-    return {
-      json: async () => ({
-        ok: true,
-        settings: { placement: 'all', notice: true, denyDirect: false, autoOpenTimeline: true, askRejectReason: true },
-        writable: true,
-      }),
+    // 界面偏好：placement + 四个行为开关。自动打开时间线按工作区区分——带 ?cwd= 或 body.cwd
+    // 的请求拿到 workspace 段；POST 带 cwd 就是「写这个工作区那份」（替身记下来供断言）
+    if (target.includes('/config')) {
+      const body = options?.body === undefined ? undefined : JSON.parse(String(options.body))
+      const fromQuery = target.includes('?cwd=')
+        ? decodeURIComponent(target.slice(target.indexOf('?cwd=') + 5))
+        : undefined
+      const cwd = body?.cwd ?? fromQuery
+      if (body !== undefined && typeof body.autoOpenTimeline === 'boolean' && cwd !== undefined) {
+        workspaceAutoOpen[cwd] = body.autoOpenTimeline
+      }
+      configRequests.push({ method: options?.method ?? 'GET', cwd, body })
+      return { json: async () => configPayload(cwd) }
     }
+    return { json: async () => configPayload(undefined) }
   })
 }
 
@@ -620,6 +662,22 @@ function clickScopeButton(name) {
     const button = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-scope'] === name)[0]
     if (button === undefined) return false
     button.props.onClick()
+    return true
+  }
+}
+
+/**
+ * 拨一个行为开关（原生 checkbox 承载状态）：按出现顺序取第 index 个，
+ * 顺序与 `behaviorSwitchSpecs` 一致 —— 0=注入审批结果，1=黑名单直接拒绝，
+ * 2=自动打开审批时间线，3=拒绝后追问理由。
+ * @param index 第几个开关
+ * @param checked 拨到开 / 关
+ */
+function toggleSwitch(index, checked) {
+  return tree => {
+    const input = findNodes(tree, node => node?.type === 'input' && node?.props?.type === 'checkbox')[index]
+    if (input === undefined) return false
+    input.props.onChange({ target: { checked } })
     return true
   }
 }
@@ -2250,6 +2308,75 @@ describe('审批触发后自动打开右侧栏时间线', () => {
       waitTick = defaultWaitTick
       vi.useRealTimers()
     }
+  })
+
+  it('这个开关按工作区取值：本工作区单独关掉后，即使全局开着也不自动展开', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, openTabs, sidebar } = harness()
+      // 该项目在策略文件里存过 prefs.autoOpenTimeline=false（全局那份仍是 true）
+      workspaceAutoOpen = { [WORKSPACE_CWD]: false }
+      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN }]
+      logResponder = () => records
+      moduleExports.apply(ctx)
+      const tick = async (ms) => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+
+      // 观察器读的是**带 cwd** 的那一份（不是全局那份）
+      await tick(POLL)
+      expect(configRequests.some(item => item.method === 'GET' && item.cwd === WORKSPACE_CWD)).toBe(true)
+      expect(sidebar.expanded).toBe(false)
+      // 新审批来了：全局开着、本工作区关着 → 不动用户的侧栏
+      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual([])
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('「自动打开审批时间线」按工作区区分（2026-09-18 用户要求）', () => {
+  it('面板读写的是本工作区（带 cwd），设置页卡片读写的是全局默认（不带 cwd）', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+
+    // 「审批设置」面板：知道当前工作区 → 读数带 ?cwd=，写数带 cwd（落进该项目的策略文件）
+    const view = slot(slotRegistrations, 'conversation.view', 'dsh-auto-pass')
+    const panel = await renderStable(react, view.component, { sessionId: SESSION_KNOWN }, steps(toggleSwitch(2, false)))
+    for (const cleanup of panel.cleanups) cleanup()
+    expect(configRequests.some(item => item.method === 'GET' && item.cwd === WORKSPACE_CWD)).toBe(true)
+    const scopedWrite = configRequests.filter(item => item.method === 'POST').pop()
+    expect(scopedWrite.cwd).toBe(WORKSPACE_CWD)
+    expect(scopedWrite.body).toEqual({ autoOpenTimeline: false, cwd: WORKSPACE_CWD })
+    // 面板里那句说明是「本工作区」版（设置页那份是所有工作区的默认值）
+    expect(JSON.stringify(panel.tree)).toContain('本工作区：触发审批且右侧栏整栏收起时自动展开时间线')
+
+    // 设置页卡片：没有工作区上下文 → 读写全局那份（所有工作区的默认值）
+    const card = slot(slotRegistrations, 'settings.plugin.item', 'dsh-auto-pass')
+    const settings = await renderStable(react, card.component, {}, steps(toggleSwitch(2, false)))
+    for (const cleanup of settings.cleanups) cleanup()
+    const globalWrite = configRequests.filter(item => item.method === 'POST').pop()
+    expect(globalWrite.cwd).toBeUndefined()
+    expect(globalWrite.body).toEqual({ autoOpenTimeline: false })
+    expect(JSON.stringify(settings.tree)).toContain('这里是所有工作区的默认值')
   })
 })
 

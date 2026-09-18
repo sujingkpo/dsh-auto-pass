@@ -18,6 +18,7 @@ import {
   kindApplicable,
   parseSuggestedRule,
   POLICY_PATH,
+  RECORD_CONFIG_PATH,
   resolveConfig,
   ruleFromRecord,
   RULE_DRAFT_PATH,
@@ -954,6 +955,54 @@ describe('策略 HTTP 入口', () => {
     const afterRemove = fakeHttp('GET', POLICY_PATH + '?cwd=' + encodeURIComponent(projectDir))
     await handler(afterRemove.req, afterRemove.res)
     expect(JSON.parse(afterRemove.state.body).project.deny).toEqual([])
+  })
+
+  it('/config 的「自动打开审批时间线」按工作区区分：带 cwd 读写该项目文件，不带 cwd 写全局', async () => {
+    const root = tempDir()
+    const projectDir = join(root, 'project')
+    const otherDir = join(root, 'other')
+    const { ctx, routes } = fakeContext()
+    apply(ctx, { policyFile: join(root, 'home', 'policy.json') })
+    const handler = routes[0].handler
+
+    // 不带 cwd：只有全局那份，没有 workspace 段
+    const global = fakeHttp('GET', RECORD_CONFIG_PATH)
+    await handler(global.req, global.res)
+    const globalBody = JSON.parse(global.state.body)
+    expect(globalBody.settings.autoOpenTimeline).toBe(true)
+    expect(globalBody.workspace).toBeUndefined()
+
+    // 带 cwd：workspace 段给出本工作区的生效值（还没存过 → 跟随全局，scoped=false）
+    const read = fakeHttp('GET', RECORD_CONFIG_PATH + '?cwd=' + encodeURIComponent(projectDir))
+    await handler(read.req, read.res)
+    expect(JSON.parse(read.state.body).workspace).toEqual({ cwd: projectDir, autoOpenTimeline: true, scoped: false })
+
+    // 只改本工作区：落进 <cwd>/.dsh-auto-pass/policy.json 的 prefs，不写设置命名空间
+    const write = fakeHttp('POST', RECORD_CONFIG_PATH, JSON.stringify({ autoOpenTimeline: false, cwd: projectDir }))
+    await handler(write.req, write.res)
+    expect(write.state.code).toBe(200)
+    expect(JSON.parse(write.state.body).workspace).toEqual({ cwd: projectDir, autoOpenTimeline: false, scoped: true })
+    expect(JSON.parse(readFileSync(join(projectDir, '.dsh-auto-pass', 'policy.json'), 'utf8')).prefs)
+      .toEqual({ autoOpenTimeline: false })
+
+    // 另一个工作区不受影响（仍然跟随全局）
+    const other = fakeHttp('GET', RECORD_CONFIG_PATH + '?cwd=' + encodeURIComponent(otherDir))
+    await handler(other.req, other.res)
+    expect(JSON.parse(other.state.body).workspace).toEqual({ cwd: otherDir, autoOpenTimeline: true, scoped: false })
+
+    // 不带 cwd 的 POST 才是「改全局默认」：这个假宿主没有可写 settings，所以如实 503（证明它没走工作区那条路）
+    const globalWrite = fakeHttp('POST', RECORD_CONFIG_PATH, JSON.stringify({ autoOpenTimeline: false }))
+    await handler(globalWrite.req, globalWrite.res)
+    expect(globalWrite.state.code).toBe(503)
+    expect(JSON.parse(readFileSync(join(projectDir, '.dsh-auto-pass', 'policy.json'), 'utf8')).prefs)
+      .toEqual({ autoOpenTimeline: false })
+
+    // 项目写盘失败（cwd 指向一个文件）：降级走全局设置那条路，不再抛错也不再写项目文件
+    const blocked = join(root, 'blocked-cwd')
+    writeFileSync(blocked, 'x', 'utf8')
+    const blockedWrite = fakeHttp('POST', RECORD_CONFIG_PATH, JSON.stringify({ autoOpenTimeline: true, cwd: blocked }))
+    await handler(blockedWrite.req, blockedWrite.res)
+    expect(blockedWrite.state.code).toBe(503)
   })
 
   it('时间线上手填的匹配条件原样写入，不再让模型改写；不覆盖本次动作的手填条件当场拒绝', async () => {

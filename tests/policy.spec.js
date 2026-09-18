@@ -844,6 +844,21 @@ describe('policy store', () => {
     writeFileSync(file, JSON.stringify({ version: 1, rules: { allow: [], deny: [] }, counters: {}, threshold: 7 }), 'utf8')
     expect(createPolicyStore({ globalFile: file, counterDir, warn: () => {} }).threshold()).toBe(7)
   })
+
+  it('工作区偏好 prefs 落进项目策略文件：没 cwd 写不进去，重启读得回来', () => {
+    const instance = store()
+    expect(instance.pref(cwd, 'autoOpenTimeline')).toBeUndefined()
+    expect(instance.setPref(cwd, 'autoOpenTimeline', false)).toBe(true)
+    expect(instance.pref(cwd, 'autoOpenTimeline')).toBe(false)
+    // 与项目规则同一份文件；全局策略文件不该因为写工作区偏好而被创建
+    expect(JSON.parse(readFileSync(projectPolicyFile(cwd), 'utf8')).prefs).toEqual({ autoOpenTimeline: false })
+    expect(existsSync(globalFile)).toBe(false)
+    // 别的工作区读不到这份；没有 cwd 时写失败（调用方据此回落全局设置）
+    expect(instance.pref(join(root, 'another'), 'autoOpenTimeline')).toBeUndefined()
+    expect(instance.setPref(undefined, 'autoOpenTimeline', true)).toBe(false)
+    // 重启后从项目文件读回
+    expect(store().pref(cwd, 'autoOpenTimeline')).toBe(false)
+  })
 })
 
 describe('observe（连续计数与升级建议）', () => {

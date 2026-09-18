@@ -312,7 +312,12 @@ describe('审批记录路由', () => {
     const saved = fakeHttp('POST', '/api/dsh-auto-pass/config', JSON.stringify({ placement: 'sidebar' }))
     await routes[0].handler(saved.req, saved.res)
     expect(saved.state.code).toBe(200)
-    expect(JSON.parse(saved.state.body)).toEqual({ ok: true, settings: { placement: 'sidebar' } })
+    // 回执与 GET 同形状（整份快照）：客户端写完之后要能直接套用，包括本工作区那段
+    expect(JSON.parse(saved.state.body)).toMatchObject({
+      ok: true,
+      settings: { notice: true, denyDirect: false, autoOpenTimeline: true, askRejectReason: true },
+      writable: true,
+    })
     expect(settings.updates).toEqual([['dsh-auto-pass', { placement: 'sidebar' }]])
 
     const bad = fakeHttp('POST', '/api/dsh-auto-pass/config', JSON.stringify({ placement: 'nope' }))

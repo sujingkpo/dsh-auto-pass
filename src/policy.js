@@ -15,6 +15,8 @@
  * @modify 2026-09-15 路径前缀支持单层通配：matchRule 认最后一段里的 *（不跨目录），validatePathPattern 明确拒绝 ** / ? / [] / 中段 * / 无目录的通配
  * @modify 2026-09-16 连续计数不再无限膨胀：条目记 at（最后更新时刻），启动时清掉「双侧 0 且未 dismissed」的死条目，新增 pruneCounters 压到 DEFAULT_MAX_COUNTERS（500）以内（先淘汰最久未用的活动条目，dismissed 最后才动）
  * @modify 2026-09-16 计数按工作区拆成 counters/<slug>.json（用户要求）：pruneCounters 改成单工作区口径、新增 canonicalizeMemoryCounters / defaultCounterDir / COUNTER_FILE_VERSION；启动时把老全局文件里的 `<cwd>\u0000<memoryKey>` 计数迁移过去并折算瘦身
+ * @modify 2026-09-18 项目策略文件多一段 prefs（工作区级界面偏好，目前只有 autoOpenTimeline），
+ *   新增 pref / setPref：跟项目规则同一份文件，所以「这个工作区要不要自动开时间线」跟着项目走
  */
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -720,9 +722,19 @@ export function projectPolicyFile(cwd) {
     : undefined
 }
 
-/** 空策略文档。`counters` 只在读老文件时出现（历史形态的计数全塞在全局文件里），迁走之后就不再写它。 */
+/**
+ * 空策略文档。`counters` 只在读老文件时出现（历史形态的计数全塞在全局文件里），迁走之后就不再写它。
+ * `prefs` 放**工作区级**的界面偏好（目前只有 autoOpenTimeline）：与项目规则同一份文件，
+ * 所以「这个工作区要不要自动打开审批时间线」跟着项目走，不污染全局设置（用户 2026-09-18 要求）。
+ */
 function emptyDoc() {
-  return { version: POLICY_FILE_VERSION, rules: { allow: [], deny: [] }, counters: {}, thresholds: {} }
+  return {
+    version: POLICY_FILE_VERSION,
+    rules: { allow: [], deny: [] },
+    counters: {},
+    thresholds: {},
+    prefs: {},
+  }
 }
 
 /** 未启用策略能力时的替身：一律「没有命中」，写入静默失败。 */
@@ -739,6 +751,8 @@ export const noopPolicyStore = Object.freeze({
     global: Object.freeze({ allow: [], deny: [] }),
     project: undefined,
   }),
+  pref: () => undefined,
+  setPref: () => false,
   addRule: () => ({ ok: false, error: 'policy store disabled' }),
   updateRule: () => ({ ok: false, error: 'policy store disabled' }),
   removeRule: () => false,
@@ -829,6 +843,10 @@ export function createPolicyStore(options = {}) {
         if (Number.isSafeInteger(parsed.thresholds?.allow) && parsed.thresholds.allow >= 1) doc.thresholds.allow = parsed.thresholds.allow
         if (Number.isSafeInteger(parsed.thresholds?.deny) && parsed.thresholds.deny >= 1) doc.thresholds.deny = parsed.thresholds.deny
         if (Number.isSafeInteger(parsed.threshold) && parsed.threshold >= 1) doc.thresholds.allow = parsed.threshold
+        // 工作区级界面偏好：只透传 JSON 里的原始值，键的合法性由调用方（pref / setPref）约束
+        if (parsed.prefs !== null && typeof parsed.prefs === 'object' && !Array.isArray(parsed.prefs)) {
+          doc.prefs = { ...parsed.prefs }
+        }
       }
       return doc
     } catch (error) {
@@ -977,6 +995,31 @@ export function createPolicyStore(options = {}) {
   function projectDoc(cwd) {
     const file = projectPolicyFile(cwd)
     return file === undefined ? undefined : { file, doc: docFor(file) }
+  }
+
+  /**
+   * 读一个工作区的界面偏好（存在该项目策略文件的 prefs 里）。
+   * 没有 cwd、或这个工作区没写过 → undefined，调用方回落到全局设置页那份值。
+   * @param cwd 工作区目录
+   * @param key 偏好键（目前只有 autoOpenTimeline）
+   * @returns {*} 存下来的值；没有时 undefined
+   */
+  function pref(cwd, key) {
+    const project = projectDoc(cwd)
+    const value = project?.doc?.prefs?.[key]
+    return value === undefined ? undefined : value
+  }
+
+  /**
+   * 写一个工作区的界面偏好（与项目规则同一份文件，第一次写会创建 <cwd>/.dsh-auto-pass/policy.json）。
+   * **没有 cwd 时返回 false**：调用方要么回落到全局设置，要么如实报错，绝不静默丢掉用户的选择。
+   * @returns {boolean} 是否落盘成功
+   */
+  function setPref(cwd, key, value) {
+    const project = projectDoc(cwd)
+    if (project === undefined) return false
+    project.doc.prefs = { ...project.doc.prefs, [key]: value }
+    return write(project.file, project.doc) === true
   }
 
   function view(doc) {
@@ -1228,6 +1271,9 @@ export function createPolicyStore(options = {}) {
       }
     },
     /** 命中查询：黑名单优先（deny 永远压过 allow），其次项目、最后全局。 */
+    /** 工作区级界面偏好：读 / 写该工作区项目策略文件里的 prefs（见上面那两个函数）。 */
+    pref,
+    setPref,
     /** 落一条白/黑名单规则（时间线升级/降级与记忆自动升级都走这里）。 */
     addRule,
     /** 改一条已有规则（面板里微调匹配条件/标签，按 id 原地更新）。 */
