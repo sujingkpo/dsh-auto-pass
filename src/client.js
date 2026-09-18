@@ -754,6 +754,14 @@ window.__ModuleLoader__.load({
         // 指纹值 + 「复制指纹」按钮（排查区也能一键复制整串；长串单行截断，整串仍挂在 title 上）
         '.ap-fingerprintValue{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:100%}',
         '.ap-fingerprintShort{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+        // 表单里的指纹值走「折行全显示」（用户 2026-09-18 从预览页选定，候选A）：.ap-field 是 fit-content
+        // 的 flex 行，里面那句 max-width:100% 在这种容器里不生效——真机上长指纹会溢出卡片右缘，把
+        // 「复制指纹」整个挤出卡外（截图复现）。所以值那一行必须是**宽度确定**的行（ap-fieldFill），
+        // 值自己占满一行再折行（ap-fingerprintText），按钮因此永远留在卡内。
+        '.ap-fieldFill{width:100%;min-width:0;align-items:flex-start}',
+        '.ap-fieldFill>.ap-fieldKey{padding-top:2px}',
+        '.ap-fingerprintWrap{display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0;max-width:100%}',
+        '.ap-fingerprintText{flex:1 1 100%;min-width:0;white-space:normal;overflow-wrap:anywhere}',
         '.ap-rowMain{flex:auto;min-width:0;display:flex;flex-direction:column;gap:1px}',
         '.ap-rowTop{display:flex;align-items:center;gap:6px;min-width:0}',
         // 行尾徽标组（自动写入标识 + 结论 + 结果）：margin-left:auto 顶到最右——
@@ -1431,15 +1439,26 @@ window.__ModuleLoader__.load({
      * 权限指纹的只读展示：一行可视化 + 「复制指纹」按钮，原始串只挂 title。
      * **不把原始串塞进输入框**：那串里全是 NUL 分隔符，浏览器把每个 NUL 画成一个方框（真机反馈
      * 「像乱码」），而且选中复制会丢分隔符——所以显示走渲染，整串复制走剪贴板 API。
+     * `wrap: true` = 表单里那种**折行全显示**形态（用户 2026-09-18 从预览页选定）：指纹可能上百字符，
+     * 单行截断在 300–340px 的侧栏里读不到它到底在授权什么，而它又不能手改、只能看。
+     * 不传 `wrap` 就是原来的单行截断（「排查信息」里那一行仍用它：那儿只要一眼核对）。
+     * @param value 指纹串
+     * @param wrap 是否折行显示（表单里用；默认单行截断）
      */
-    function FingerprintValue({ value }) {
+    function FingerprintValue({ value, wrap }) {
       const raw = String(value ?? '')
+      const wrapped = wrap === true
       const [note, setNote] = react.useState('')
       const copy = () => {
         void copyText(raw).then(ok => setNote(ok ? t.copiedFingerprint : t.copyFingerprintFailed))
       }
-      return react.createElement('span', { className: 'ap-fingerprintValue', title: raw },
-        react.createElement('span', { className: 'ap-mono ap-fingerprintShort' }, fingerprintShort(raw)),
+      return react.createElement('span', {
+        className: wrapped ? 'ap-fingerprintValue ap-fingerprintWrap' : 'ap-fingerprintValue',
+        title: raw,
+      },
+        react.createElement('span', {
+          className: wrapped ? 'ap-mono ap-fingerprintText' : 'ap-mono ap-fingerprintShort',
+        }, fingerprintShort(raw)),
         react.createElement('button', { type: 'button', className: 'ap-btn', onClick: copy }, t.copyFingerprint),
         note !== '' && react.createElement('span', { className: 'ap-note' }, note))
     }
@@ -1772,12 +1791,14 @@ window.__ModuleLoader__.load({
               title: kindApplicable(record, kind) === true ? undefined : t.ruleKindUnavailable(kindLabel(kind)),
               onClick: () => chooseKind(kind),
             }, kindLabel(kind))))),
-        react.createElement('div', { className: 'ap-field' },
+        // 指纹那一行的宽度必须是确定的（ap-fieldFill）：fit-content 的行里长指纹会溢出卡片、
+        // 把「复制指纹」挤出卡外（真机截图复现），折行形态要靠确定宽度才折得对
+        react.createElement('div', { className: draft.kind === 'signature' ? 'ap-field ap-fieldFill' : 'ap-field' },
           react.createElement('span', { className: 'ap-fieldKey' }, t.ruleValue),
           // 权限指纹：显示渲染后的可视化 + 一键复制（原始串含 NUL，塞进输入框会显示成方框）；
-          // 别的条件才是可编辑的输入框
+          // 别的条件才是可编辑的输入框。指纹不能手改、又常常上百字符，表单里折行全显示
           draft.kind === 'signature'
-            ? react.createElement(FingerprintValue, { value: draft.value })
+            ? react.createElement(FingerprintValue, { value: draft.value, wrap: true })
             : react.createElement('input', {
               className: 'ap-input ap-inputWide',
               'aria-label': t.ruleValue,
@@ -2253,7 +2274,7 @@ window.__ModuleLoader__.load({
             onClick: () => chooseKind(kind),
           }, kindLabel(kind)))),
         draft.kind === 'signature'
-          ? react.createElement(FingerprintValue, { value: draft.value })
+          ? react.createElement(FingerprintValue, { value: draft.value, wrap: true })
           : react.createElement('input', {
             className: 'ap-input ap-inputWide',
             'aria-label': t.ruleValue,

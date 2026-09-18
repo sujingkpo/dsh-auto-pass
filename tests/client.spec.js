@@ -993,6 +993,19 @@ describe('客户端半加载与注册', () => {
       && node?.props?.['aria-label'] === '匹配值')).toHaveLength(0)
     expect(JSON.stringify(rendered.tree)).toContain('pwsh · pnpm test · sandbox_permissions=danger-full-access')
     expect(JSON.stringify(rendered.tree)).toContain('权限指纹由插件算出、不能手改')
+    // 表单里的指纹值走「折行全显示」（用户 2026-09-18 从预览页选定）：值那一行的宽度必须是确定的
+    // （ap-fieldFill）——.ap-field 是 fit-content 的 flex 行，长指纹在那里会溢出卡片右缘、把
+    // 「复制指纹」整个挤出卡外（真机截图复现）；值自己占满一行再折（ap-fingerprintText）
+    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-field ap-fieldFill').length)
+      .toBeGreaterThan(0)
+    const wrapValue = findNodes(rendered.tree, node => node?.props?.className === 'ap-fingerprintValue ap-fingerprintWrap')
+    expect(wrapValue.length).toBeGreaterThan(0)
+    expect(wrapValue[0].props.title).toBe(key)
+    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-mono ap-fingerprintText').length)
+      .toBeGreaterThan(0)
+    // 排查区那一行故意保持单行截断：那儿只要一眼核对，不跟表单一起折行
+    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-mono ap-fingerprintShort').length)
+      .toBeGreaterThan(0)
   })
 
   it('展开详情先给决定依据：技术字段收在默认收起的「排查信息」里', async () => {
@@ -1234,6 +1247,9 @@ describe('客户端半加载与注册', () => {
     const dump = JSON.stringify(rendered.tree)
     expect(dump).toContain('bash · npm test · sandbox_permissions=danger-full-access')
     expect(dump).toContain('权限指纹由插件算出、不能手改')
+    // 编辑行里的指纹与时间线那块表单同一套控件：同样折行全显示（长串不再溢出编辑行）
+    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-mono ap-fingerprintText').length)
+      .toBeGreaterThan(0)
   })
 
   it('设置面板：命令前缀规则切不成「权限指纹」（没有指纹可填，按钮禁用且点了也不动）', async () => {
@@ -1814,7 +1830,9 @@ describe('升级/降级的查重文案', () => {
     const form = findNodes(rendered.tree, node => node?.props?.className === 'ap-actions')[0]
     expect(form).toBeDefined()
     // 三行编辑各带**可见标签**（用户 2026-09-18 选定；原先两个输入框只有 aria-label，界面上看不出哪栏是什么）
-    expect(findNodes(form, node => node?.props?.className === 'ap-field')
+    // 匹配值那一行在指纹形态下多一个 ap-fieldFill（宽度确定，长指纹才折得对，见下一条用例）
+    expect(findNodes(form, node => node?.props?.className === 'ap-field'
+      || node?.props?.className === 'ap-field ap-fieldFill')
       .map(row => row.children?.[0]?.children?.[0])).toEqual(['匹配条件', '匹配值', '规则标签'])
     // 作用域只选一次（data-scope），两个动作按钮共用它
     expect(findNodes(form, node => node?.props?.['data-scope'] !== undefined)
