@@ -15,6 +15,8 @@
  * @modify 2026-09-15 规则默认命令前缀：没有可用模型建议时用 defaultRuleOf（有命令就 command_prefix）；审批记录按工作区分文件
  * @modify 2026-09-16 加入名单可撤销：addRule/updateRule 回执带上被顶掉的旧规则快照，记录写进 ruleApplied，
  *   新增 POST /api/dsh-auto-pass/rule/revert 还原；日志与界面都把被删/被改的规则列清楚
+ * @modify 2026-09-18 达阈值自动写入的那条规则把来源一起记进 ruleApplied.optimizedBy
+ *   （record=审查模型的建议 / signature=本次动作的权限指纹）：审批时间线的折叠行据此标出标识
  */
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -1563,21 +1565,24 @@ function updateRecord(ctx, records, recordId, patch) {
  * @param policies 策略存储
  * @param records 审批记录存储
  * @param options cwd / recordId / rule / list / scope / auto（true = 达阈值自动写入，没问过用户）
+ *   / optimizedBy（规则条件来自哪条路：record = 本次审查里模型的建议，signature = 本次动作的权限指纹）
  * @returns {object|undefined} addRule 的回执（写失败时 undefined）
  */
-function enrollRule(ctx, policies, records, { cwd, recordId, rule, list, scope, auto }) {
+function enrollRule(ctx, policies, records, { cwd, recordId, rule, list, scope, auto, optimizedBy }) {
   const added = policies.addRule({ scope, list, rule: { ...rule, source: rule.source ?? 'model' } }, cwd)
   if (added.ok !== true) {
     ctx.logger.warn('dsh-auto-pass: 写入规则失败：' + safeLogValue(String(added.error)))
     return undefined
   }
-  const applied = buildRuleApplied(added, list, undefined)
+  // optimizedBy 一起写进记录（时间线的折叠行与详情据此说明条件是从哪来的）
+  const applied = buildRuleApplied(added, list, optimizedBy)
   // auto 标记只给时间线看：这条规则是**没问过用户**直接写进去的，同样带撤销凭据
   updateRecord(ctx, records, recordId, { ruleApplied: auto === true ? { ...applied, auto: true } : applied })
   ctx.logger.info('dsh-auto-pass: ' + (auto === true ? '连续计数达阈值，自动写入规则' : '用户确认后已写入规则')
     + ' list=' + list + ' scope=' + added.scope
     + ' replaced=' + String(added.replaced === true) + ' covered=' + String(added.covered === true)
     + ' merged=' + String(added.merged ?? 0) + ' dropped=' + safeLogValue(droppedRuleLabels(added).join(' | '))
+    + ' by=' + String(optimizedBy ?? '?')
     + ' label=' + safeLogValue(rule.label))
   return added
 }
@@ -1588,6 +1593,8 @@ function enrollRule(ctx, policies, records, { cwd, recordId, rule, list, scope, 
  * 直接把匹配条件写进（优先本项目的）白名单，不再人工确认；而「把这类请求钉死成永远转人工」
  * 是收紧动作，仍旧弹卡等用户拍板。
  * 整条流程是**旁路**：在审批结论已经确定之后异步执行，既不改变结论，也不阻塞这次工具调用。
+ * 用的条件是「模型建议」还是「权限指纹兜底」会一起写进记录的 `ruleApplied.optimizedBy`
+ * （2026-09-18 新增）：审批时间线据此在折叠行上标出标识。
  */
 async function proposeRule(ctx, policies, records, request, options) {
   const { config, language, signature, cwd, suggestion, decision, recordId } = options
@@ -1606,6 +1613,9 @@ async function proposeRule(ctx, policies, records, request, options) {
     ctx.logger.warn('dsh-auto-pass: 没有可用的匹配条件，跳过规则确认 signature=' + safeLogValue(signature.text))
     return
   }
+  // 条件是从哪来的（时间线的折叠行与详情据此标出「模型建议 / 权限指纹」）：
+  // record = 本次审查里模型顺带给的建议规则，signature = 模型建议不可用、回落到本次动作的权限指纹
+  const optimizedBy = usable === true ? 'record' : 'signature'
   // 白名单：不再问用户，直接写入。有工作区就写项目名单，没有就写全局（与原来问卡时的首选一致）
   if (suggestion.list === 'allow') {
     enrollRule(ctx, policies, records, {
@@ -1615,6 +1625,7 @@ async function proposeRule(ctx, policies, records, request, options) {
       list: 'allow',
       scope: typeof cwd === 'string' && cwd !== '' ? 'project' : 'global',
       auto: true,
+      optimizedBy,
     })
     return
   }
@@ -1677,6 +1688,7 @@ async function proposeRule(ctx, policies, records, request, options) {
     list: suggestion.list,
     scope: chosen.scope,
     auto: false,
+    optimizedBy,
   })
 }
 

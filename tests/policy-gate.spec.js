@@ -391,6 +391,8 @@ describe('权限记忆（白名单达阈值自动写入、黑名单询问用户�
     expect(patch.ruleApplied.auto).toBe(true)
     expect(patch.ruleApplied.list).toBe('allow')
     expect(patch.ruleApplied.ruleId).toBe(rules[0].id)
+    // 条件来自哪条路也写进记录：时间线的折叠行据此标出「模型建议」/「权限指纹」
+    expect(patch.ruleApplied.optimizedBy).toBe('record')
   })
 
   it('连续放行达到阈值后自动写入白名单：用审查那次的模型建议，不额外叫模型', async () => {
@@ -448,8 +450,9 @@ describe('权限记忆（白名单达阈值自动写入、黑名单询问用户�
         },
       },
     })
+    const records = { add: vi.fn(() => ({ id: 'record-1' })), update: vi.fn(), list: () => [], size: () => 0 }
     const handler = createAutoApprovalHandler(
-      ctx, resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' }), undefined, policies)
+      ctx, resolveConfig({ reviewerProvider: 'p', reviewerModel: 'm' }), records, policies)
     const approve = () => vi.fn().mockResolvedValue('allowed-once')
 
     expect(await handler(requestWith({ cwd: projectDir }), approve())).toBe('allowed-once')
@@ -463,6 +466,10 @@ describe('权限记忆（白名单达阈值自动写入、黑名单询问用户�
     expect(rules).toHaveLength(1)
     expect(rules[0].match.kind).toBe('signature')
     expect(rules[0].match.value).toBe(signatureOf(requestWith({ command: 'npm test' }), exactAction(requestWith({ command: 'npm test' }))).key)
+    // 兜底路写进记录的条件来源是 signature：时间线据此标「权限指纹」（而不是「模型建议」）
+    const patch = records.update.mock.calls.at(-1)[1]
+    expect(patch.ruleApplied.auto).toBe(true)
+    expect(patch.ruleApplied.optimizedBy).toBe('signature')
   })
 
   it('黑名单确认卡上写的是这次动作的可读摘要，不是含 NUL 的机器指纹', async () => {
