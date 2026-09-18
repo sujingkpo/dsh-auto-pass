@@ -343,8 +343,12 @@ async function loadClient() {
   return registrations[0]
 }
 
-/** 造一个够客户端半用的假宿主：记录槽位注册、可提供右侧栏座位。 */
-function harness() {
+/**
+ * 造一个够客户端半用的假宿主：记录槽位注册、可提供右侧栏座位。
+ * @param {object} [options] 选项
+ * @param {boolean} [options.legacySidebar] 右侧栏服务不给 isExpanded（模拟老宿主）
+ */
+function harness(options = {}) {
   const slotRegistrations = []
   const tabRegistrations = []
   const slots = {
@@ -373,9 +377,17 @@ function harness() {
       }),
     },
   }
-  // 右侧栏导航面替身：自动打开时间线就是调它的 openTab(kind)
+  // 右侧栏导航面替身：自动打开时间线就是调它的 openTab(kind)；isExpanded 模拟宿主
+  // 「整栏是否展开」——收起才允许自动展开，展开着（= 用户停在其他侧边工具上）不许抢。
+  // 真实 openTab 内部会 planSetExpanded(true)（读 dsh-client-ui-sidebar-right 源码确认），替身照做。
   const openTabs = []
-  const sidebarRight = { openTab: kind => { openTabs.push(kind) } }
+  const sidebar = { expanded: false }
+  const sidebarRight = options.legacySidebar === true
+    ? { openTab: kind => { openTabs.push(kind); sidebar.expanded = true } }
+    : {
+      openTab: kind => { openTabs.push(kind); sidebar.expanded = true },
+      isExpanded: () => sidebar.expanded,
+    }
   const ctx = {
     get: name => (name === 'slots' ? slots
       : name === 'sessions' ? sessions
@@ -386,7 +398,7 @@ function harness() {
     },
     effect: fn => fn(),
   }
-  return { ctx, slots, slotRegistrations, tabRegistrations, openTabs }
+  return { ctx, slots, slotRegistrations, tabRegistrations, openTabs, sidebar }
 }
 
 /**
@@ -2125,7 +2137,7 @@ describe('审批触发后自动打开右侧栏时间线', () => {
   /** 与客户端半的 POLL_MS 对齐：观察器每 3 秒看一次当前会话的最新记录。 */
   const POLL = 3_000
 
-  it('首次观测只记基线；新审批出现且时间线没打开才展开；已打开则不抢焦点', async () => {
+  it('首次观测只记基线；侧栏收起才自动展开；已显示或停在其他工具上都不抢焦点', async () => {
     vi.useFakeTimers()
     waitTick = () => vi.advanceTimersByTimeAsync(0)
     try {
@@ -2135,7 +2147,7 @@ describe('审批触发后自动打开右侧栏时间线', () => {
         if (specifier === 'react') return react
         throw new Error('unexpected require: ' + specifier)
       })
-      const { ctx, slotRegistrations, openTabs } = harness()
+      const { ctx, slotRegistrations, openTabs, sidebar } = harness()
       /** 当前 /log 的返回：观察器只看第一条记录的 id。 */
       let records = [{ id: 'record-history', sessionId: SESSION_KNOWN }]
       logResponder = () => records
@@ -2150,10 +2162,12 @@ describe('审批触发后自动打开右侧栏时间线', () => {
       await tick(POLL)
       expect(openTabs).toEqual([])
 
-      // 触发了一次审批（最新记录的 id 变了）→ 时间线没打开，于是自动展开
+      // 触发了一次审批（最新记录的 id 变了）+ 右侧栏收起着 → 自动展开
+      // （真实 openTab 会把侧栏展开，替身照做，后面的用例才和真机同一形态）
       records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN }, ...records]
       await tick(POLL)
       expect(openTabs).toEqual(['dsh-auto-pass-log'])
+      expect(sidebar.expanded).toBe(true)
 
       // 时间线已经显示在眼前（面板挂载 + tab 可见）：再来一次审批也不抢焦点
       const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
@@ -2165,9 +2179,52 @@ describe('审批触发后自动打开右侧栏时间线', () => {
       await tick(POLL)
       expect(openTabs).toEqual(['dsh-auto-pass-log'])
 
-      // 侧栏被收起 / 切到了别的 tab（面板卸载）后，下一次审批会重新展开
+      // 用户切到别的侧边工具（时间线面板卸载，但侧栏整体仍然展开着）：新审批绝不把他切回来
+      // —— 这正是 2026-09-18 修掉的「主动聚焦」（宿主 openTab 会 focusTab 回时间线）
       for (const cleanup of rendered.cleanups) cleanup()
+      records = [{ id: 'record-switched', sessionId: SESSION_KNOWN }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log'])
+
+      // 用户自己把侧栏整栏收起（没在用侧栏）→ 下一次审批重新自动展开
+      sidebar.expanded = false
       records = [{ id: 'record-latest', sessionId: SESSION_KNOWN }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log', 'dsh-auto-pass-log'])
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
+  })
+
+  it('老宿主没有 isExpanded 时保持旧行为：时间线没显示就展开', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, openTabs, sidebar } = harness({ legacySidebar: true })
+      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN }]
+      logResponder = () => records
+      moduleExports.apply(ctx)
+      const tick = async (ms) => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+
+      await tick(POLL)
+      expect(openTabs).toEqual([])
+      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log'])
+      // 侧栏展开、时间线面板已卸载：拿不到状态就照旧尽力打开
+      sidebar.expanded = true
+      records = [{ id: 'record-switched', sessionId: SESSION_KNOWN }, ...records]
       await tick(POLL)
       expect(openTabs).toEqual(['dsh-auto-pass-log', 'dsh-auto-pass-log'])
     } finally {

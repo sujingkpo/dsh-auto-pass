@@ -291,7 +291,7 @@ window.__ModuleLoader__.load({
         denyDirectTitle: '黑名单直接拒绝',
         denyDirectHint: '命中黑名单时直接把这次调用判为拒绝（工具调用失败），不再弹人工审批卡',
         autoOpenTitle: '自动打开审批时间线',
-        autoOpenHint: '触发审批时自动展开审批时间线；已显示时不抢焦点',
+        autoOpenHint: '触发审批时自动展开审批时间线；已显示、或右侧栏正停在其他工具上时不打扰',
         askReasonTitle: '拒绝后追问理由',
         askReasonHint: '你拒绝一次审批后，插件问一句拒绝理由并注入模型上下文（默认选项就是本次的模型审批意见）',
         saveFailed: '保存失败',
@@ -305,7 +305,7 @@ window.__ModuleLoader__.load({
         placementTab: '只保留审批设置',
         placementSidebar: '只保留时间线',
         placementAll: '两处都显示',
-        panelCardDesc: '面板显示在哪里，以及四个行为开关：是否把审批结果注入模型上下文、命中黑名单是否直接拒绝、本会话第一次审批时是否自动打开审批时间线、人工拒绝后是否追问一句拒绝理由。',
+        panelCardDesc: '面板显示在哪里，以及四个行为开关：是否把审批结果注入模型上下文、命中黑名单是否直接拒绝、侧栏收起时是否自动展开审批时间线（已显示或停在其他工具上时不打扰）、人工拒绝后是否追问一句拒绝理由。',
       },
       en: {
         timelineTab: 'Approval timeline',
@@ -466,7 +466,7 @@ window.__ModuleLoader__.load({
         denyDirectTitle: 'Reject on denylist',
         denyDirectHint: 'A denylist hit fails the tool call outright instead of opening a human approval card',
         autoOpenTitle: 'Open the approval timeline automatically',
-        autoOpenHint: 'Open the approval timeline when an approval is triggered; when it is already visible it stays put',
+        autoOpenHint: 'Open the approval timeline when an approval is triggered; it stays put while the timeline is visible or the sidebar is on another tool',
         askReasonTitle: 'Ask for a rejection reason',
         askReasonHint: 'After you reject an approval, the plugin asks for a reason and injects it into the model context (the model review note is the default answer)',
         saveFailed: 'Save failed',
@@ -480,7 +480,7 @@ window.__ModuleLoader__.load({
         placementTab: 'Policy only',
         placementSidebar: 'Timeline only',
         placementAll: 'Both',
-        panelCardDesc: 'Where the panels live, plus four behaviour switches: inject approval results into the context, reject on a denylist hit, open the approval timeline automatically for this session’s first approval, and ask for a rejection reason after you reject one.',
+        panelCardDesc: 'Where the panels live, plus four behaviour switches: inject approval results into the context, reject on a denylist hit, expand the approval timeline automatically while the sidebar is collapsed (it stays put when the timeline shows or another tool is on screen), and ask for a rejection reason after you reject one.',
       },
     }
     const t = COPY[ZH ? 'zh' : 'en']
@@ -897,6 +897,27 @@ window.__ModuleLoader__.load({
     /** 审批观察器：seen 记每个会话上一次看到的最新记录 id（判断有没有出现新审批），timer 是轮询句柄。 */
     const approvalWatch = { seen: new Map(), timer: undefined }
 
+    /**
+     * 右侧栏此刻是不是整栏展开着。
+     *
+     * 用来把两种「时间线没显示在眼前」分开：整栏收起（用户没在用侧栏）与「展开着但停在其他
+     * 侧边工具上」。用户 2026-09-18 选定的口径只允许前者自动打开，后者绝不切走他的视图。
+     *
+     * 为什么必须问宿主、不能从面板自己推：切到别的 tab 时时间线面板会卸载，它的
+     * useTabInfo 也就停了，插件手上只剩「上次肯定是可见的」这种过期信息。
+     * @returns {boolean|undefined} 展开/收起；宿主没提供这个方法（老版本）时返回 undefined = 状态未知
+     */
+    function sidebarExpanded() {
+      try {
+        const service = typeof clientCtx?.get === 'function' ? clientCtx.get('sidebarRight') : undefined
+        if (service === null || typeof service !== 'object' || typeof service.isExpanded !== 'function') return undefined
+        return service.isExpanded() === true
+      } catch (error) {
+        console.warn(LOG, '读取右侧栏展开状态失败', error)
+        return undefined
+      }
+    }
+
     /** 当前会话 id：来自宿主 sessions 服务的列表快照（拿不到返回 undefined）。 */
     function currentSessionId() {
       try {
@@ -912,10 +933,10 @@ window.__ModuleLoader__.load({
     /**
      * 看一次「当前会话有没有刚触发的审批」。
      *
-     * 判定规则（用户 2026-09-15 选定）：**只要触发审批、且审批列表没打开，就自动打开**。
-     * 所以这里没有「本会话只开一次」的记忆：approvalWatch.seen 只用来发现「最新一条记录的 id 变了」，
-     * 变了就说明刚发生了审批。**首次观测只记基线**——页面刷新后会话里往往已经堆着历史记录，
-     * 那不是「刚触发的审批」，不该把时间线弹开。
+     * 判定规则全部交给 maybeAutoOpenTimeline（用户 2026-09-18 修订）：触发审批 + 时间线没显示在眼前
+     * + 右侧栏整栏收起时才自动打开。所以这里没有「本会话只开一次」的记忆：approvalWatch.seen
+     * 只用来发现「最新一条记录的 id 变了」，变了就说明刚发生了审批。**首次观测只记基线**——
+     * 页面刷新后会话里往往已经堆着历史记录，那不是「刚触发的审批」，不该把时间线弹开。
      * 观察器与面板无关：用户停在「轨迹」标签页、或 placement 只挂右侧栏时同样会触发
      * （旧实现把探针写在「拿不到项目目录」的分支里，正常情况根本不执行，等于没生效）。
      * @returns {Promise<void>} 无返回值；任何失败只记日志，绝不影响面板自身
@@ -948,11 +969,13 @@ window.__ModuleLoader__.load({
     /**
      * 触发审批后自动展开右侧栏的「审批时间线」。
      *
-     * 判定规则（用户 2026-09-15 选定）：**只要触发审批、且审批列表没打开，就自动打开**——
-     * 时间线已经显示在眼前时什么都不做（不抢焦点）；没显示（tab 从没打开过、切到了别的 tab、
-     * 或者侧栏被收起）就展开它。真正展开靠官方 sidebarRight 服务的 openTab
-     * （dsh-client-ui-sidebar-right 的 openContent 内部会 planSetExpanded(true)，右侧栏因此自动展开），
-     * 不需要自己拼 layout 调用。
+     * 判定规则（用户 2026-09-18 修订）：时间线已经显示在眼前时什么都不做；**侧栏展开着却停在
+     * 别的侧边工具上时也不动它**——只有右侧栏整栏收起才自动展开（用户选定的口径是「收起侧栏才
+     * 自动展开，停在其他工具上绝不把他切走」）。
+     * 真正展开靠官方 sidebarRight 服务的 openTab（dsh-client-ui-sidebar-right 的 openContent 内部会
+     * planSetExpanded(true)，右侧栏因此自动展开），不需要自己拼 layout 调用；也正因为宿主这个入口
+     * **没有「只展开不聚焦」的参数**——我们的 tab 已在面板里时它必然补一个 focusTab——「不该抢」
+     * 就只能靠插件自己不调用它（读宿主源码确认，2026-09-18）。
      * @param {string} sessionId 触发这次展开的会话（只用于信标与日志）
      * @returns {void} 无返回值；任何失败只影响这次自动展开
      */
@@ -960,6 +983,10 @@ window.__ModuleLoader__.load({
       if (runtimeStore.autoOpenTimeline !== true) return
       if (mountState.sidebar === undefined) return
       if (mountState.timelineShown === true) return
+      // 侧栏展开着 = 用户正在用侧栏里的别的东西（时间线没显示已经由上一行保证了）：
+      // 这时宿主 openTab 会把他的 tab 切回时间线，正是 2026-09-18 要修掉的「主动聚焦」。
+      // 状态未知（老宿主没有 isExpanded）时保持旧行为，尽力打开。
+      if (sidebarExpanded() === true) return
       /** 开一次时间线；服务不可用或抛错时返回 false（调用方只重试一次）。 */
       const attempt = () => {
         try {
