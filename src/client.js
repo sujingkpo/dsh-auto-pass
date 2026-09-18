@@ -25,6 +25,29 @@
  *   覆盖命中（没写入任何条目）不给撤销；设置面板编辑规则也会列出被合并掉的窄规则
  * @modify 2026-09-16 权限指纹只读 + 可视化：原始串（含 NUL）不再显示/不再靠选中复制——
  *   界面显示渲染后的文案，整串复制走「复制指纹」按钮（剪贴板 API）；详情里拆成工具/命令/额外参数
+ * @modify 2026-09-18 达阈值自动加入白名单的记录在折叠行就给标识（RuleAutoBadge）：
+ *   标出条件来源是审查模型的建议还是本次动作的权限指纹；覆盖命中时说明没新增条目
+ * @modify 2026-09-18 展开详情重排成两层（用户要求：引导优先 + 排查折叠）——明面只留决定依据，
+ *   「这次写没写规则」合并成一张 RuleCard（含撤销，替代原「已应用」字段与 UndoRule 行），
+ *   「加入名单」表单与「排查信息」（全部技术字段）默认收起；两个入口的开合状态放在 RecordRow 上
+ * @modify 2026-09-18 按预览页（preview/detail-options.html）选定的「融合版」定稿：结论条
+ *   （.ap-callout + 风险/授权/命中/连续计数 chip）+「依据」分组 + 规则卡 + 底部右对齐的两个文字入口；
+ *   命中规则并进结论条 chip（t.policyHit 删除），Reviewer 行改挂审查模型路由
+ * @modify 2026-09-18 第二轮（同样先出预览页）：加入名单表单改成「三行可见标签 + 作用域选一次 + 两个动作按钮」
+ *   （t.promote/t.demote 与 4 个作用域按钮删除），排查信息改成两组（这次动作 / 审查与用量）+ 去重
+ *   —— 去掉「工具」「签名摘要」「已自动升级」与 Reviewer 的「0 steps」，「一个字段都不删」这条被用户推翻
+ * @modify 2026-09-18 第三轮（预览页 timeline-*.html 逐项定稿后落地）时间线整体重排：
+ *   ① 列表骨架：左侧 18px 轨道（竖线 + 按结论着色的圆点）+ 按天分组（t.dayToday/dayYesterday，日期进组标题、
+ *      行头只留时分秒）+ **两行行头**（时间 · 工具 · 来源 chip ·（+白名单）· 结论/结果徽标 ／ 审批意见）；
+ *      时间**紧贴圆点**（行头不留左内边距、展开箭头删除，整行就是按钮），「第几轮第几步」撤出折叠行；
+ *      命中规则说明进 chip 的 tooltip（与审批意见只能留一个）
+ *   ② 展开态：整块背景把轨道/圆点/时间一起包进来（.ap-item.open::before，用伪元素避免把 8px 记录间隔也染上），
+ *      行头与详情之间一条分割线且整条跨过去（.ap-detailBox 负 margin 顶到面板左边缘），展开块圆点放大到 10px；
+ *      RuleAutoBadge 由长句压成短标记（+白名单 / 白名单已覆盖），条件来源仍留在 tooltip
+ *   ③ 两块改「卡头即入口」（FoldCard）：卡头行本身就是开关（data-ui 仍挂在它上面），
+ *      底部那行重复的文字入口（.ap-detailFoot / .ap-btnGhost）删除；正文用函数传入，收起时不构造元素
+ *   ④ 移除「本次会话 / 全部会话」切换（面板固定看本次会话），记录字段与宿主 /log 接口一律保留——
+ *      随之删掉会话名那行小字（.ap-session）与 t.scopeSession / t.scopeAll，sessionNameOf 成为死代码被删
  */
 window.__ModuleLoader__.load({
   id: 'dsh-auto-pass',
@@ -98,8 +121,9 @@ window.__ModuleLoader__.load({
         guideDescription: '自动审批的自动批准与转人工记录，可一键升级为白名单或降级为黑名单',
         title: '审批时间线',
         subtitle: '最新的在最上面',
-        scopeSession: '本次会话',
-        scopeAll: '全部会话',
+        // 按天分组（用户 2026-09-18 定）：日期交给组标题，行头里只留时分秒
+        dayToday: '今天',
+        dayYesterday: '昨天',
         reload: '刷新',
         empty: '还没有审批记录',
         loading: '加载中…',
@@ -116,7 +140,6 @@ window.__ModuleLoader__.load({
         rationale: '审批意见',
         action: '动作',
         latency: '耗时',
-        reviewer: 'Reviewer',
         tokens: 'Token 消耗',
         usageIn: '输入',
         usageOut: '输出',
@@ -124,17 +147,15 @@ window.__ModuleLoader__.load({
         reason: '审批原因',
         time: '时间',
         signature: '权限指纹',
-        signatureText: '签名摘要',
+        // 「签名摘要」不在界面上了（用户 2026-09-18：与「工具 + 命令」同义，排查区去重时删掉）
         suggestedRule: '模型建议规则',
-        policyHit: '命中规则',
+        // 命中规则不再单独占一行：并进「结论条」的 chip（见 kvChip 与 calloutChips）
         hitAllow: '白名单',
         hitDeny: '黑名单',
         filterAll: '全部',
         filterAuto: '自动',
         filterHuman: '人工',
         filterEmpty: '没有符合筛选条件的记录',
-        promoted: '已自动升级',
-        applied: '已应用',
         approvals: '连续放行',
         denials: '连续被拒',
         decidedAuto: '自动',
@@ -149,8 +170,9 @@ window.__ModuleLoader__.load({
         decidedHumanTitle: '人工审批通过或拒绝',
         ruleAsk: '规则询问',
         ruleDeclined: '已询问，未加入',
-        promote: '升级为白名单',
-        demote: '降级为黑名单',
+        // 「加入名单」表单的两个动作按钮（用户 2026-09-18 从预览页选定：4 个作用域按钮收成「作用域 + 两个动作」）
+        actionAllow: '以后直接放行',
+        actionDeny: '以后直接转人工',
         scopeProject: '本项目',
         scopeGlobal: '全局',
         working: '处理中…',
@@ -159,7 +181,45 @@ window.__ModuleLoader__.load({
         appliedFallback: '已加入（没有可用的模型建议，已回落到本次动作的权限指纹）',
         appliedReplaced: labels => '（已更新同名规则' + (labels === '' || labels === undefined ? '' : '：' + labels) + '）',
         appliedCovered: '（已有规则已覆盖这个动作，未重复添加）',
-        appliedAuto: '（连续放行达阈值，自动加入，未询问）',
+        appliedAuto: by => '（连续放行达阈值，自动加入，未询问'
+          + (by === 'record' ? '；条件来自审查模型的建议' : by === 'signature' ? '；条件是本次动作的权限指纹' : '') + '）',
+        // 达阈值触发自动写入、但已有规则已覆盖这次动作（一条都没写进去）：只说这一句，
+        // 免得「未重复添加」紧接着「自动加入」这种自相矛盾的读法
+        appliedAutoCovered: '（连续放行达阈值，但已有规则覆盖这次动作，未新增条目）',
+        // 折叠行的标识（用户 2026-09-18 要求，第二次调整口径）：不用展开就能看到这条记录顺手把规则
+        // 写进了白名单。行头压到两行之后只放得下短标记（`+白名单`），条件来源（模型建议 / 权限指纹）
+        // 与作用域 + 规则标签一并挪进 tooltip（见 ruleAutoTitle）；覆盖命中时如实说明没新增条目。
+        ruleAutoBadge: list => (list === 'deny' ? '+黑名单' : '+白名单'),
+        ruleAutoCovered: list => (list === 'deny' ? '黑名单已覆盖' : '白名单已覆盖'),
+        ruleAutoTitle: (by, detail) => '连续放行达阈值后自动写入白名单，未询问'
+          + (by === 'record' ? '；条件来自审查模型的建议' : by === 'signature' ? '；条件是本次动作的权限指纹' : '')
+          + '：' + detail,
+        // 覆盖命中那次的 tooltip：达阈值确实触发了自动写入，但一条都没写进去——不能照抄上面那句
+        ruleAutoCoveredTitle: detail => '连续放行达阈值触发了自动写入，但已有规则已覆盖这次动作、未新增条目：' + detail,
+        // 规则卡上的条件来源标（用户 2026-09-18）：先分清「没问过你直接写的」与「你确认后写的」，再说条件从哪来
+        ruleSourceAutoRecord: '自动 · 模型建议',
+        ruleSourceAutoFingerprint: '自动 · 权限指纹',
+        ruleSourceRecord: '模型建议',
+        ruleSourceModel: '模型优化',
+        ruleSourceManual: '你手填的',
+        // 「加入名单」与「排查信息」两块（用户 2026-09-18 最后定「卡头即入口」）：
+        // 卡头那一行就是开关，底部不再有第二处文字入口（那是同一件事的两处文字）
+        blockRuleTitle: '加入名单',
+        blockRuleHint: '写一条规则，以后按它匹配',
+        blockDebugTitle: '排查信息',
+        blockDebugHint: '对账用，平时不用看',
+        // 「结论条」与「依据」分组（用户 2026-09-18 从预览页选定「融合版」）
+        // 认不出来的等级返回 undefined：命中黑名单 / 老记录根本没有 risk_level，别说成「?风险」
+        riskWord: level => ({ low: '低', medium: '中', high: '高', critical: '极高' }[level]),
+        calloutLead: (verdict, riskWord) => (riskWord === undefined ? verdict : verdict + ' · ' + riskWord + '风险'),
+        groupBasis: '依据',
+        chipHit: label => '命中 ' + label,
+        // 「加入名单」表单的作用域（用户 2026-09-18 选定：A 的行 + B 的按钮）
+        formScope: '作用域',
+        // 「排查信息」的两组小标题（用户 2026-09-18 选定：分组 + 去重）
+        debugGroupAction: '这次动作',
+        debugGroupReview: '审查与用量',
+        reviewModel: '审查模型',
         appliedMerged: (count, labels) => '（已合并 ' + String(count) + ' 条被它覆盖的窄规则'
           + (labels === '' || labels === undefined ? '' : '：' + labels) + '）',
         appliedManual: '已按你填写的条件加入',
@@ -168,7 +228,7 @@ window.__ModuleLoader__.load({
         ruleUndoLabel: '本次加入的规则',
         ruleDropped: labels => '顶掉了：' + labels,
         ruleUndone: '已撤销，名单已还原',
-        ruleDraftLabel: '加入名单的规则',
+        // 表单不再有独立标题（用户 2026-09-18：每行左侧已给可见标签，标题是多余的一层）
         ruleKind: '匹配条件',
         ruleValue: '匹配值',
         ruleLabelField: '规则标签',
@@ -195,7 +255,7 @@ window.__ModuleLoader__.load({
         sourceMemory: '记忆',
         kindSignature: '权限指纹',
         // 权限指纹是机器算出来的串：界面上只读，并按它的结构摊开给人看（用户 2026-09-16 要求）
-        fingerprintTool: '工具',
+        // 指纹摊开的明细不再单独列「工具」（用户 2026-09-18：指纹行本身就以工具名开头）
         fingerprintCommand: '命令',
         fingerprintArgs: '参数',
         fingerprintExtra: '额外参数',
@@ -253,8 +313,8 @@ window.__ModuleLoader__.load({
         guideDescription: 'Auto Approve auto-approvals and hand-offs; promote or demote each one',
         title: 'Approval timeline',
         subtitle: 'newest first',
-        scopeSession: 'This session',
-        scopeAll: 'All sessions',
+        dayToday: 'Today',
+        dayYesterday: 'Yesterday',
         reload: 'Refresh',
         empty: 'No approvals recorded yet',
         loading: 'Loading…',
@@ -271,7 +331,6 @@ window.__ModuleLoader__.load({
         rationale: 'Rationale',
         action: 'Action',
         latency: 'Latency',
-        reviewer: 'Reviewer',
         tokens: 'Token usage',
         usageIn: 'in',
         usageOut: 'out',
@@ -279,17 +338,15 @@ window.__ModuleLoader__.load({
         reason: 'Approval reason',
         time: 'Time',
         signature: 'Permission fingerprint',
-        signatureText: 'Signature summary',
+        // the readable signature summary is no longer shown (it duplicates tool + command)
         suggestedRule: 'Suggested rule',
-        policyHit: 'Matched rule',
+        // the matched rule is no longer a row of its own: it becomes a chip in the callout
         hitAllow: 'Allowlist',
         hitDeny: 'Denylist',
         filterAll: 'All',
         filterAuto: 'Auto',
         filterHuman: 'Human',
         filterEmpty: 'No records match the filters',
-        promoted: 'Auto-promoted',
-        applied: 'Applied',
         approvals: 'Consecutive approvals',
         denials: 'Consecutive denials',
         decidedAuto: 'auto',
@@ -304,8 +361,8 @@ window.__ModuleLoader__.load({
         decidedHumanTitle: 'approved or rejected by the human',
         ruleAsk: 'Rule prompt',
         ruleDeclined: 'Asked, not added',
-        promote: 'Promote to allowlist',
-        demote: 'Demote to denylist',
+        actionAllow: 'Allow it from now on',
+        actionDeny: 'Hand it to me from now on',
         scopeProject: 'This project',
         scopeGlobal: 'Global',
         working: 'Working…',
@@ -314,7 +371,32 @@ window.__ModuleLoader__.load({
         appliedFallback: 'Added (no usable model suggestion; fell back to this action\u2019s permission fingerprint)',
         appliedReplaced: labels => ' (updated the existing rule' + (labels === '' || labels === undefined ? '' : ': ' + labels) + ')',
         appliedCovered: ' (already covered by an existing rule; nothing added)',
-        appliedAuto: ' (auto-added after the consecutive-approval threshold, no prompt)',
+        appliedAuto: by => ' (auto-added after the consecutive-approval threshold, no prompt'
+          + (by === 'record' ? '; the condition came from the review model suggestion' : by === 'signature' ? '; the condition is this action\u2019s permission fingerprint' : '') + ')',
+        appliedAutoCovered: ' (auto-add threshold reached, but an existing rule already covers this action; nothing added)',
+        ruleAutoBadge: list => (list === 'deny' ? '+denylist' : '+allowlist'),
+        ruleAutoCovered: list => (list === 'deny' ? 'denylist covered' : 'allowlist covered'),
+        ruleAutoTitle: (by, detail) => 'auto-added to the allowlist at the consecutive-approval threshold, no prompt'
+          + (by === 'record' ? '; the condition came from the review model suggestion' : by === 'signature' ? '; the condition is this action\u2019s permission fingerprint' : '')
+          + ': ' + detail,
+        ruleAutoCoveredTitle: detail => 'the auto-add threshold was reached, but an existing rule already covers this action; nothing was added: ' + detail,
+        ruleSourceAutoRecord: 'auto \u00b7 review suggestion',
+        ruleSourceAutoFingerprint: 'auto \u00b7 fingerprint',
+        ruleSourceRecord: 'review suggestion',
+        ruleSourceModel: 'model-optimized',
+        ruleSourceManual: 'your own condition',
+        blockRuleTitle: 'Add to a list',
+        blockRuleHint: 'write a rule future calls match',
+        blockDebugTitle: 'Debug info',
+        blockDebugHint: 'for reconciliation, not for daily use',
+        riskWord: level => ({ low: 'low', medium: 'medium', high: 'high', critical: 'critical' }[level]),
+        calloutLead: (verdict, riskWord) => (riskWord === undefined ? verdict : verdict + ' \u00b7 ' + riskWord + ' risk'),
+        groupBasis: 'Basis',
+        chipHit: label => 'matched ' + label,
+        formScope: 'Scope',
+        debugGroupAction: 'This action',
+        debugGroupReview: 'Review & usage',
+        reviewModel: 'Review model',
         appliedMerged: (count, labels) => ' (merged ' + String(count) + ' narrower rule(s) it covers'
           + (labels === '' || labels === undefined ? '' : ': ' + labels) + ')',
         appliedManual: 'Added with the condition you wrote',
@@ -322,7 +404,7 @@ window.__ModuleLoader__.load({
         ruleUndoLabel: 'Rule added',
         ruleDropped: labels => 'Displaced: ' + labels,
         ruleUndone: 'Undone; the list was restored',
-        ruleDraftLabel: 'Rule to add',
+        // no separate form title: every row carries its own visible label
         ruleKind: 'Match kind',
         ruleValue: 'Match value',
         ruleLabelField: 'Rule label',
@@ -348,7 +430,7 @@ window.__ModuleLoader__.load({
         sourceModel: 'model',
         sourceMemory: 'memory',
         kindSignature: 'permission fingerprint',
-        fingerprintTool: 'Tool',
+        // no separate "tool" row: the fingerprint row already starts with the tool name
         fingerprintCommand: 'Command',
         fingerprintArgs: 'Arguments',
         fingerprintExtra: 'Extra arguments',
@@ -536,7 +618,10 @@ window.__ModuleLoader__.load({
       const tag = document.createElement('style')
       tag.id = 'dsh-auto-pass-style'
       tag.textContent = [
-        '.ap-root{box-sizing:border-box;flex:auto;min-height:0;height:100%;display:flex;flex-direction:column;color:var(--dsw-alias-label-primary);font-size:13px}',
+        // box-sizing 只写在 .ap-root 上是不会被子元素继承的：面板里凡「width:100% + 内边距」的盒子
+        // 在 content-box 下都会把内边距加到宽度之外（实测折叠行因此超出 100%）——面板内部统一 border-box
+        '.ap-root,.ap-root *{box-sizing:border-box}',
+        '.ap-root{flex:auto;min-height:0;height:100%;display:flex;flex-direction:column;color:var(--dsw-alias-label-primary);font-size:13px}',
         // 对话区面板：内容列与消息列同宽并居中（--dsh-chat-content-width 由会话根元素下发，取不到时回退 748px）
         // 右侧栏 chip 标题：图标 + 文案（标题席位 key 与 tab id 同名）
         '.ap-tabTitle{display:inline-flex;align-items:center;gap:6px;min-width:0}',
@@ -570,21 +655,54 @@ window.__ModuleLoader__.load({
         '.ap-chip[data-on="1"]{border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-state-business-primary)}',
         '.ap-chipCount{color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}',
         '.ap-chip[data-on="1"] .ap-chipCount{color:inherit}',
-        '.ap-list{flex:auto;min-height:0;overflow-y:auto;margin:0;padding:4px 0 12px;list-style:none}',
-        '.ap-row{border-bottom:1px solid var(--dsw-alias-border-l1)}',
-        '.ap-rowHead{width:100%;appearance:none;border:0;background:0 0;font:inherit;text-align:left;color:inherit;display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer}',
-        '.ap-rowHead:hover{background:var(--dsw-alias-bg-layer-2)}',
+        // 时间线列表（用户 2026-09-18 从预览页定稿）：左侧 18px 轨道列（竖线 + 按结论着色的圆点）
+        // + 内容列；按天分组的标题占整行。记录之间用**内边距**留白——用外边距的话竖线会在缝隙处断开
+        // 列表自身留出左右 12px 边距（与头部/筛选条对齐）：轨道、按天分组、展开的整块背景与分割线
+        // 都以它为界，不再贴着面板边缘（用户 2026-09-18：两侧边距再大一点）
+        '.ap-list{flex:auto;min-height:0;overflow-y:auto;margin:0;padding:2px 12px 12px;list-style:none}',
+        // 每条记录都铺一个圆角块（::before，见下面展开那条的说明）：平时透明，
+        // hover 时浮现（带过渡）、展开时常驻——所以 hover 的底色天然把轨道和圆点一起包进去
+        '.ap-item{position:relative;isolation:isolate;display:grid;grid-template-columns:18px 1fr}',
+        '.ap-item::before{content:"";position:absolute;left:0;right:0;top:0;bottom:8px;border-radius:8px;background:0 0;z-index:-1;transition:background-color .15s ease}',
+        '.ap-item:not(.gap)::before{bottom:0}',
+        '.ap-item:hover::before,.ap-item.open::before{background:var(--dsw-alias-bg-layer-2)}',
+        '.ap-item.gap{padding-bottom:8px}',
+        '.ap-rail{position:relative}',
+        '.ap-railLine{position:absolute;left:8px;top:0;bottom:0;width:1px;background:var(--dsw-alias-border-l2)}',
+        '.ap-item.isFirst .ap-railLine{top:14px}',
+        '.ap-item.isLast .ap-railLine{bottom:auto;height:14px}',
+        // 圆点的尺寸与光环都带过渡：展开时放大到 10px、hover 时光环跟着块的底色走
+        '.ap-dot{position:absolute;left:5px;top:12px;width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-label-tertiary);box-shadow:0 0 0 3px var(--dsw-alias-bg-layer-3);transition:width .15s ease,height .15s ease,left .15s ease,top .15s ease,background-color .15s ease,box-shadow .15s ease}',
+        '.ap-dot[data-tone="ok"]{background:var(--dsw-alias-state-success-primary)}',
+        '.ap-dot[data-tone="warn"]{background:var(--dsw-alias-state-warn-primary)}',
+        '.ap-dot[data-tone="dim"]{background:var(--dsw-alias-border-l4)}',
+        '.ap-item:hover .ap-dot,.ap-item.open .ap-dot{box-shadow:0 0 0 3px var(--dsw-alias-bg-layer-2)}',
+        '.ap-dayGroup{padding:6px 0 4px;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:14px;letter-spacing:.04em;border-top:1px solid var(--dsw-alias-border-l1);margin-top:4px}',
+        '.ap-body{min-width:0}',
+        // 折叠行：时间紧贴圆点（行内左右边距由列表与详情的留白统一给，也不再放展开箭头——整行就是按钮）
+        // width:100% 必须保留：.ap-rowHead 是 <button>，button 的宽度默认按内容收缩（不像块级元素那样撑满），
+        // 删掉它会让行尾徽标组全部失去右对齐（margin-left:auto 没有空间可用）；
+        // 面板已统一 border-box，100% + 内边距不会再溢出
+        '.ap-rowHead{width:100%;appearance:none;border:0;background:0 0;font:inherit;text-align:left;color:inherit;display:flex;align-items:flex-start;padding:7px 10px 7px 0;cursor:pointer}',
         '.ap-time{flex:none;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;font-size:11px;line-height:16px}',
         '.ap-tool{flex:none;font-family:var(--dsw-font-family-mono,ui-monospace,monospace);font-size:12px}',
-        '.ap-turnStep{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;font-variant-numeric:tabular-nums}',
         '.ap-badge{flex:none;border-radius:8px;padding:0 6px;font-size:11px;line-height:16px}',
         '.ap-badgeOk{color:var(--dsw-alias-state-success-primary);background:var(--dsw-alias-state-success-tertiary)}',
         '.ap-badgeWarn{color:var(--dsw-alias-state-warn-primary);background:var(--dsw-alias-state-warn-tertiary)}',
         '.ap-badgeMuted{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-base)}',
         // 「自动」标签用业务色，「人工」标签用中性色：与命中名单的绿/黄区分开
         '.ap-badgeInfo{color:var(--dsw-alias-state-business-primary);background:var(--dsw-alias-state-business-tertiary)}',
-        '.ap-chevron{flex:none;color:var(--dsw-alias-label-tertiary)}',
-        '.ap-detail{padding:0 12px 10px;display:flex;flex-direction:column;gap:4px}',
+        // 展开的那条记录（用户 2026-09-18 定）：背景块常驻（hover 规则已统一到上面），行头保持透明；
+        // 行头与详情之间只留一条分割线，且这条线整条跨过去（详情用负 margin 顶到列表内容区的左边缘，
+        // 再用 padding 推回内容列）。背景画在 ::before 上而不是给 li 染色：li 的高度含下面 8px 记录间隔，
+        // 直接染会和下一条糊在一起。
+        '.ap-item.open .ap-rowHead{background:0 0}',
+        // 圆点展开时放大（尺寸/光环的过渡见 .ap-dot）
+        '.ap-item.open .ap-dot{left:3.5px;top:10.5px;width:10px;height:10px}',
+        // 详情：内容与右边缘之间留 10px（用户 2026-09-18：结论条、两张卡都顶着最右边了）；
+        // 展开时淡入 + 轻微下滑（只作用于插入那一刻，轮询重渲染不会重播）
+        '.ap-detailBox{display:flex;flex-direction:column;gap:4px;border-top:1px solid var(--dsw-alias-border-l1);padding:8px 10px 10px 18px;margin:0 0 0 -18px;min-width:0;animation:ap-detail-in .18s ease}',
+        '@keyframes ap-detail-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}',
         '.ap-field{display:flex;gap:6px;align-items:baseline}',
         '.ap-fieldKey{flex:none;min-width:5.5em;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}',
         '.ap-fieldVal{min-width:0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere;white-space:pre-wrap}',
@@ -594,18 +712,56 @@ window.__ModuleLoader__.load({
         // 记录详情的操作区：竖着一行一行来（规则编辑器一行、两个操作各一行、状态提示一行），
         // 之前是一整排 flex-wrap，控件一多就横七竖八（用户反馈「按钮排版好乱」）
         '.ap-actions{display:flex;flex-direction:column;gap:6px;align-items:flex-start;padding-top:4px;min-width:0}',
+        // 表单提示（指纹只读 / 草稿来源 / 通配符口径 / 校验错误）：挤成一小块，行距比控件之间更紧
+        '.ap-hints{display:flex;flex-direction:column;gap:2px;min-width:0}',
         '.ap-actionRow{display:flex;flex-wrap:wrap;align-items:center;gap:6px;width:100%;min-width:0}',
         '.ap-actionsLabel{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;min-width:5.5em}',
         '.ap-note{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}',
         '.ap-warn{color:var(--dsw-alias-state-warn-primary)}',
-        '.ap-rowMain{flex:auto;min-width:0;display:flex;flex-direction:column;gap:2px}',
-        '.ap-rowTop{display:flex;align-items:center;gap:8px;min-width:0}',
-        '.ap-opinion{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;text-align:left;overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical}',
-        // 标签行（决策来源 / 命中名单共用）：chip + 说明文字，折叠态就能看见
-        '.ap-hitRow{display:flex;align-items:center;gap:6px;min-width:0}',
-        '.ap-hitText{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;min-width:0;overflow-wrap:anywhere}',
-        // 「全部会话」时记录最下面的一行会话名：小字、单行截断，不与审批意见/标签行抢视觉
-        '.ap-session{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;padding:0 12px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}',
+        // 「这次写没写规则」卡：一件事一个落点（用户 2026-09-18），撤销按钮贴着它撤销的那条规则
+        '.ap-ruleCard{display:flex;flex-direction:column;gap:4px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;padding:6px 8px;margin-top:2px;min-width:0}',
+        '.ap-ruleCardMuted{color:var(--dsw-alias-label-tertiary)}',
+        // 「标签优先」（用户 2026-09-18 选定）：规则标签独占一行且加粗，badge 让到下一行
+        '.ap-ruleCardLabel{min-width:0;color:var(--dsw-alias-label-primary);font-size:12px;font-weight:600;line-height:18px;overflow-wrap:anywhere}',
+        // 结论条（用户 2026-09-18 从预览页选定「融合版」）：结论 + 风险/授权/命中/连续计数一眼可见
+        '.ap-callout{display:flex;flex-direction:column;gap:4px;padding:7px 9px;border-radius:8px;margin-top:2px}',
+        '.ap-callout[data-tone="ok"]{background:var(--dsw-alias-state-success-tertiary)}',
+        '.ap-callout[data-tone="warn"]{background:var(--dsw-alias-state-warn-tertiary)}',
+        '.ap-calloutTop{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}',
+        '.ap-calloutLead{font-size:12px;font-weight:600;line-height:18px}',
+        '.ap-callout[data-tone="ok"] .ap-calloutLead{color:var(--dsw-alias-state-success-primary)}',
+        '.ap-callout[data-tone="warn"] .ap-calloutLead{color:var(--dsw-alias-state-warn-primary)}',
+        // chip 的值可能很长（命中名单带标签），单行截断 + title 挂全文
+        '.ap-kvChip{flex:none;max-width:100%;font-size:11px;line-height:16px;padding:0 6px;border-radius:8px;background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+        // 「依据」分组：小标题 + 1px 分隔线，与上面的结论条分开（别再糊成一坨）
+        '.ap-group{display:flex;flex-direction:column;gap:4px;padding-top:6px;border-top:1px solid var(--dsw-alias-border-l1);margin-top:2px;min-width:0}',
+        '.ap-groupCaption{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:14px;letter-spacing:.04em}',
+        // 「加入名单」/「排查信息」两块（用户 2026-09-18 最终定「卡头即入口」）：卡头行本身就是开关，
+        // 行尾一个 ▸/▾，内容展开时才渲染——底部不再有第二处文字入口
+        '.ap-blockCard{display:flex;flex-direction:column;gap:5px;width:100%;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;padding:7px 8px;margin-top:6px;min-width:0}',
+        '.ap-blockHead{appearance:none;border:0;background:0 0;color:inherit;font:inherit;width:100%;display:flex;align-items:baseline;gap:6px;padding:0;cursor:pointer;text-align:left;min-width:0}',
+        '.ap-blockHead:hover .ap-blockTitle{color:var(--dsw-alias-label-primary)}',
+        '.ap-blockTitle{flex:none;color:var(--dsw-alias-label-secondary);font-size:11px;font-weight:600;line-height:16px}',
+        '.ap-blockHint{min-width:0;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px;overflow-wrap:anywhere}',
+        // 行尾箭头（内联 SVG）：展开时旋转 90°（transition 让开合有动画），颜色跟随卡头的 hover 变化
+        '.ap-blockChevron{flex:none;align-self:center;margin-left:auto;color:var(--dsw-alias-label-tertiary);transition:transform .15s ease}',
+        '.ap-blockHead[aria-expanded="true"] .ap-blockChevron{transform:rotate(90deg)}',
+        // 「排查信息」展开后的字段区：缩进一层 + 左侧细线，不与上面的决定依据抢视觉
+        '.ap-debugBody{display:flex;flex-direction:column;gap:6px;padding-left:10px;border-left:2px solid var(--dsw-alias-border-l1);min-width:0}',
+        // 两个分组（用户 2026-09-18 从预览页选定）：这次动作 / 审查与用量——把 13 行平铺改成两组
+        '.ap-debugGroup{display:flex;flex-direction:column;gap:3px;min-width:0}',
+        '.ap-debugGroupCaption{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:14px;letter-spacing:.04em}',
+        // 指纹值 + 「复制指纹」按钮（排查区也能一键复制整串；长串单行截断，整串仍挂在 title 上）
+        '.ap-fingerprintValue{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:100%}',
+        '.ap-fingerprintShort{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+        '.ap-rowMain{flex:auto;min-width:0;display:flex;flex-direction:column;gap:1px}',
+        '.ap-rowTop{display:flex;align-items:center;gap:6px;min-width:0}',
+        // 行尾徽标组（自动写入标识 + 结论 + 结果）：margin-left:auto 顶到最右——
+        // 不用空的 grow span 撑开，那个空元素在真机上被宿主样式影响过（结论徽标不贴右）
+        '.ap-rowBadges{flex:none;display:inline-flex;align-items:center;gap:6px;margin-left:auto;min-width:0}',
+        '.ap-opinion{min-width:0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;text-align:left;overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical}',
+        // 规则卡里的 chip 行（作用域 + 条件来源）；折叠行的来源 chip 已经并进行头第一行
+        '.ap-hitRow{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}',
         '.ap-sectionTitle{font-size:12px;font-weight:600;line-height:18px}',
         '.ap-subTitle{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;margin-top:4px}',
         '.ap-ruleList{list-style:none;margin:4px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}',
@@ -614,7 +770,6 @@ window.__ModuleLoader__.load({
         '.ap-input{appearance:none;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:0 0;color:inherit;font:inherit;font-size:12px;line-height:18px;padding:2px 8px;width:5em}',
         // 规则编辑器（时间线的「加入名单的规则」与设置面板的编辑行）：条件分段按钮 + 值 + 标签一行，
         // 说明与校验提示另起一行（挤在同一行会盖住按钮）。条件不用原生 <select>：它的弹层在深色主题下白底黑字
-        '.ap-ruleBlock{display:flex;flex-direction:column;gap:4px;width:100%;min-width:0}',
         '.ap-ruleEditor{display:flex;flex-wrap:wrap;align-items:center;gap:6px;width:100%;min-width:0}',
         '.ap-ruleEditorRow{flex:1}',
         '.ap-inputWide{width:auto;flex:1;min-width:10em}',
@@ -846,30 +1001,6 @@ window.__ModuleLoader__.load({
         console.warn(LOG, '读取会话工作目录失败', error)
         return undefined
       }
-    }
-
-    /**
-     * 会话显示名：与 DSH 左侧会话列表同一份投影（durable title → 项目目录名 → 会话 id）。
-     * 「全部会话」视图下每条记录要在最下面标出属于哪个会话；历史会话可能不在当前列表快照里，
-     * 这时退回 id 的短形式（DSH 的会话 id 形如 session-<uuid>，去掉前缀再取 8 位），
-     * 保证不同会话仍能区分，而不是所有记录都空着。
-     */
-    function sessionNameOf(sessionId) {
-      if (typeof sessionId !== 'string' || sessionId === '') return undefined
-      try {
-        const sessions = typeof clientCtx?.get === 'function' ? clientCtx.get('sessions') : undefined
-        const snapshot = typeof sessions?.list?.getSnapshot === 'function' ? sessions.list.getSnapshot() : undefined
-        const row = snapshot !== null && typeof snapshot === 'object' && snapshot.byId !== undefined
-          ? snapshot.byId[sessionId]
-          : undefined
-        const displayTitle = row !== null && typeof row === 'object' ? row.displayTitle : undefined
-        if (typeof displayTitle === 'string' && displayTitle !== '') return displayTitle
-      } catch (error) {
-        console.warn(LOG, '读取会话名称失败', error)
-      }
-      // 8 位足以区分同机会话，又不至于把这行小字挤成两行
-      const bare = sessionId.startsWith('session-') ? sessionId.slice('session-'.length) : sessionId
-      return bare.length > 8 ? bare.slice(0, 8) : bare
     }
 
     /** 策略快照的客户端缓存：设置面板与时间线共用，任何变更广播给订阅者。 */
@@ -1228,7 +1359,7 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 指纹的分行明细（详情里用）：工具 / 命令（或参数）/ 额外参数。
+     * 指纹的分行明细（详情里用）：命令（或参数）/ 额外参数。
      * 解析不出来就返回空数组，只留详情里那一行原始 key。
      * @param value 指纹串
      * @returns {Array} Field 元素数组
@@ -1236,8 +1367,8 @@ window.__ModuleLoader__.load({
     function fingerprintFields(value) {
       const parsed = fingerprintOf(value)
       if (parsed === undefined) return []
+      // 不再单独列「工具」：上一行的指纹本身就是以 `工具 · 命令 · 额外参数` 开头（用户 2026-09-18 去重）
       return [
-        react.createElement(Field, { key: 'fingerprint-tool', label: t.fingerprintTool, value: parsed.tool }),
         react.createElement(Field, {
           key: 'fingerprint-head',
           label: parsed.command === undefined ? t.fingerprintArgs : t.fingerprintCommand,
@@ -1380,14 +1511,10 @@ window.__ModuleLoader__.load({
      */
     function VerdictBadge({ record }) {
       const allow = record.verdict === 'allow'
-      const label = allow
-        ? t.autoApproved
-        : record.verdict === 'blacklist-reject' ? t.denyRejected
-          : record.verdict === 'deny' ? t.referred : t.reviewFailed
       return react.createElement('span', {
         className: 'ap-badge ' + (allow ? 'ap-badgeOk' : 'ap-badgeWarn'),
         title: record.rationale ?? '',
-      }, label)
+      }, verdictLabelOf(record))
     }
 
     /** 人工侧结论的文案与徽标样式；没有人工结论时返回 undefined。 */
@@ -1410,11 +1537,33 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 折叠态那一行标签：「命中名单」与「决策来源」合并成一行——
-     * chip 是「名单·自动/人工」（没命中名单时只剩 自动/人工），说明文字是命中规则信息，
-     * 没命中时是决策含义（自动 = 模型自动审批；人工 = 人工审批通过/拒绝）。
+     * 折叠行的「规则自动写入」标识（用户 2026-09-18 要求）：达阈值自动写进白名单的那条记录，
+     * **不展开也能看到**这次顺手往名单里写了规则，并标出条件来源（模型建议 / 权限指纹）。
+     * 只认记录里的 `ruleApplied.auto === true`（宿主 `enrollRule` 只在自动写入时置它）；
+     * `covered === true`（已有规则覆盖这次动作、其实没写任何条目）时文案如实说明没新增，
+     * 用中性色——别让标识看起来像刚加了那条规则。
+     * 来源字段（`optimizedBy`）是 2026-09-18 才写进记录的：老记录没有时只显示「已自动加入白名单」。
      */
-    function TagRow({ record }) {
+    function RuleAutoBadge({ record }) {
+      const applied = record?.ruleApplied
+      if (applied === null || applied === undefined || applied.auto !== true) return null
+      const by = applied.optimizedBy
+      const covered = applied.covered === true
+      const list = applied.list === 'deny' ? 'deny' : 'allow'
+      const detail = scopeLabel(applied.scope) + ' · ' + String(applied.label ?? '')
+      return react.createElement('span', {
+        className: 'ap-badge ' + (covered ? 'ap-badgeMuted' : 'ap-badgeInfo'),
+        // 覆盖命中那次照抄「已写入」的说明会撒谎：tooltip 也分开写
+        title: covered ? t.ruleAutoCoveredTitle(detail) : t.ruleAutoTitle(by, detail),
+      }, covered ? t.ruleAutoCovered(list) : t.ruleAutoBadge(list))
+    }
+
+    /**
+     * 折叠行第一行里的「来源 / 命中」chip：命中名单时是「白名单·自动」这类，没命中时是「自动 / 人工」。
+     * 说明文字（命中规则「本项目 · 运行 vitest 测试」/ 决策含义）挂 tooltip——用户 2026-09-18 定的两行行头里，
+     * 第二行留给审批意见，两者只能留一个（见预览页取舍表）。
+     */
+    function HitChip({ record }) {
       const auto = decidedByOf(record) === 'auto'
       const policy = record.policy
       const listLabel = policy === undefined ? '' : (policy.list === 'allow' ? t.hitAllow : t.hitDeny)
@@ -1426,20 +1575,47 @@ window.__ModuleLoader__.load({
         ? (auto ? 'ap-badgeInfo' : 'ap-badgeMuted')
         : (policy.list === 'allow' ? 'ap-badgeOk' : 'ap-badgeWarn')
       return react.createElement('span', {
-        className: 'ap-hitRow',
-        title: auto ? t.decidedAutoTitle : t.decidedHumanTitle,
-      },
-        react.createElement('span', { className: 'ap-badge ' + badgeClass },
-          listLabel === '' ? sourceLabel : listLabel + '·' + sourceLabel),
-        react.createElement('span', { className: 'ap-hitText' }, text))
+        className: 'ap-badge ' + badgeClass,
+        title: (auto ? t.decidedAutoTitle : t.decidedHumanTitle) + '：' + text,
+      }, listLabel === '' ? sourceLabel : listLabel + '·' + sourceLabel)
     }
 
-    /** 时间戳格式化：完整时间放 title，行内只显示到秒。 */
-    function formatTime(value) {
+    /** 两位补零。 */
+    function pad2(n) {
+      return String(n).padStart(2, '0')
+    }
+
+    /**
+     * 日期分组标题（用户 2026-09-18 定「按天分组」）：今天 / 昨天 / 更早的用 `MM-DD`。
+     * 认不出时间的记录返回空串，调用方据此退化成不分组。
+     */
+    function dayLabelOf(value) {
+      const date = new Date(value)
+      if (Number.isNaN(date.getTime())) return ''
+      const midnight = d => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+      const today = midnight(new Date())
+      const target = midnight(date)
+      const DAY_MS = 24 * 60 * 60 * 1000
+      if (target === today) return t.dayToday
+      if (target === today - DAY_MS) return t.dayYesterday
+      return pad2(date.getMonth() + 1) + '-' + pad2(date.getDate())
+    }
+
+    /** 折叠行里的时间：按天分组之后不再重复日期，只留时分秒（完整时间戳挂 title 与「排查信息」）。 */
+    function clockLabel(value) {
       const date = new Date(value)
       if (Number.isNaN(date.getTime())) return String(value ?? '')
-      const pad = (n) => String(n).padStart(2, '0')
-      return pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds())
+      return pad2(date.getHours()) + ':' + pad2(date.getMinutes()) + ':' + pad2(date.getSeconds())
+    }
+
+    /**
+     * 轨道圆点的颜色（用户 2026-09-18 预览选定）：绿 = 自动批准；黄 = 转人工（还没人管）或黑名单直接拒；
+     * 灰 = 已经有人定夺过（人工批准 / 人工拒绝）。
+     */
+    function dotToneOf(record) {
+      if (record.verdict === 'allow') return 'ok'
+      if (record.verdict === 'deny') return 'warn'
+      return decidedByOf(record) === 'auto' ? 'warn' : 'dim'
     }
 
     /** 升级/降级按钮组：两种名单 × 两种作用域，作用域真值由宿主按记录里的 cwd 决定。 */
@@ -1449,6 +1625,8 @@ window.__ModuleLoader__.load({
       const [done, setDone] = react.useState(undefined)
       // 可调草稿：默认模型建议 / 本次动作的权限指纹，用户不满意就直接改（用户 2026-09-15 要求）
       const [draft, setDraft] = react.useState(() => ruleDraftOf(record))
+      // 作用域（用户 2026-09-18 选定）：两个动作按钮共用它
+      const [scope, setScope] = react.useState('project')
       const draftProblem = ruleDraftProblem(draft)
       const patch = next => setDraft(previous => ({ ...previous, ...next }))
       /** 这次动作用不上的条件（没有命令 / 没有路径）：按钮已禁用，这里给一行说明。 */
@@ -1528,49 +1706,69 @@ window.__ModuleLoader__.load({
             : done.optimizedBy === 'manual' ? t.appliedManual : t.appliedModel)
           + dedupeNote
           + '：' + String(done.rule?.label ?? '')
-      const scopeButtons = (list, className) => ['project', 'global'].map(scope => react.createElement('button', {
-        key: list + ':' + scope,
+      /**
+       * 作用域选择（用户 2026-09-18 从预览页选定）：原先 4 个按钮（2 个动作 × 2 个作用域）收成
+       * 「先选作用域、再点动作」——按钮少一半，点哪个会发生什么也更直白。
+       * 没有工作区的记录选「本项目」时由宿主按既有规则降级成全局，回执里的 scope 会如实回报。
+       */
+      const scopeSeg = react.createElement('span', { className: 'ap-seg', role: 'group', 'aria-label': t.formScope },
+        ...['project', 'global'].map(name => react.createElement('button', {
+          key: name,
+          type: 'button',
+          'data-scope': name,
+          'data-on': scope === name ? '1' : '0',
+          'aria-pressed': scope === name,
+          onClick: () => setScope(name),
+        }, name === 'project' ? t.scopeProject : t.scopeGlobal)))
+      /** 写入按钮：两个动作共用上面选中的作用域。 */
+      const actionButton = (list, className, label) => react.createElement('button', {
         type: 'button',
         className: 'ap-btn ' + className,
         disabled: busy || draftProblem !== undefined || typeof record.id !== 'string',
         onClick: () => run(list, scope),
-      }, scope === 'project' ? t.scopeProject : t.scopeGlobal))
+      }, label)
       return react.createElement('div', { className: 'ap-actions' },
-        // 匹配条件 / 值 / 标签都能改：默认填的是模型建议或本次动作的权限指纹，按钮按这里的内容写入。
+        // 三行编辑：匹配条件 / 匹配值 / 规则标签，每行左侧给**可见标签**（用户 2026-09-18 选定）——
+        // 原先两个输入框只有 aria-label，界面上看不出哪栏是值、哪栏是标签。
         // 匹配条件用自带的分段按钮，不用原生 <select>：原生下拉的弹层在深色主题下是白底黑字（用户反馈）
-        react.createElement('span', { className: 'ap-actionsLabel' }, t.ruleDraftLabel),
-        react.createElement('div', { className: 'ap-ruleBlock' },
-          react.createElement('div', { className: 'ap-ruleEditor' },
-            react.createElement('div', { className: 'ap-seg', role: 'group', 'aria-label': t.ruleKind },
-              ...MATCH_KIND_ORDER.map(kind => react.createElement('button', {
-                key: kind,
-                type: 'button',
-                'data-kind': kind,
-                'data-on': draft.kind === kind ? '1' : '0',
-                'aria-pressed': draft.kind === kind,
-                // 这次动作没有命令 / 路径时对应条件禁用：那种规则永远命不中
-                disabled: kindApplicable(record, kind) !== true,
-                title: kindApplicable(record, kind) === true ? undefined : t.ruleKindUnavailable(kindLabel(kind)),
-                onClick: () => chooseKind(kind),
-              }, kindLabel(kind)))),
-            // 权限指纹：显示渲染后的可视化 + 一键复制（原始串含 NUL，塞进输入框会显示成方框）；
-            // 别的条件才是可编辑的输入框
-            draft.kind === 'signature'
-              ? react.createElement(FingerprintValue, { value: draft.value })
-              : react.createElement('input', {
-                className: 'ap-input ap-inputWide',
-                'aria-label': t.ruleValue,
-                title: draft.value,
-                value: draft.value,
-                onChange: event => patch({ value: event.target.value }),
-              }),
-            react.createElement('input', {
+        react.createElement('div', { className: 'ap-field' },
+          react.createElement('span', { className: 'ap-fieldKey' }, t.ruleKind),
+          react.createElement('div', { className: 'ap-seg', role: 'group', 'aria-label': t.ruleKind },
+            ...MATCH_KIND_ORDER.map(kind => react.createElement('button', {
+              key: kind,
+              type: 'button',
+              'data-kind': kind,
+              'data-on': draft.kind === kind ? '1' : '0',
+              'aria-pressed': draft.kind === kind,
+              // 这次动作没有命令 / 路径时对应条件禁用：那种规则永远命不中
+              disabled: kindApplicable(record, kind) !== true,
+              title: kindApplicable(record, kind) === true ? undefined : t.ruleKindUnavailable(kindLabel(kind)),
+              onClick: () => chooseKind(kind),
+            }, kindLabel(kind))))),
+        react.createElement('div', { className: 'ap-field' },
+          react.createElement('span', { className: 'ap-fieldKey' }, t.ruleValue),
+          // 权限指纹：显示渲染后的可视化 + 一键复制（原始串含 NUL，塞进输入框会显示成方框）；
+          // 别的条件才是可编辑的输入框
+          draft.kind === 'signature'
+            ? react.createElement(FingerprintValue, { value: draft.value })
+            : react.createElement('input', {
               className: 'ap-input ap-inputWide',
-              'aria-label': t.ruleLabelField,
-              title: draft.label,
-              value: draft.label,
-              onChange: event => patch({ label: event.target.value }),
+              'aria-label': t.ruleValue,
+              title: draft.value,
+              value: draft.value,
+              onChange: event => patch({ value: event.target.value }),
             })),
+        react.createElement('div', { className: 'ap-field' },
+          react.createElement('span', { className: 'ap-fieldKey' }, t.ruleLabelField),
+          react.createElement('input', {
+            className: 'ap-input ap-inputWide',
+            'aria-label': t.ruleLabelField,
+            title: draft.label,
+            value: draft.label,
+            onChange: event => patch({ label: event.target.value }),
+          })),
+        // 提示按需要出现，且挤成一小块（不与上面的三行编辑抢视觉）
+        react.createElement('div', { className: 'ap-hints' },
           draft.kind === 'signature'
             && react.createElement('span', { className: 'ap-note' }, t.fingerprintReadonly),
           react.createElement('span', { className: 'ap-note', title: draft.error === '' ? undefined : draft.error },
@@ -1586,13 +1784,13 @@ window.__ModuleLoader__.load({
           unavailableNote !== ''
             && react.createElement('span', { className: 'ap-note' }, unavailableNote),
           draftProblem !== undefined && react.createElement('span', { className: 'ap-note ap-warn' }, draftProblem)),
-        // 两行操作各自成行：标签 + 该组的两个作用域按钮，不会和别的控件挤在一起换行
+        // 作用域一行 + 动作一行：4 个按钮收成「先选作用域、再点动作」
         react.createElement('div', { className: 'ap-actionRow' },
-          react.createElement('span', { className: 'ap-actionsLabel' }, t.promote),
-          ...scopeButtons('allow', 'ap-btnPrimary')),
+          react.createElement('span', { className: 'ap-fieldKey' }, t.formScope),
+          scopeSeg),
         react.createElement('div', { className: 'ap-actionRow' },
-          react.createElement('span', { className: 'ap-actionsLabel' }, t.demote),
-          ...scopeButtons('deny', 'ap-btnDanger')),
+          actionButton('allow', 'ap-btnPrimary', t.actionAllow),
+          actionButton('deny', 'ap-btnDanger', t.actionDeny)),
         (busy || error !== '' || doneText !== undefined) && react.createElement('div', { className: 'ap-actionRow' },
           busy && react.createElement('span', { className: 'ap-note' }, t.working),
           error !== '' && react.createElement('span', { className: 'ap-note ap-warn' }, error),
@@ -1602,17 +1800,51 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 「本次加入的规则」那一行：说明这次写了什么、顶掉了哪些旧规则，并可一键撤销。
-     * 凭据在记录里（`ruleApplied`），所以刷新页面后照样能撤销；撤销过（`ruleReverted`）就不再给按钮。
-     * 「已有规则覆盖这次动作」（covered）没有写入任何东西，**不给撤销**——那种 ruleId 指的是别人的规则。
+     * 规则条件的来源标（规则卡上的 chip）：先分清「没问过你、达阈值自动写的」与「你确认后写的」，
+     * 再说条件从哪来（审查模型的建议 / 现场模型优化 / 本次动作的权限指纹 / 你手填的）。
+     * 老记录没有 `optimizedBy` 字段时只说「自动」「手动」，不瞎标来源。
      */
-    function UndoRule({ record, onDone }) {
+    function ruleSourceLabel(applied) {
+      const auto = applied.auto === true
+      if (applied.optimizedBy === 'record') return auto ? t.ruleSourceAutoRecord : t.ruleSourceRecord
+      if (applied.optimizedBy === 'signature') return auto ? t.ruleSourceAutoFingerprint : t.kindSignature
+      if (auto === true) return t.ruleAuto
+      if (applied.optimizedBy === 'model') return t.ruleSourceModel
+      if (applied.optimizedBy === 'manual') return t.ruleSourceManual
+      return t.ruleManual
+    }
+
+    /**
+     * 「这次写没写规则」的唯一落点（用户 2026-09-18 要求）：原先散在三处——详情里「已应用」那一行、
+     * 「本次加入的规则」撤销行、以及「已询问，未加入」，现在合成一张卡：名单/作用域 + 条件来源 + 规则标签
+     * + 覆盖/合并/被顶掉的说明 + 撤销按钮。撤销按钮**贴着它撤销的那条规则**，凭据取自记录里的
+     * `ruleApplied`（所以刷新页面后照样能撤）；撤销过（`ruleReverted`）就只显示已撤销文案。
+     * 「已有规则覆盖这次动作」（covered）一条都没写进去，**不给撤销**（那种 ruleId 指的是别人的规则），
+     * 也不声称「已加入」。两件事都没发生时整张卡不渲染。
+     */
+    function RuleCard({ record, onDone }) {
       const applied = record?.ruleApplied
+      const declined = record?.ruleDeclined
       const [busy, setBusy] = react.useState(false)
       const [error, setError] = react.useState('')
       const [undone, setUndone] = react.useState(record?.ruleReverted !== undefined)
-      if (applied === undefined || applied === null || typeof applied.ruleId !== 'string'
-        || applied.ruleId === '' || applied.covered === true) return null
+      // 「已询问，未加入」（黑名单确认卡上选了「不加入」）：同一张卡的变体
+      if (applied === undefined || applied === null) {
+        if (declined === undefined || declined === null) return null
+        return react.createElement('div', { className: 'ap-ruleCard ap-ruleCardMuted' },
+          react.createElement('span', { className: 'ap-note' }, t.ruleAsk),
+          // 标签独占一行（用户 2026-09-18 选定「标签优先」）：与 badge 挤在同一行时，
+          // 窄栏里标签必被挤成折行、卡里出现孤字
+          react.createElement('span', { className: 'ap-ruleCardLabel' }, String(declined.label ?? '')),
+          react.createElement('div', { className: 'ap-hitRow' },
+            react.createElement('span', { className: 'ap-badge ap-badgeMuted' },
+              declined.list === 'deny' ? t.hitDeny : t.hitAllow)),
+          react.createElement('span', { className: 'ap-note' }, t.ruleDeclined))
+      }
+      const covered = applied.covered === true
+      const note = appliedNote(applied)
+      // 覆盖命中那次 ruleId 指的是**别人的**规则；没有凭据的老记录也不给按钮
+      const revertable = covered !== true && typeof applied.ruleId === 'string' && applied.ruleId !== ''
       const dropped = []
       if (applied.previousRule !== undefined && applied.previousRule !== null) {
         dropped.push(String(applied.previousRule.label ?? applied.previousRule.id ?? ''))
@@ -1621,6 +1853,7 @@ window.__ModuleLoader__.load({
         dropped.push(String(rule?.label ?? rule?.id ?? ''))
       }
       const droppedText = dropped.filter(label => label !== '').join(' / ')
+      /** 撤销这次加入：成功本地置「已撤销」，并让面板重拉记录与策略快照。 */
       const run = () => {
         setBusy(true)
         setError('')
@@ -1632,21 +1865,57 @@ window.__ModuleLoader__.load({
           .catch(cause => setError(String(cause?.message ?? cause)))
           .finally(() => setBusy(false))
       }
-      return react.createElement('div', { className: 'ap-actionRow ap-undo' },
-        react.createElement('span', { className: 'ap-actionsLabel' }, t.ruleUndoLabel),
-        react.createElement('span', { className: 'ap-note' },
-          scopeLabel(applied.scope) + ' / ' + (applied.list === 'allow' ? t.allowList : t.denyList)
-          + ' · ' + String(applied.label ?? '')),
+      return react.createElement('div', {
+        className: 'ap-ruleCard' + (covered ? ' ap-ruleCardMuted' : ''),
+      },
+        react.createElement('span', { className: 'ap-note' }, t.ruleUndoLabel),
+        // 「写了哪条规则」是第一行（用户 2026-09-18 选定「标签优先」）：badge 让到下一行，
+        // 否则标签会被挤成折行
+        react.createElement('span', { className: 'ap-ruleCardLabel' }, String(applied.label ?? '')),
+        react.createElement('div', { className: 'ap-hitRow' },
+          react.createElement('span', {
+            className: 'ap-badge ' + (covered ? 'ap-badgeMuted' : (applied.list === 'allow' ? 'ap-badgeOk' : 'ap-badgeWarn')),
+          }, scopeLabel(applied.scope) + ' · ' + (applied.list === 'allow' ? t.allowList : t.denyList)),
+          react.createElement('span', {
+            className: 'ap-badge ' + (covered ? 'ap-badgeMuted' : 'ap-badgeInfo'),
+          }, ruleSourceLabel(applied))),
+        note !== '' && react.createElement('span', { className: 'ap-note' }, note),
         droppedText !== '' && react.createElement('span', { className: 'ap-note ap-warn' }, t.ruleDropped(droppedText)),
-        undone
+        revertable && (undone
           ? react.createElement('span', { className: 'ap-note' }, t.ruleUndone)
           : react.createElement('button', {
             type: 'button',
             className: 'ap-btn',
             disabled: busy || typeof record.id !== 'string',
             onClick: run,
-          }, busy ? t.working : t.undoRule),
+          }, busy ? t.working : t.undoRule)),
         error !== '' && react.createElement('span', { className: 'ap-note ap-warn' }, error))
+    }
+
+    /**
+     * 结论条上的小 chip（用户 2026-09-18 从预览页选定「融合版」）：风险 / 授权 / 命中名单 / 连续计数。
+     * 值可能很长（命中名单带规则标签），所以 CSS 单行截断 + `title` 挂全文。
+     */
+    function kvChip(text) {
+      return react.createElement('span', { className: 'ap-kvChip', title: String(text) }, String(text))
+    }
+
+    /**
+     * 结论徽标的文案（折叠行的徽标与结论条共用同一套口径，别两处各写一遍）。
+     * **命中黑名单转人工**那条记录的 `verdict` 也是 `'defer'`，但它跟「审查未完成」是两回事——
+     * 只说成「转人工」，命中细节由结论条的 chip 给出（原先一律显示「审查未完成」，是错的）。
+     */
+    function verdictLabelOf(record) {
+      if (record.verdict === 'allow') return t.autoApproved
+      if (record.verdict === 'blacklist-reject') return t.denyRejected
+      const deferred = record.verdict === 'deny' || record.policy?.list === 'deny'
+      return deferred ? t.referred : t.reviewFailed
+    }
+
+    /** 结论条的色调：只有「模型自动放行 + 非高/极高风险」是成功色，其余一律警告色。 */
+    function calloutTone(record) {
+      const risky = record.riskLevel === 'high' || record.riskLevel === 'critical'
+      return record.verdict === 'allow' && risky !== true ? 'ok' : 'warn'
     }
 
     /**
@@ -1665,33 +1934,84 @@ window.__ModuleLoader__.load({
       return parts.length === 0 ? undefined : parts.join(' · ')
     }
 
-    /** 单条记录：折叠只显示概要，展开显示风险/授权/理由/动作，以及升级/降级操作。 */
-    function RecordRow({ record, open, onToggle, onChanged, showSession }) {
-      // 会话名只在「全部会话」视图里需要：本次会话下每条都属于当前会话，写了只是噪声
-      const sessionName = showSession === true ? sessionNameOf(record.sessionId) : undefined
+    /**
+     * 详情「已应用」那一行的后缀说明：覆盖命中 / 达阈值自动写入各自的措辞。
+     * 两者同时成立（达阈值触发自动写入，但已有规则已覆盖这次动作、一条都没写）时只说一句，
+     * 免得出现「未重复添加」紧接着「自动加入」这种自相矛盾的读法。
+     * @param {object} applied 记录里的 ruleApplied
+     * @returns {string} 后缀（无话可说时是空串）
+     */
+    function appliedNote(applied) {
+      if (applied.covered === true) {
+        return applied.auto === true ? t.appliedAutoCovered : t.appliedCovered
+      }
+      return applied.auto === true ? t.appliedAuto(applied.optimizedBy) : ''
+    }
+
+    /** 折叠卡行尾的箭头：内联 SVG（文字箭头 ▸ 在窄屏字体下又细又不齐，用户 2026-09-18 反馈不好看）；展开时旋转 90°。 */
+    function BlockChevron({ open }) {
+      return react.createElement('svg', {
+        className: 'ap-blockChevron',
+        viewBox: '0 0 16 16',
+        width: 12,
+        height: 12,
+        'aria-hidden': 'true',
+      }, react.createElement('path', {
+        d: 'M6 3.5 10.5 8 6 12.5',
+        fill: 'none',
+        stroke: 'currentColor',
+        'stroke-width': '1.6',
+        'stroke-linecap': 'round',
+        'stroke-linejoin': 'round',
+      }))
+    }
+
+    /**
+     * 「加入名单」/「排查信息」的折叠卡（用户 2026-09-18 最终选定「卡头即入口」）：
+     * 卡头那一行本身就是开关（行尾 ▸/▾）。底部不再有另一行文字入口——那和卡头标题是同一句话的两处
+     * （旧的 `.ap-detailFoot` 已删）。**正文用函数传入**（`render`）而不是 children：收起时连元素都不构造，
+     * 「收起」在元素树里就是真的不存在（技术字段不会被顺手渲染出来）。
+     * @param {object} props title / hint / open / onToggle / dataUi（稳定的测试锚点）/ render（返回正文元素）
+     */
+    function FoldCard({ title, hint, open, onToggle, dataUi, render }) {
+      return react.createElement('div', { className: 'ap-blockCard' },
+        react.createElement('button', {
+          type: 'button',
+          className: 'ap-blockHead',
+          'data-ui': dataUi,
+          'aria-expanded': open,
+          onClick: onToggle,
+        },
+          react.createElement('span', { className: 'ap-blockTitle' }, title),
+          react.createElement('span', { className: 'ap-blockHint' }, hint),
+          react.createElement(BlockChevron, { open })),
+        open === true && render())
+    }
+
+    /**
+     * 单条记录（用户 2026-09-18 从预览页逐项定下的形态）。
+     * 折叠态**两行**：第一行「时间 · 工具 · 来源 chip ·（+白名单）· 结论/结果徽标」，第二行审批意见——
+     * 命中规则说明与审批意见只能留一个，说明进 chip 的 tooltip（取舍见预览页）。时间**紧贴轨道圆点**：
+     * 行头里不再有展开箭头（整行就是按钮 + hover 底色），也不再显示「第几轮第几步」（排查信息里有）。
+     * 展开态：背景块把轨道与圆点一起包进来、行头与详情之间一条分割线（整条跨过去）、圆点放大到 10px；
+     * 详情依次是结论条、依据、规则卡、两块（「加入名单」与「排查信息」，卡头即入口）。
+     * @param {object} props record / open / onToggle / onChanged / first / last（轨道竖线的首尾修剪）
+     */
+    function RecordRow({ record, open, onToggle, onChanged, first, last }) {
+      // 两块（加入名单 / 排查信息）的开合状态**放在行上**：
+      // 状态写在子组件里也写得出来，但那样子组件会各自多一个 hook，而「前面那个组件按条件增减 hook」
+      // 会挤掉后面组件的 hook 槽位（测试替身按求值顺序分槽，真机 React 里则是条件渲染导致的同类问题），
+      // 于是「打开加入名单」会顺手把排查信息关上。放在行上最稳，且开合状态天然按记录隔离。
+      const [debugOpen, setDebugOpen] = react.useState(false)
+      const [entryOpen, setEntryOpen] = react.useState(false)
       const route = record.route === undefined ? undefined : record.route.provider + '/' + record.route.model
       const suggested = record.suggestedRule === undefined
         ? undefined
         : record.suggestedRule.label + '（' + kindLabel(record.suggestedRule.match?.kind) + '：' + String(record.suggestedRule.match?.value ?? '') + '）'
-      const applied = record.ruleApplied === undefined
-        ? undefined
-        : scopeLabel(record.ruleApplied.scope) + ' / ' + (record.ruleApplied.list === 'allow' ? t.allowList : t.denyList) + ' · ' + String(record.ruleApplied.label ?? '')
-          // 覆盖命中：这次其实什么都没写，明细里说清楚，别让人以为名单多了这条
-          + (record.ruleApplied.covered === true ? t.appliedCovered : '')
-          // 达阈值自动写入（没问过用户）：详情里说清楚它是怎么来的，免得看起来像自己加的
-          + (record.ruleApplied.auto === true ? t.appliedAuto : '')
-          + (record.ruleApplied.optimizedBy === 'manual' ? '（你手填的匹配条件）' : '')
-      const promoted = record.promotedRule === undefined
-        ? undefined
-        : scopeLabel(record.promotedRule.scope) + ' · ' + String(record.promotedRule.label ?? '')
-      // 命中规则信息（只在展开详情里用；折叠态由 TagRow 统一渲染）
+      // 命中规则信息（只在展开详情里用；折叠态由 HitChip 的 tooltip 承载）
       const hitText = record.policy === undefined
         ? undefined
         : scopeLabel(record.policy.scope) + ' · ' + String(record.policy.label ?? '')
-      const declined = record.ruleDeclined === undefined
-        ? undefined
-        : t.ruleDeclined + ' · ' + (record.ruleDeclined.list === 'allow' ? t.allowList : t.denyList)
-          + ' · ' + String(record.ruleDeclined.label ?? '')
       const approvals = typeof record.approvals === 'number' && record.approvals > 0
         ? String(record.approvals)
         : undefined
@@ -1705,66 +2025,113 @@ window.__ModuleLoader__.load({
       const turn = typeof record.turn === 'number' ? record.turn : undefined
       const step = typeof record.step === 'number' ? record.step : undefined
       const turnStep = turn === undefined && step === undefined ? undefined : t.turnStepLabel(turn ?? '?', step ?? '?')
-      return react.createElement('li', { className: 'ap-row' },
-        react.createElement('button', {
-          type: 'button', className: 'ap-rowHead', 'aria-expanded': open,
-          onClick: onToggle,
-        },
-          react.createElement('span', { className: 'ap-chevron', 'aria-hidden': 'true' }, open ? '▾' : '▸'),
-          react.createElement('span', { className: 'ap-rowMain' },
-            react.createElement('span', { className: 'ap-rowTop' },
-              react.createElement('span', { className: 'ap-time', title: String(record.time ?? '') }, formatTime(record.time)),
-              // 折叠态就能看到「第几轮第几步」：审批记录要靠它对应回对话里的那一步
-              turnStep !== undefined && react.createElement('span', { className: 'ap-turnStep' }, turnStep),
-              react.createElement('span', { className: 'ap-tool' }, String(record.toolName ?? '?')),
-              react.createElement('span', { className: 'ap-grow' }, ''),
-              react.createElement(VerdictBadge, { record }),
-              react.createElement(OutcomeBadge, { record })),
-            opinion !== undefined && react.createElement('span', { className: 'ap-opinion' }, opinion),
-            react.createElement(TagRow, { record }))),
-        open === true && react.createElement('div', { className: 'ap-detail' },
-          react.createElement(Field, { label: t.risk, value: record.riskLevel }),
-          react.createElement(Field, { label: t.authorization, value: record.userAuthorization }),
-          react.createElement(Field, { label: t.turnStep, value: turnStep }),
-          react.createElement(Field, { label: t.rationale, value: record.rationale }),
-          // 人工补的拒绝理由（追问卡的回答）：与插件/模型意见分开显示
-          react.createElement(Field, { label: t.rejectReason, value: record.rejectReason }),
-          react.createElement(Field, { label: t.reason, value: record.reason }),
-          react.createElement(Field, { label: t.action, value: record.action, mono: true }),
-          // 「权限指纹」显示机器 key：与规则表单里生成的签名逐字一致（用户 2026-09-16 要求）；
-          // 可读文本另起一行，别让长 key 把「这次在授权什么」这件事盖住
-          // 权限指纹：显示渲染后的可视化，原始串（含 NUL）挂 title，别在详情里糊一串方框
-          react.createElement(Field, {
-            label: t.signature,
-            value: record.signature === undefined ? undefined : fingerprintShort(record.signature.key),
-            title: record.signature === undefined ? undefined : record.signature.key,
-            mono: true,
-          }),
-          // 指纹是机器串：紧跟着按它的结构摊开（工具 / 命令或参数 / 额外参数），人一眼看得出在授权什么
-          ...fingerprintFields(record.signature === undefined ? undefined : record.signature.key),
-          react.createElement(Field, { label: t.signatureText, value: record.signature === undefined ? undefined : record.signature.text }),
-          react.createElement(Field, { label: t.suggestedRule, value: suggested }),
-          react.createElement(Field, { label: t.policyHit, value: hitText }),
-          react.createElement(Field, { label: t.applied, value: applied }),
-          react.createElement(Field, { label: t.promoted, value: promoted }),
-          react.createElement(Field, { label: t.approvals, value: approvals }),
-          react.createElement(Field, { label: t.decidedBy, value: decidedByOf(record) === 'auto' ? t.decidedAuto : t.decidedHuman }),
-          react.createElement(Field, { label: t.denials, value: record.denials === undefined || record.denials === 0 ? undefined : String(record.denials) }),
-          react.createElement(Field, { label: t.ruleAsk, value: declined }),
-          react.createElement(Field, { label: t.latency, value: record.latencyMs === undefined ? undefined : String(record.latencyMs) + ' ms' }),
-          react.createElement(Field, { label: t.reviewer, value: [record.reviewerSessionId, record.steps === undefined ? undefined : record.steps + ' steps'].filter(Boolean).join(' · ') }),
-          react.createElement(Field, { label: t.tokens, value: usageText }),
-          react.createElement(Field, { label: t.time, value: record.time }),
-          // 升级/降级需要记录的签名或模型建议；更早版本留下的老记录两者都没有，不显示死按钮
-          (record.signature !== undefined || record.suggestedRule !== undefined)
-            && react.createElement(RuleActions, { record, onDone: onChanged }),
-          // 「本次加入的规则」+ 撤销这次加入（记录里带撤销凭据、且没撤销过时才渲染）
-          react.createElement(UndoRule, { record, onDone: onChanged })),
-        // 「全部会话」时在整条记录的最下面用小字标出会话名；title 挂完整 sessionId 便于核对
-        sessionName !== undefined && react.createElement('div', {
-          className: 'ap-session',
-          title: typeof record.sessionId === 'string' ? record.sessionId : undefined,
-        }, sessionName))
+      // 结论条上的 chip：人工侧结论（只对转人工的记录有意义）、风险、授权、命中名单、连续计数
+      const calloutChips = [
+        record.verdict === 'allow' ? undefined : (outcomeOf(record)?.[0] ?? t.decidedUnknown),
+        record.riskLevel === undefined ? undefined : t.risk + ' ' + String(record.riskLevel),
+        record.userAuthorization === undefined ? undefined : t.authorization + ' ' + String(record.userAuthorization),
+        hitText === undefined ? undefined : t.chipHit(hitText),
+        approvals === undefined ? undefined : t.approvals + ' ' + approvals,
+        record.denials === undefined || record.denials === 0 ? undefined : t.denials + ' ' + String(record.denials),
+      ].filter(text => text !== undefined).map(text => kvChip(text))
+      /**
+       * 「排查信息」的两组字段（默认收起、不记忆展开状态），用户 2026-09-18 从预览页选定「分组 + 去重」：
+       * 去掉 4 行重复或恒空项——「工具」并进指纹行（指纹本身就以工具名开头）、「签名摘要」（与工具 + 命令同义）、
+       * 「已自动升级」（`promotedRule` 新记录恒空）、Reviewer 的「0 steps」（单轮审查恒为 0，会话字段也没人写）；
+       * 13 行 → 11 行。指纹行带「复制指纹」按钮：排查时最常做的就是拿整串去核对。
+       */
+      const debugActionFields = [
+        // 权限指纹：机器口径的授权范围（可视化 + 复制按钮，整串挂 title 供悬停核对）
+        ...(record.signature === undefined
+          ? []
+          : [react.createElement('div', { key: 'debug-fingerprint', className: 'ap-field' },
+            react.createElement('span', { className: 'ap-fieldKey' }, t.signature),
+            react.createElement('span', { className: 'ap-fieldVal' },
+              react.createElement(FingerprintValue, { value: record.signature.key })))]),
+        // 指纹是机器串：紧跟着按它的结构摊开（命令或参数 / 额外参数）
+        ...fingerprintFields(record.signature === undefined ? undefined : record.signature.key),
+        react.createElement(Field, { key: 'debug-action', label: t.action, value: record.action, mono: true }),
+        react.createElement(Field, { key: 'debug-turnStep', label: t.turnStep, value: turnStep }),
+      ]
+      const debugReviewFields = [
+        react.createElement(Field, { key: 'debug-suggestedRule', label: t.suggestedRule, value: suggested }),
+        react.createElement(Field, { key: 'debug-decidedBy', label: t.decidedBy, value: decidedByOf(record) === 'auto' ? t.decidedAuto : t.decidedHuman }),
+        // 审查用的模型路由（老字段 route，原先只被一个没人看的 Reviewer 行用着）
+        react.createElement(Field, { key: 'debug-model', label: t.reviewModel, value: route }),
+        react.createElement(Field, { key: 'debug-latency', label: t.latency, value: record.latencyMs === undefined ? undefined : String(record.latencyMs) + ' ms' }),
+        react.createElement(Field, { key: 'debug-tokens', label: t.tokens, value: usageText }),
+        react.createElement(Field, { key: 'debug-time', label: t.time, value: record.time }),
+      ]
+      // 轨道竖线要修剪首尾（第一行的线从圆点开始、最后一行到圆点结束），行与行之间用留白分隔——
+      // 留白用内边距而不是外边距，隐藏的竖线才会连着穿过去（见预览页踩坑记录）
+      const itemClass = ['ap-item']
+        .concat(first === true ? ['isFirst'] : [])
+        .concat(last === true ? ['isLast'] : [])
+        .concat(open === true ? ['open'] : [])
+        .concat(last === true ? [] : ['gap'])
+        .join(' ')
+      const canAddRule = record.signature !== undefined || record.suggestedRule !== undefined
+      return react.createElement('li', { className: itemClass },
+        react.createElement('span', { className: 'ap-rail', 'aria-hidden': 'true' },
+          react.createElement('span', { className: 'ap-railLine' }),
+          react.createElement('span', { className: 'ap-dot', 'data-tone': dotToneOf(record) })),
+        react.createElement('span', { className: 'ap-body' },
+          react.createElement('button', {
+            type: 'button', className: 'ap-rowHead', 'aria-expanded': open,
+            onClick: onToggle,
+          },
+            react.createElement('span', { className: 'ap-rowMain' },
+              react.createElement('span', { className: 'ap-rowTop' },
+                react.createElement('span', { className: 'ap-time', title: String(record.time ?? '') }, clockLabel(record.time)),
+                react.createElement('span', { className: 'ap-tool' }, String(record.toolName ?? '?')),
+                react.createElement(HitChip, { record }),
+                // 右侧徽标独立成组，用 margin-left:auto 顶到行尾：原先靠一个**空的** .ap-grow 撑开，
+                // 真机上它被宿主样式影响过，结论徽标不贴右边（用户 2026-09-18 截图反馈）
+                react.createElement('span', { className: 'ap-rowBadges' },
+                  react.createElement(RuleAutoBadge, { record }),
+                  react.createElement(VerdictBadge, { record }),
+                  react.createElement(OutcomeBadge, { record }))),
+              opinion !== undefined && react.createElement('span', { className: 'ap-opinion', title: opinion }, opinion))),
+          open === true && react.createElement('div', { className: 'ap-detailBox' },
+            // —— 结论条（用户 2026-09-18 从预览页选定「融合版」）：一眼看到结论与「凭什么」——
+            react.createElement('div', { className: 'ap-callout', 'data-tone': calloutTone(record) },
+              react.createElement('div', { className: 'ap-calloutTop' },
+                react.createElement('span', { className: 'ap-calloutLead' },
+                  t.calloutLead(verdictLabelOf(record), t.riskWord(record.riskLevel))),
+                ...calloutChips)),
+            // —— 依据：审查者结论（second-hand）与申请方原话（first-hand）＋人工拒绝理由 ——
+            react.createElement('div', { className: 'ap-group' },
+              react.createElement('span', { className: 'ap-groupCaption' }, t.groupBasis),
+              react.createElement(Field, { label: t.rationale, value: record.rationale }),
+              react.createElement(Field, { label: t.reason, value: record.reason }),
+              // 人工补的拒绝理由（追问卡的回答）：与插件/模型意见分开显示
+              react.createElement(Field, { label: t.rejectReason, value: record.rejectReason })),
+            // 这次写没写规则：唯一落点（原先的「已应用」字段、撤销行与「已询问，未加入」都并进这张卡）
+            react.createElement(RuleCard, { record, onDone: onChanged }),
+            // —— 两块（用户 2026-09-18 定「卡头即入口」）：卡头那一行就是开关，
+            //    展开时内容才渲染；底部不再有第二处文字入口（同一件事的两处文字） ——
+            canAddRule && react.createElement(FoldCard, {
+              title: t.blockRuleTitle,
+              hint: t.blockRuleHint,
+              dataUi: 'rule-entry',
+              open: entryOpen,
+              onToggle: () => setEntryOpen(previous => previous !== true),
+              render: () => react.createElement(RuleActions, { record, onDone: onChanged }),
+            }),
+            react.createElement(FoldCard, {
+              title: t.blockDebugTitle,
+              hint: t.blockDebugHint,
+              dataUi: 'debug-info',
+              open: debugOpen,
+              onToggle: () => setDebugOpen(previous => previous !== true),
+              render: () => react.createElement('div', { className: 'ap-debugBody' },
+                react.createElement('div', { className: 'ap-debugGroup' },
+                  react.createElement('span', { className: 'ap-debugGroupCaption' }, t.debugGroupAction),
+                  ...debugActionFields),
+                react.createElement('div', { className: 'ap-debugGroup' },
+                  react.createElement('span', { className: 'ap-debugGroupCaption' }, t.debugGroupReview),
+                  ...debugReviewFields)),
+            }))))
     }
 
     /**
@@ -2162,15 +2529,17 @@ window.__ModuleLoader__.load({
         mountState.timelineShown = visible
         return () => { mountState.timelineShown = false }
       }, [visible])
-      const [scope, setScope] = react.useState('session')
       const [state, setState] = react.useState({ records: [], error: '', loaded: false })
       const [openId, setOpenId] = react.useState('')
       // 快捷筛选：多选叠加（空数组 = 不筛选，显示全部）
       const [filters, setFilters] = react.useState([])
 
-      const key = scope + '|' + sessionId
+      // 只看本次会话（用户 2026-09-18：面板上的「本次会话 / 全部会话」切换不要了）。
+      // 记录里的 sessionId 等字段一律保留，宿主的 /log 接口也照旧支持不带 session 查全部，
+      // 只是界面不再提供那个入口。
+      const key = sessionId
       const load = react.useCallback(async () => {
-        const query = scope === 'session' && sessionId !== '' ? '?session=' + encodeURIComponent(sessionId) : ''
+        const query = sessionId !== '' ? '?session=' + encodeURIComponent(sessionId) : ''
         try {
           const response = await fetch(API_LOG + query, { headers: { accept: 'application/json' } })
           const data = await response.json()
@@ -2182,7 +2551,7 @@ window.__ModuleLoader__.load({
         } catch (error) {
           setState(previous => ({ records: previous.records, error: String(error?.message ?? error), loaded: true }))
         }
-      }, [scope, sessionId])
+      }, [sessionId])
 
       react.useEffect(() => {
         let alive = true
@@ -2213,6 +2582,17 @@ window.__ModuleLoader__.load({
           ? previous.filter(item => item !== key)
           : [...previous, key])
       }
+      // 按天分组（用户 2026-09-18 定）：日期交给组标题，行头里只留时分秒。时间认不出来的记录
+      // 落到空标题那一组，行为上等价于不分组。
+      const groups = []
+      for (const record of shown) {
+        const label = dayLabelOf(record.time)
+        const lastGroup = groups[groups.length - 1]
+        if (lastGroup === undefined || lastGroup.label !== label) groups.push({ label, records: [record] })
+        else lastGroup.records.push(record)
+      }
+      /** 记录的身份 key：展开状态与 React key 都用它。 */
+      const keyOf = record => String(record.id ?? record.time)
       // 升级/降级成功后同时刷新记录与策略快照：记录上会回写「已应用」，设置面板同步见到新规则
       const refresh = () => { void load(); void policyStore.load() }
       return react.createElement('div', { className: 'ap-root' },
@@ -2220,9 +2600,6 @@ window.__ModuleLoader__.load({
           react.createElement('div', { className: 'ap-grow' },
             react.createElement('div', { className: 'ap-title' }, t.title),
             react.createElement('div', { className: 'ap-sub' }, t.subtitle + ' · ' + auto + '/' + records.length)),
-          react.createElement('div', { className: 'ap-seg' },
-            react.createElement('button', { type: 'button', 'data-on': scope === 'session' ? '1' : '0', onClick: () => setScope('session') }, t.scopeSession),
-            react.createElement('button', { type: 'button', 'data-on': scope === 'all' ? '1' : '0', onClick: () => setScope('all') }, t.scopeAll)),
           react.createElement('button', { type: 'button', className: 'ap-btn', onClick: refresh }, t.reload)),
         state.error !== '' && react.createElement('div', { className: 'ap-error' }, state.error),
         react.createElement('div', { className: 'ap-filters' },
@@ -2245,15 +2622,21 @@ window.__ModuleLoader__.load({
           ? react.createElement('div', { className: 'ap-empty' },
             state.loaded === false ? t.loading : (records.length === 0 ? t.empty : t.filterEmpty))
           : react.createElement('ul', { className: 'ap-list' },
-            shown.map(record => react.createElement(RecordRow, {
-              key: String(record.id ?? record.time),
-              record,
-              open: openId === String(record.id ?? record.time),
-              onToggle: () => setOpenId(previous => previous === String(record.id ?? record.time) ? '' : String(record.id ?? record.time)),
-              onChanged: refresh,
-              // 只有「全部会话」需要标明每条记录属于哪个会话
-              showSession: scope === 'all',
-            }))))
+            ...groups.flatMap(group => [
+              // 组标题不是轨道上的一行：两条记录之间隔着一天的标题，所以每组的首尾都要修剪竖线
+              ...(group.label === ''
+                ? []
+                : [react.createElement('li', { key: 'day-' + group.label, className: 'ap-dayGroup' }, group.label)]),
+              ...group.records.map((record, index) => react.createElement(RecordRow, {
+                key: keyOf(record),
+                record,
+                open: openId === keyOf(record),
+                onToggle: () => setOpenId(previous => previous === keyOf(record) ? '' : keyOf(record)),
+                onChanged: refresh,
+                first: index === 0,
+                last: index === group.records.length - 1,
+              })),
+            ])))
     }
 
     /** 客户端插件入口：按 placement 决定挂载审批设置标签页、时间线 tab 或两者。 */

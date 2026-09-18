@@ -88,39 +88,83 @@ function fakeReact() {
   const frames = []
   /** 取当前渲染帧（组件树里所有 hook 共用一帧）。 */
   const frame = () => frames[frames.length - 1]
+  /**
+   * 当前组件的路径（`evaluate` 在每个组件求值前设置），hook 槽位按**它**分：
+   * 早先的实现按「整棵树第几个 hook」分（单一扁平游标），那是错的——前面任何一个组件
+   * 按条件增减 hook（例如展开「加入名单」表单会多挂 4 个），后面所有组件的槽位都会串位，
+   * 于是别的行读到别人的状态。真机 React 的状态属于组件实例，按路径分才与它一致。
+   */
+  let key = ''
+  /** 取一个 hook 在本组件内的序号并前进游标（游标每轮渲染重置，槽位跨轮复用）。 */
+  const nextIndex = field => {
+    const current = frame()
+    const index = current[field][key] ?? 0
+    current[field][key] = index + 1
+    return index
+  }
+  /**
+   * 与 React 同口径：children 同时进 `props.children`（一个子节点就是它本身，多个是数组）。
+   * 少了这一步，`createElement(Comp, props, child)` 这种写法的组件在替身里读不到 children——
+   * 真机照常渲染、测试里却什么都不渲染（本轮 `.ap-blockCard` 的展开内容就栽在这）。
+   * 渲染树仍保留 `children` 数组，断言照旧按它遍历子节点。
+   */
+  const createElement = (type, props, ...children) => ({
+    type,
+    props: children.length === 0
+      ? props
+      : { ...(props ?? {}), children: children.length === 1 ? children[0] : children },
+    children,
+  })
   return {
-    createElement: (type, props, ...children) => ({ type, props, children }),
+    createElement,
     useState: value => {
       const current = frame()
-      const index = current.cursor
-      current.cursor += 1
-      if (!(index in current.slots)) current.slots[index] = typeof value === 'function' ? value() : value
-      return [current.slots[index], next => {
-        current.slots[index] = typeof next === 'function' ? next(current.slots[index]) : next
+      const slot = key + '#' + String(nextIndex('cursors'))
+      if (!(slot in current.slots)) current.slots[slot] = typeof value === 'function' ? value() : value
+      return [current.slots[slot], next => {
+        current.slots[slot] = typeof next === 'function' ? next(current.slots[slot]) : next
         current.dirty = true
       }]
     },
     useEffect: effect => {
       const current = frame()
-      const index = current.effectCursor
-      current.effectCursor += 1
-      if (current.effects[index] === undefined) current.effects[index] = effect
+      const slot = key + '$' + String(nextIndex('effectCursors'))
+      if (current.registered.has(slot)) return
+      current.registered.add(slot)
+      current.effects.push({ key: slot, effect })
     },
     useCallback: fn => fn,
     useMemo: fn => fn(),
     useRef: value => ({ current: value }),
     /** 开一帧（同一组件反复渲染共用这一帧，状态才留得住）。 */
     __pushFrame: () => {
-      const current = { slots: [], effects: [], cleanups: [], cursor: 0, effectCursor: 0, ran: [], dirty: false }
+      const current = {
+        slots: {},
+        cursors: {},
+        effectCursors: {},
+        effects: [],
+        registered: new Set(),
+        cleanups: [],
+        ran: new Set(),
+        dirty: false,
+      }
       frames.push(current)
       return current
     },
     __popFrame: () => frames.pop(),
+    /** 进入一个组件：把当前路径切到它（hook 按路径分槽），返回还原函数。 */
+    __enter: next => {
+      const previous = key
+      key = next
+      return () => {
+        key = previous
+      }
+    },
     /** 每轮渲染前重置 hook 游标（hook 顺序必须一致，重置后才能按序号复用状态）。 */
     __resetCursor: () => {
       const current = frame()
-      current.cursor = 0
-      current.effectCursor = 0
+      current.cursors = {}
+      current.effectCursors = {}
     },
   }
 }
@@ -350,20 +394,34 @@ function harness() {
  * 文案藏在嵌套的子组件里，只求值根节点会漏掉——那正是这个冒烟测试要抓的东西。
  * depth 上限只是防御性的，正常组件树很浅。
  */
-function evaluate(element, depth = 0) {
+function evaluate(element, depth = 0, react = undefined, path = 'root') {
   // 注册进槽位的组件通常是包装组件（`props => <Panel {...props}/>`），一层包装就吃掉两层深度；
   // 上限太小会把深层徽标原样返回（函数类型的 type 还会被 JSON.stringify 丢掉），断言就变成空转。
   if (depth > 14) return element
-  if (Array.isArray(element)) return element.map(child => evaluate(child, depth + 1))
+  if (Array.isArray(element)) return element.map((child, index) => evaluate(child, depth + 1, react, path + '.' + String(index)))
   if (element === null || typeof element !== 'object') return element
-  if (typeof element.type === 'function') return evaluate(element.type(element.props ?? {}), depth + 1)
+  if (typeof element.type === 'function') {
+    // hook 槽位按组件路径分（见 fakeReact）：求值组件体之前把「当前组件」切到它，求值完再还原
+    const here = path + ':' + componentName(element.type)
+    const leave = react?.__enter === undefined ? undefined : react.__enter(here)
+    try {
+      return evaluate(element.type(element.props ?? {}), depth + 1, react, here)
+    } finally {
+      if (leave !== undefined) leave()
+    }
+  }
   return {
     type: element.type,
     props: element.props,
     children: Array.isArray(element.children)
-      ? element.children.map(child => evaluate(child, depth + 1))
+      ? element.children.map((child, index) => evaluate(child, depth + 1, react, path + '.' + String(index)))
       : element.children,
   }
+}
+
+/** 组件名（匿名组件退回 anon）：路径里带上它，同一位置换了组件类型就不会串用槽位。 */
+function componentName(type) {
+  return typeof type.name === 'string' && type.name !== '' ? type.name : 'anon'
 }
 
 /**
@@ -379,14 +437,14 @@ async function renderStable(react, component, props, interact) {
     for (let pass = 0; pass < 8; pass += 1) {
       frame.dirty = false
       react.__resetCursor()
-      tree = evaluate(component(props))
+      tree = evaluate(component(props), 0, react)
       // 每轮渲染后给用例一次驱动机会（例如点「全部会话」）：面板内部的 setState 只能这样触发
       if (typeof interact === 'function') interact(tree)
-      // 只跑本轮新注册的副作用（例如拉记录），重复渲染不会重复订阅
-      for (let index = 0; index < frame.effects.length; index += 1) {
-        if (frame.ran[index] === true) continue
-        frame.ran[index] = true
-        const cleanup = frame.effects[index]()
+      // 只跑本轮新注册的副作用（例如拉记录），重复渲染不会重复订阅（按组件路径去重）
+      for (const entry of frame.effects) {
+        if (frame.ran.has(entry.key)) continue
+        frame.ran.add(entry.key)
+        const cleanup = entry.effect()
         if (typeof cleanup === 'function') frame.cleanups.push(cleanup)
       }
       await waitTick()
@@ -410,6 +468,17 @@ function findNodes(node, predicate, found = []) {
   return found
 }
 
+/**
+ * 时间线列表里的记录节点（`.ap-item`）：类名上还挂着 isFirst / isLast / open / gap，
+ * 所以不能按类名全等匹配，得按分词判断（`findChip` 用 data-filter 是同一套思路）。
+ * @param {*} node 求值后的元素树
+ * @returns {Array} 记录节点（按出现顺序）
+ */
+function findRows(node) {
+  return findNodes(node, candidate => typeof candidate?.props?.className === 'string'
+    && candidate.props.className.split(' ').includes('ap-item'))
+}
+
 /** 展开详情里某个字段的值（Field 渲染成 .ap-field：键 span + 值 span）。 */
 function fieldValue(node, label) {
   const field = findNodes(node, candidate => candidate?.props?.className === 'ap-field'
@@ -423,6 +492,136 @@ function findButton(node, label) {
     && Array.isArray(candidate.children)
     && candidate.children.length === 1
     && candidate.children[0] === label)[0]
+}
+
+/**
+ * 找「自动加入名单」标识（客户端 RuleAutoBadge 渲染的胶囊）：className 里带 ap-badge，
+ * 文案是短标记 `+白名单` / `+黑名单`，或覆盖命中的 `白名单已覆盖` / `黑名单已覆盖`
+ * （2026-09-18 行头压到两行后由长句改短句，条件来源挪进 tooltip）。折叠态与展开态都能找到。
+ * @param {*} node 求值后的元素树
+ * @returns {*} 找到的标识元素；没找到返回 undefined
+ */
+function findAutoBadge(node) {
+  return findNodes(node, candidate => {
+    const className = candidate?.props?.className
+    if (typeof className !== 'string' || className.split(' ').includes('ap-badge') !== true) return false
+    const label = candidate.children?.[0]
+    return typeof label === 'string' && (label === '+白名单' || label === '+黑名单' || label.endsWith('已覆盖'))
+  })[0]
+}
+
+/**
+ * 找一个**默认收起**的入口按钮（「排查信息」/「加入名单」）：它的文案带箭头或在开/合之间变化，
+ * 不能按文案完全匹配去找，所以用稳定的 `data-ui` 属性定位（与 findChip 用 data-filter 同一套思路）。
+ * @param {*} node 求值后的元素树
+ * @param {string} key 'debug-info' | 'rule-entry'
+ * @returns {*} 找到的入口按钮；没找到返回 undefined
+ */
+function findUiToggle(node, key) {
+  return findNodes(node, candidate => candidate?.props?.['data-ui'] === key)[0]
+}
+
+/**
+ * 交互动作序列：renderStable 每轮渲染只执行**下一个**动作，且一个动作一个渲染轮次
+ * ——前一个动作的效果（setState）要下一轮才可见，同一轮里接着点会把旧值发出去。
+ * 动作返回 false 表示「这一轮还轮不到它」（目标还没出现），下一轮重试。
+ * @param {...Function} actions 动作函数数组
+ * @returns {Function} renderStable 的 interact 回调
+ */
+function steps(...actions) {
+  let index = 0
+  return tree => {
+    if (index >= actions.length) return
+    if (actions[index](tree) === false) return
+    index += 1
+  }
+}
+
+/** 展开第 index 条记录的详情（默认第一条）。 */
+function expandRow(index = 0) {
+  return tree => {
+    const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[index]
+    if (head === undefined) return false
+    head.props.onClick()
+    return true
+  }
+}
+
+/** 点开一个默认收起的入口（'debug-info' 排查信息 / 'rule-entry' 加入名单）。 */
+function openToggle(key) {
+  return tree => {
+    const toggle = findUiToggle(tree, key)
+    if (toggle === undefined) return false
+    toggle.props.onClick()
+    return true
+  }
+}
+
+/** 点一个文案完全匹配的按钮（复用 findButton 的定位口径）。 */
+function clickButton(label) {
+  return tree => {
+    const button = findButton(tree, label)
+    if (button === undefined) return false
+    button.props.onClick()
+    return true
+  }
+}
+
+/** 点「加入名单」表单里的匹配条件按钮（data-kind）。 */
+function clickKind(kind) {
+  return tree => {
+    const button = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === kind)[0]
+    if (button === undefined) return false
+    button.props.onClick()
+    return true
+  }
+}
+
+/** 往一个按 aria-label 定位的输入框里填值。 */
+function fillInput(label, value) {
+  return tree => {
+    const input = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === label)[0]
+    if (input === undefined) return false
+    input.props.onChange({ target: { value } })
+    return true
+  }
+}
+
+/**
+ * 点「加入名单」表单里的写入动作按钮（`以后直接放行` / `以后直接转人工`）。
+ * 2026-09-18 起表单是「先选作用域、再点动作」，作用域按钮不再触发写入（见 clickScopeButton）。
+ */
+function clickFormAction(label) {
+  return tree => {
+    const actions = findNodes(tree, node => node?.props?.className === 'ap-actions')[0]
+    if (actions === undefined) return false
+    const button = findNodes(actions, node => node?.type === 'button' && node.children?.[0] === label)[0]
+    if (button === undefined) return false
+    button.props.onClick()
+    return true
+  }
+}
+
+/** 点「加入名单」表单里的作用域按钮（本项目 / 全局；`data-scope` 定位，点它只切作用域不写入）。 */
+function clickScopeButton(name) {
+  return tree => {
+    const button = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-scope'] === name)[0]
+    if (button === undefined) return false
+    button.props.onClick()
+    return true
+  }
+}
+
+/**
+ * 「权限指纹」那一行显示的紧凑文案。2026-09-18 起排查区里的指纹行不是纯文本，
+ * 而是 `FingerprintValue`（可视化 span + 「复制指纹」按钮），所以不能再用 fieldValue。
+ * @param {*} node 求值后的元素树
+ * @returns {string|undefined} 形如 `pwsh · pnpm test · sandbox_permissions=…` 的文案
+ */
+function fingerprintRowText(node) {
+  const row = findNodes(node, candidate => candidate?.props?.className === 'ap-field'
+    && candidate.children?.[0]?.children?.[0] === '权限指纹')[0]
+  return row?.children?.[1]?.children?.[0]?.children?.[0]?.children?.[0]
 }
 
 /**
@@ -560,14 +759,17 @@ describe('客户端半加载与注册', () => {
     expect(JSON.stringify(titleTree)).toContain('审批时间线')
     for (const cleanup of cleanups) cleanup()
 
-    // 对话区标签页只放审批设置：有阈值输入，没有时间线的「本次会话/全部会话」切换
+    // 对话区标签页只放审批设置：有阈值输入，没有时间线的东西
     expect(trees[0].includes('连续放行阈值')).toBe(true)
     expect(trees[0].includes('连续被拒阈值')).toBe(true)
     expect(trees[0].includes('黑名单 · 直接转人工')).toBe(true)
-    expect(trees[0].includes('本次会话')).toBe(false)
-    // 右侧栏是审批时间线：有会话范围切换，没有阈值输入
+    // 「审批设置」里有个开关叫「自动打开审批时间线」，所以只能断言时间线那两处独有的东西不在对话区标签页
+    expect(trees[0].includes('ap-list')).toBe(false)
+    // 右侧栏是审批时间线：没有阈值输入，也没有「本次会话 / 全部会话」切换
+    // （用户 2026-09-18：切换不要了，面板固定看本次会话；记录里的 sessionId 等字段照旧保留）
     expect(trees[1].includes('审批时间线')).toBe(true)
-    expect(trees[1].includes('本次会话')).toBe(true)
+    expect(trees[1].includes('本次会话')).toBe(false)
+    expect(trees[1].includes('全部会话')).toBe(false)
     expect(trees[1].includes('连续放行阈值')).toBe(false)
     // 时间线行内要能看见审批意见，以及命中的是白名单还是黑名单（含规则标签）
     expect(trees[1].includes('用户明确要求运行测试。')).toBe(true)
@@ -595,38 +797,8 @@ describe('客户端半加载与注册', () => {
     expect(trees[0].includes('自动打开审批时间线')).toBe(true)
     expect(trees[0].includes('拒绝后追问理由')).toBe(true)
     expect(findNodes(JSON.parse(trees[0]), node => node?.type === 'input' && node?.props?.type === 'checkbox')).toHaveLength(4)
-    // 默认「本次会话」视图不标会话名：每条都属于当前会话，写出来只是噪声
+    // 会话名那行小字随「全部会话」视图一起删掉了（记录字段仍在，只是界面上不再有那个视图）
     expect(trees[1].includes('ap-session')).toBe(false)
-  })
-
-  it('切到「全部会话」时，每条记录最下面用小字标出会话名', async () => {
-    const registration = await loadClient()
-    const react = fakeReact()
-    const moduleExports = registration.factory(specifier => {
-      if (specifier === 'react') return react
-      throw new Error('unexpected require: ' + specifier)
-    })
-    const { ctx, slotRegistrations } = harness()
-    moduleExports.apply(ctx)
-    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
-
-    // 时间线的会话范围是内部 state：只能渲染一轮后点按钮切过去（只点一次，避免每轮重复触发）
-    let switched = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (switched) return
-      const button = findButton(tree, '全部会话')
-      if (button === undefined) return
-      switched = true
-      button.props.onClick()
-    })
-    expect(switched).toBe(true)
-    for (const cleanup of rendered.cleanups) cleanup()
-
-    const rows = findNodes(rendered.tree, node => node?.props?.className === 'ap-session')
-    // 四条记录各一行会话名：快照里有的用 displayTitle，不在快照里的退回 id 短名
-    expect(rows.map(row => row.children[0])).toEqual(['审批面板改造', '2b7d4c11', '审批面板改造', '审批面板改造'])
-    // 完整 sessionId 留在 title 里，小字只显示短名
-    expect(rows[1].props.title).toBe(SESSION_UNKNOWN)
   })
 
   it('快捷筛选：五个 chip 都带当前范围的条数，默认「全部」点亮', async () => {
@@ -651,7 +823,7 @@ describe('客户端半加载与注册', () => {
     // 默认不筛选：「全部」点亮，另外四个都不亮，列表是完整三条
     expect(findChip(rendered.tree, 'all').props['data-on']).toBe('1')
     expect(FILTER_CHIPS.slice(1).map(key => findChip(rendered.tree, key).props['data-on'])).toEqual(['0', '0', '0', '0'])
-    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-row')).toHaveLength(4)
+    expect(findRows(rendered.tree)).toHaveLength(4)
   })
 
   it('展开记录时能看到人工补的拒绝理由', async () => {
@@ -670,7 +842,7 @@ describe('客户端半加载与注册', () => {
     const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
       if (clicked) return
       // 黑名单那条记录：折叠态里有它的命中规则文案，用它定位行头
-      const row = findNodes(tree, node => node?.props?.className === 'ap-row')
+      const row = findRows(tree)
         .find(candidate => JSON.stringify(candidate).includes('rm -rf'))
       if (row === undefined) return
       const head = findNodes(row, node => node?.props?.className === 'ap-rowHead')[0]
@@ -687,7 +859,83 @@ describe('客户端半加载与注册', () => {
     expect(dump).toContain('这次不需要提权，先别动。')
   })
 
-  it('详情里的「权限指纹」就是规则表单生成的签名，可读文本另起一行「签名摘要」', async () => {
+  it('按天分组：日期进组标题，行头只留时分秒，轮次步数不再占折叠行', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    /** 本地时间的「N 天前 HH:04:05」：分组按本地零点切，所以这里也用本地时间构造。 */
+    const at = (daysAgo, hour) => {
+      const now = new Date()
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo, hour, 4, 5).toISOString()
+    }
+    logResponder = () => [
+      { id: 'today-1', time: at(0, 10), sessionId: SESSION_KNOWN, toolName: 'bash', verdict: 'allow', rationale: '今天第一条。', turn: 2, step: 40, decidedBy: 'auto' },
+      { id: 'today-2', time: at(0, 9), sessionId: SESSION_KNOWN, toolName: 'bash', verdict: 'defer', outcome: 'rejected', rationale: '今天第二条。' },
+      { id: 'yesterday-1', time: at(1, 23), sessionId: SESSION_KNOWN, toolName: 'read', verdict: 'allow', rationale: '昨天那条。', decidedBy: 'auto' },
+    ]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN })
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+    const rows = findRows(rendered.tree)
+    const first = JSON.stringify(rows[0])
+
+    // 组标题：今天 / 昨天（同一天不再重复一个标题）
+    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-dayGroup')
+      .map(node => node.children[0])).toEqual(['今天', '昨天'])
+    // 折叠行第一行只显示时分秒：日期交给组标题（完整时间戳仍挂在 title 上，悬停可核对）
+    const clock = findNodes(rows[0], node => node?.props?.className === 'ap-time')[0]
+    expect(clock.children[0]).toBe('10:04:05')
+    expect(clock.props.title).toBe('2026-09-18T02:04:05.000Z')
+    // 「第几轮第几步」不再占折叠行（技术字段收在排查信息里，展开那一块才看得到）
+    expect(first).not.toContain('第 2 轮')
+    // 轨道竖线首尾修剪：每组第一条从圆点起、每组最后一条到圆点止（昨天那组只有一条，两头都要剪）
+    expect(rows.map(row => row.props.className.split(' ').filter(name => name === 'isFirst' || name === 'isLast').join('+')))
+      .toEqual(['isFirst', 'isLast', 'isFirst+isLast'])
+  })
+
+  it('「加入名单」/「排查信息」是卡头即入口：底部不再有第二行文字入口', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    // 只展开第一条记录：两个开关都在卡头行上，正文默认收起
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, steps(expandRow()))
+    for (const cleanup of rendered.cleanups) cleanup()
+    const dump = JSON.stringify(rendered.tree)
+    // 详情容器换了名字（整块背景 + 分割线那一套），旧的底部入口行彻底没了
+    expect(dump).toContain('ap-detailBox')
+    expect(dump).not.toContain('ap-detailFoot')
+    expect(dump).not.toContain('ap-btnGhost')
+    expect(dump).not.toContain('加入名单…')
+    expect(dump).not.toContain('收起名单设置')
+    // 卡头即开关：卡片在、正文不在
+    expect(dump).toContain('ap-blockCard')
+    expect(findUiToggle(rendered.tree, 'rule-entry')).toBeDefined()
+    expect(findUiToggle(rendered.tree, 'debug-info')).toBeDefined()
+    expect(dump).not.toContain('ap-debugBody')
+    expect(findUiToggle(rendered.tree, 'debug-info').props['aria-expanded']).toBe(false)
+
+    // 点开排查信息：仍是同一张卡（卡头还在），正文出现在卡片里
+    const opened = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, steps(expandRow(), openToggle('debug-info')))
+    for (const cleanup of opened.cleanups) cleanup()
+    expect(JSON.stringify(opened.tree)).toContain('ap-debugBody')
+    expect(findUiToggle(opened.tree, 'debug-info').props['aria-expanded']).toBe(true)
+  })
+
+  it('排查区里的「权限指纹」就是规则表单生成的签名，摊开的明细只留命令与额外参数', async () => {
     const registration = await loadClient()
     const react = fakeReact()
     const moduleExports = registration.factory(specifier => {
@@ -710,27 +958,22 @@ describe('客户端半加载与注册', () => {
     moduleExports.apply(ctx)
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
-    let clicked = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (clicked) return
-      const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
-      if (head === undefined) return
-      clicked = true
-      head.props.onClick()
-    })
+    // 展开记录 → 打开「排查信息」→ 打开「加入名单」：指纹与规则表单都在默认收起的区域里（用户 2026-09-18）
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('debug-info'), openToggle('rule-entry')))
     for (const cleanup of rendered.cleanups) cleanup()
     logResponder = null
-    expect(clicked).toBe(true)
+    expect(findUiToggle(rendered.tree, 'debug-info').props['aria-expanded']).toBe(true)
+    expect(findUiToggle(rendered.tree, 'rule-entry').props['aria-expanded']).toBe(true)
 
-    // 详情里的「权限指纹」显示**渲染后的可视化**（原始串含 NUL，糊在界面上会被浏览器画成方框＝乱码），
-    // 原始串挂 title 供悬停/复制核对
-    expect(fieldValue(rendered.tree, '权限指纹')).toBe('pwsh · pnpm test · sandbox_permissions=danger-full-access')
-    const fingerprintField = findNodes(rendered.tree, node => node?.props?.className === 'ap-field'
-      && node.children?.[0]?.children?.[0] === '权限指纹')[0]
-    expect(fingerprintField.children?.[1]?.props?.title).toBe(key)
-    expect(fieldValue(rendered.tree, '签名摘要')).toBe('pwsh: pnpm test')
-    // 指纹是机器串，详情里同时按它的结构摊开给人看（工具 / 命令 / 额外参数），人才能管理名单
-    expect(fieldValue(rendered.tree, '工具')).toBe('pwsh')
+    // 排查区里的「权限指纹」是**渲染后的可视化 + 「复制指纹」按钮**（原始串含 NUL，糊在界面上会被浏览器画成方框＝乱码）
+    expect(fingerprintRowText(rendered.tree)).toBe('pwsh · pnpm test · sandbox_permissions=danger-full-access')
+    const fingerprintValue = findNodes(rendered.tree, node => node?.props?.className === 'ap-fingerprintValue')[0]
+    expect(fingerprintValue.props.title).toBe(key)
+    // 2026-09-18 去重：「签名摘要」与「工具」两行删了（前者与「工具 + 命令」同义，后者并进指纹行本身）
+    expect(fieldValue(rendered.tree, '签名摘要')).toBeUndefined()
+    expect(fieldValue(rendered.tree, '工具')).toBeUndefined()
+    // 指纹是机器串，排查区里按它的结构摊开剩下的两行（命令 / 额外参数），人才能管理名单
     expect(fieldValue(rendered.tree, '命令')).toBe('pnpm test')
     expect(fieldValue(rendered.tree, '额外参数')).toBe('sandbox_permissions=danger-full-access')
     // 表单里：指纹**没有**可编辑的值输入框（不许手改），而是一个「复制指纹」按钮 + 一行说明
@@ -738,6 +981,171 @@ describe('客户端半加载与注册', () => {
       && node?.props?.['aria-label'] === '匹配值')).toHaveLength(0)
     expect(JSON.stringify(rendered.tree)).toContain('pwsh · pnpm test · sandbox_permissions=danger-full-access')
     expect(JSON.stringify(rendered.tree)).toContain('权限指纹由插件算出、不能手改')
+  })
+
+  it('展开详情先给决定依据：技术字段收在默认收起的「排查信息」里', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    logResponder = () => [{
+      id: 'record-layered',
+      time: '2026-09-18T09:00:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'allow',
+      outcome: 'allowed-once',
+      decidedBy: 'auto',
+      riskLevel: 'low',
+      userAuthorization: 'high',
+      reason: 'escalate sandbox to danger-full-access: 跑测试',
+      rationale: '只读测试命令，提权只为让子进程能启动。',
+      latencyMs: 1234,
+      steps: 0,
+      usage: { inputTokens: 212, outputTokens: 112, totalTokens: 1220 },
+      route: { provider: 'p', model: 'm' },
+      signature: { toolName: 'pwsh', key: FINGERPRINT_KEY, text: 'pwsh: pnpm test', command: 'pnpm test', paths: [] },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, steps(expandRow()))
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+
+    // 明面第一眼是结论条（用户 2026-09-18 从预览页选定的「融合版」）：结论 + 风险/授权 chip
+    const callouts = findNodes(rendered.tree, node => node?.props?.className === 'ap-callout')
+    expect(callouts).toHaveLength(1)
+    expect(callouts[0].props['data-tone']).toBe('ok')
+    const dump = JSON.stringify(rendered.tree)
+    expect(dump).toContain('自动批准 · 低风险')
+    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-kvChip')
+      .map(node => node.children?.[0])).toEqual(['风险 low', '授权 high'])
+    // 结论条下面是「依据」分组：审查意见与申请原因各一行
+    expect(dump).toContain('依据')
+    expect(fieldValue(rendered.tree, '审批意见')).toBe('只读测试命令，提权只为让子进程能启动。')
+    expect(fieldValue(rendered.tree, '审批原因')).toBe('escalate sandbox to danger-full-access: 跑测试')
+    // 两个默认收起的入口并排右对齐，且都没展开
+    expect(findUiToggle(rendered.tree, 'debug-info').props['aria-expanded']).toBe(false)
+    expect(findUiToggle(rendered.tree, 'rule-entry').props['aria-expanded']).toBe(false)
+    // 技术字段一个都不在明面上（这正是「乱」的来源）：指纹 / Token / 耗时 / Reviewer / 匹配值输入框
+    expect(fieldValue(rendered.tree, '权限指纹')).toBeUndefined()
+    expect(fieldValue(rendered.tree, 'Token 消耗')).toBeUndefined()
+    expect(fieldValue(rendered.tree, 'Reviewer')).toBeUndefined()
+    expect(dump).not.toContain('1234 ms')
+    expect(JSON.stringify(findNodes(rendered.tree, node => node?.type === 'input'
+      && node?.props?.['aria-label'] === '匹配值'))).toBe('[]')
+  })
+
+  it('「排查信息」分两组（这次动作 / 审查与用量），指纹行可复制、重复行已去', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    logResponder = () => [{
+      id: 'record-debug-groups',
+      time: '2026-09-18T10:00:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'bash',
+      verdict: 'allow',
+      outcome: 'allowed-once',
+      decidedBy: 'auto',
+      riskLevel: 'low',
+      userAuthorization: 'high',
+      rationale: '只读测试命令。',
+      latencyMs: 900,
+      signature: { toolName: 'bash', key: FINGERPRINT_KEY, text: 'bash: npm test', command: 'npm test', paths: [] },
+      route: { provider: 'p', model: 'm' },
+      suggestedRule: { tool: 'bash', match: { kind: 'command_prefix', value: 'npm test' }, label: '跑测试' },
+      promotedRule: { id: 'rule-old', scope: 'global', list: 'allow', label: '老字段' },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('debug-info')))
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+
+    // 两组小标题（用户 2026-09-18 选定「分组 + 去重」）
+    const body = findNodes(rendered.tree, node => node?.props?.className === 'ap-debugBody')[0]
+    expect(findNodes(body, node => node?.props?.className === 'ap-debugGroupCaption')
+      .map(node => node.children?.[0])).toEqual(['这次动作', '审查与用量'])
+    // 去掉的四行：工具（并进指纹行本身）、签名摘要（与工具 + 命令同义）、已自动升级（恒空）、Reviewer 的「0 steps」
+    expect(fieldValue(rendered.tree, '工具')).toBeUndefined()
+    expect(fieldValue(rendered.tree, '签名摘要')).toBeUndefined()
+    expect(fieldValue(rendered.tree, '已自动升级')).toBeUndefined()
+    expect(fieldValue(rendered.tree, 'Reviewer')).toBeUndefined()
+    // 审查模型只留路由（原先那行是「路由 · 会话 · 0 steps」）
+    expect(fieldValue(rendered.tree, '审查模型')).toBe('p/m')
+    // 指纹行能一键复制整串：排查时最常做的就是拿它去核对
+    expect(findButton(rendered.tree, '复制指纹')).toBeDefined()
+  })
+
+  it('结论条：转人工 + 极高风险用警告色，人工侧结论与命中名单都收进 chip', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    logResponder = () => [{
+      id: 'record-risk',
+      time: '2026-09-18T09:30:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'deny',
+      outcome: 'rejected',
+      decidedBy: 'human',
+      riskLevel: 'critical',
+      userAuthorization: 'low',
+      reason: '清理构建产物：rm -rf dist && rm -rf D:/build-cache',
+      rationale: '命令会删除工作区外的目录，且不可撤销。',
+      rejectReason: '产物留着排查，先别动。',
+      policy: { list: 'deny', scope: 'project', ruleId: 'rule-2', label: '删除构建产物', kind: 'signature' },
+      signature: { toolName: 'pwsh', key: 'k2', text: 'pwsh: rm -rf dist', command: 'rm -rf dist', paths: [] },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, steps(expandRow()))
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+
+    const callout = findNodes(rendered.tree, node => node?.props?.className === 'ap-callout')[0]
+    expect(callout.props['data-tone']).toBe('warn')
+    expect(JSON.stringify(callout)).toContain('转人工 · 极高风险')
+    // chip 顺序：人工侧结论 → 风险 → 授权 → 命中名单（连续计数为 0 时不显示）
+    expect(findNodes(callout, node => node?.props?.className === 'ap-kvChip').map(node => node.children?.[0]))
+      .toEqual(['已拒绝', '风险 critical', '授权 low', '命中 本项目 · 删除构建产物'])
+    // 你写的拒绝理由在「依据」里，用警示色与模型意见分开
+    expect(fieldValue(rendered.tree, '人工拒绝理由')).toBe('产物留着排查，先别动。')
+
+    // 没有 risk_level 的记录（命中黑名单直接转人工 / 审查失败的老记录）：结论条不能写成「转人工 · ?风险」
+    logResponder = () => [{
+      id: 'record-no-risk',
+      time: '2026-09-18T09:40:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'bash',
+      verdict: 'defer',
+      outcome: 'rejected',
+      decidedBy: 'human',
+      rationale: '这条命令已列入黑名单。',
+      policy: { list: 'deny', scope: 'project', ruleId: 'rule-2', label: 'bash · rm -rf', kind: 'signature' },
+    }]
+    const second = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, steps(expandRow()))
+    for (const cleanup of second.cleanups) cleanup()
+    logResponder = null
+    const secondCallout = findNodes(second.tree, node => node?.props?.className === 'ap-callout')[0]
+    expect(JSON.stringify(secondCallout)).toContain('转人工')
+    expect(JSON.stringify(secondCallout)).not.toContain('?风险')
   })
 
   it('「复制指纹」复制的是完整原始串（含 NUL），不是在界面上选中那行渲染', async () => {
@@ -763,25 +1171,11 @@ describe('客户端半加载与注册', () => {
     moduleExports.apply(ctx)
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
-    let expanded = false
-    let copied = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (expanded === false) {
-        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
-        if (head === undefined) return
-        expanded = true
-        head.props.onClick()
-        return
-      }
-      if (copied) return
-      const button = findButton(tree, '复制指纹')
-      if (button === undefined) return
-      copied = true
-      button.props.onClick()
-    })
+    // 「复制指纹」按钮在默认收起的「加入名单」表单里：展开记录 → 打开表单 → 点复制
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('rule-entry'), clickButton('复制指纹')))
     for (const cleanup of rendered.cleanups) cleanup()
     logResponder = null
-    expect(copied).toBe(true)
 
     // 整串写进剪贴板：NUL 分隔符一个不少（界面上的渲染文案是另一回事）
     expect(clipboardWrites).toEqual([key])
@@ -907,17 +1301,13 @@ describe('客户端半加载与注册', () => {
     moduleExports.apply(ctx)
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
-    let clicked = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (clicked) return
-      const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
-      if (head === undefined) return
-      clicked = true
-      head.props.onClick()
-    })
+    // 展开记录 → 打开「排查信息」（比对详情那一行）→ 打开「加入名单」（比对表单草稿）
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('debug-info'), openToggle('rule-entry')))
     for (const cleanup of rendered.cleanups) cleanup()
     logResponder = null
-    expect(clicked).toBe(true)
+    expect(findUiToggle(rendered.tree, 'debug-info').props['aria-expanded']).toBe(true)
+    expect(findUiToggle(rendered.tree, 'rule-entry').props['aria-expanded']).toBe(true)
 
     // 假签名不当默认值：条件仍是权限指纹，值回落到本次签名 key（点了才不会被宿主 400 not-covering 拒）
     const kind = findNodes(rendered.tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'signature')[0]
@@ -925,7 +1315,7 @@ describe('客户端半加载与注册', () => {
     // 指纹没有输入框（不许手改），界面上是渲染后的文案；点「复制指纹」拿到的才是原始 key
     expect(findNodes(rendered.tree, node => node?.type === 'input'
       && node?.props?.['aria-label'] === '匹配值')).toHaveLength(0)
-    expect(fieldValue(rendered.tree, '权限指纹')).toBe('pwsh · pnpm vitest run · sandbox_permissions=danger-full-access')
+    expect(fingerprintRowText(rendered.tree)).toBe('pwsh · pnpm vitest run · sandbox_permissions=danger-full-access')
     // 那条建议仍如实展示在「模型建议规则」里，只是不再填空
     expect(JSON.stringify(rendered.tree)).toContain('escalation=danger-full-access')
     expect(JSON.stringify(rendered.tree)).toContain('默认是本次动作的权限指纹')
@@ -955,17 +1345,12 @@ describe('客户端半加载与注册', () => {
     moduleExports.apply(ctx)
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
-    let clicked = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (clicked) return
-      const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
-      if (head === undefined) return
-      clicked = true
-      head.props.onClick()
-    })
+    // 展开记录 → 打开「加入名单」：表单默认收起（用户 2026-09-18）
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('rule-entry')))
     for (const cleanup of rendered.cleanups) cleanup()
     logResponder = null
-    expect(clicked).toBe(true)
+    expect(findUiToggle(rendered.tree, 'rule-entry').props['aria-expanded']).toBe(true)
 
     // 建议确实覆盖本次动作：照旧当默认值（连标签一起），提示语也仍是「来自模型建议」
     // 指纹条件的值不给手改，界面上显示的是渲染后的文案（原始串可由「复制指纹」复制）
@@ -998,7 +1383,7 @@ describe('客户端半加载与注册', () => {
     expect(clicked).toBe(true)
     for (const cleanup of rendered.cleanups) cleanup()
 
-    const rows = findNodes(rendered.tree, node => node?.props?.className === 'ap-row')
+    const rows = findRows(rendered.tree)
     expect(rows).toHaveLength(1)
     const dump = JSON.stringify(rendered.tree)
     expect(dump).toContain('bash · npm test')
@@ -1030,7 +1415,7 @@ describe('客户端半加载与注册', () => {
     expect(clicked).toBe(true)
     for (const cleanup of rendered.cleanups) cleanup()
 
-    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-row')).toHaveLength(1)
+    expect(findRows(rendered.tree)).toHaveLength(1)
     const dump = JSON.stringify(rendered.tree)
     expect(dump).toContain('模型判定为只读操作')
     // 命中白名单那条 decidedBy 也是 auto，但命中名单的记录只算「白名单」，不再落进「自动」
@@ -1061,7 +1446,7 @@ describe('客户端半加载与注册', () => {
     expect(step).toBe(2)
     for (const cleanup of rendered.cleanups) cleanup()
 
-    expect(findNodes(rendered.tree, node => node?.props?.className === 'ap-row')).toHaveLength(2)
+    expect(findRows(rendered.tree)).toHaveLength(2)
     expect(findChip(rendered.tree, 'allow').props['data-on']).toBe('1')
     expect(findChip(rendered.tree, 'deny').props['data-on']).toBe('1')
     expect(findChip(rendered.tree, 'auto').props['data-on']).toBe('0')
@@ -1122,44 +1507,11 @@ describe('升级/降级的查重文案', () => {
     moduleExports.apply(ctx)
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
-    let expanded = false
-    let switched = false
-    let edited = false
-    let clicked = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (expanded === false) {
-        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
-        if (head === undefined) return
-        expanded = true
-        head.props.onClick()
-        return
-      }
-      if (switched === false) {
-        // 这一条没有模型建议：草稿默认是本次动作的权限指纹（**没有可编辑的值输入框**），
-        // 先把条件切到命令前缀（我们自己的分段按钮），下一轮才有输入框可以填
-        const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
-        if (kindButton === undefined) return
-        switched = true
-        kindButton.props.onClick()
-        return
-      }
-      if (edited === false) {
-        const value = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
-        if (value === undefined) return
-        edited = true
-        value.props.onChange({ target: { value: 'npm test' } })
-        return
-      }
-      if (clicked) return
-      const actions = findNodes(tree, node => node?.props?.className === 'ap-actions')[0]
-      if (actions === undefined) return
-      const button = findNodes(actions, node => node?.type === 'button' && node.children?.[0] === '本项目')[0]
-      if (button === undefined) return
-      clicked = true
-      button.props.onClick()
-    })
+    // 展开记录 → 打开「加入名单」→ 切到命令前缀（草稿默认是权限指纹，那档没有值输入框）→ 填值 → 点「以后直接放行」写入
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('rule-entry'), clickKind('command_prefix'),
+        fillInput('匹配值', 'npm test'), clickFormAction('以后直接放行')))
     for (const cleanup of rendered.cleanups) cleanup()
-    expect(clicked).toBe(true)
 
     const posts = bodiesOf('/rule')
     expect(posts).toHaveLength(1)
@@ -1207,25 +1559,11 @@ describe('升级/降级的查重文案', () => {
     moduleExports.apply(ctx)
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
-    let expanded = false
-    let switched = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (expanded === false) {
-        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
-        if (head === undefined) return
-        expanded = true
-        head.props.onClick()
-        return
-      }
-      if (switched) return
-      const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
-      if (kindButton === undefined) return
-      switched = true
-      kindButton.props.onClick()
-    })
+    // 展开记录 → 打开「加入名单」→ 切到命令前缀：切换会先本地推导，再请模型按该条件重新生成
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('rule-entry'), clickKind('command_prefix')))
     for (const cleanup of rendered.cleanups) cleanup()
     logResponder = null
-    expect(switched).toBe(true)
 
     // 请求里带着用户选的条件与「本地先推导出来的值」（模型据此改写，提示词由宿主补全）
     const drafts = bodiesOf('/rule/draft')
@@ -1270,26 +1608,12 @@ describe('升级/降级的查重文案', () => {
     moduleExports.apply(ctx)
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
-    let expanded = false
-    let switched = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (expanded === false) {
-        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
-        if (head === undefined) return
-        expanded = true
-        head.props.onClick()
-        return
-      }
-      if (switched) return
-      const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
-      if (kindButton === undefined) return
-      switched = true
-      kindButton.props.onClick()
-    })
+    // 展开记录 → 打开「加入名单」→ 切到命令前缀（宿主回 503，模型这次生成不了）
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('rule-entry'), clickKind('command_prefix')))
     for (const cleanup of rendered.cleanups) cleanup()
     logResponder = null
     draftResponder = null
-    expect(switched).toBe(true)
 
     const value = findNodes(rendered.tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
     expect(value.props.value).toBe("rg 'a|b' src")
@@ -1307,40 +1631,20 @@ describe('升级/降级的查重文案', () => {
     moduleExports.apply(ctx)
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
-    let expanded = false
-    let switched = false
-    let edited = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (expanded === false) {
-        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
-        if (head === undefined) return
-        expanded = true
-        head.props.onClick()
-        return
-      }
-      // 草稿默认是权限指纹（没有值输入框）：先切到路径前缀，下一轮再填值
-      if (switched === false) {
-        const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'path_prefix')[0]
-        if (kindButton === undefined) return
-        switched = true
-        kindButton.props.onClick()
-        return
-      }
-      if (edited) return
-      const value = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
-      if (value === undefined) return
-      edited = true
-      value.props.onChange({ target: { value: 'D:/repo/**/*.js' } })
-    })
+    // 展开记录 → 打开「加入名单」→ 切到路径前缀（草稿默认是权限指纹，那档没有值输入框）→ 填一个 ** 进去
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('rule-entry'), clickKind('path_prefix'),
+        fillInput('匹配值', 'D:/repo/**/*.js')))
     for (const cleanup of rendered.cleanups) cleanup()
-    expect(edited).toBe(true)
 
     const dump = JSON.stringify(rendered.tree)
     // 口径说明 + 拒绝原因都在，且写按钮被禁用（** 不会发出去）
     expect(dump).toContain('路径前缀支持单层通配')
     expect(dump).toContain('不支持 **')
-    const promote = findNodes(rendered.tree, node => node?.type === 'button' && node.children?.[0] === '本项目')[0]
-    expect(promote.props.disabled).toBe(true)
+    // 写入按钮（「以后直接放行」）在草稿非法时禁用；作用域按钮只是切换、不该被禁用
+    expect(findButton(rendered.tree, '以后直接放行').props.disabled).toBe(true)
+    expect(findNodes(rendered.tree, node => node?.props?.['data-scope'] === 'project')[0].props.disabled)
+      .toBeFalsy()
   })
 
   it('这次动作没有文件路径时，路径前缀按钮禁用并说明原因（免得生成命不中的规则）', async () => {
@@ -1366,17 +1670,12 @@ describe('升级/降级的查重文案', () => {
     moduleExports.apply(ctx)
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
-    let expanded = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (expanded) return
-      const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
-      if (head === undefined) return
-      expanded = true
-      head.props.onClick()
-    })
+    // 展开记录 → 打开「加入名单」：两个条件按钮的可用性要在表单里看
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('rule-entry')))
     for (const cleanup of rendered.cleanups) cleanup()
     logResponder = null
-    expect(expanded).toBe(true)
+    expect(findUiToggle(rendered.tree, 'rule-entry').props['aria-expanded']).toBe(true)
 
     const pathButton = findNodes(rendered.tree,
       node => node?.type === 'button' && node?.props?.['data-kind'] === 'path_prefix')[0]
@@ -1410,34 +1709,12 @@ describe('升级/降级的查重文案', () => {
     moduleExports.apply(ctx)
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
-    let expanded = false
-    let switched = false
-    let edited = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (expanded === false) {
-        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
-        if (head === undefined) return
-        expanded = true
-        head.props.onClick()
-        return
-      }
-      // 草稿默认是权限指纹（没有值输入框）：先切到命令前缀，下一轮再填值
-      if (switched === false) {
-        const kindButton = findNodes(tree, node => node?.type === 'button' && node?.props?.['data-kind'] === 'command_prefix')[0]
-        if (kindButton === undefined) return
-        switched = true
-        kindButton.props.onClick()
-        return
-      }
-      if (edited) return
-      const value = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '匹配值')[0]
-      if (value === undefined) return
-      edited = true
-      value.props.onChange({ target: { value: 'pnpm vitest run tests/*' } })
-    })
+    // 展开记录 → 打开「加入名单」→ 切到命令前缀 → 前缀里写一个 *
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('rule-entry'), clickKind('command_prefix'),
+        fillInput('匹配值', 'pnpm vitest run tests/*')))
     for (const cleanup of rendered.cleanups) cleanup()
     logResponder = null
-    expect(edited).toBe(true)
     expect(JSON.stringify(rendered.tree)).toContain('命令前缀里的 * 是字面量')
   })
 
@@ -1495,9 +1772,52 @@ describe('升级/降级的查重文案', () => {
     policyResponder = null
   })
 
+  it('「加入名单」表单：三行带可见标签、作用域选一次、两个动作按钮', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    logResponder = () => [{
+      id: 'record-form',
+      time: '2026-09-18T10:10:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'bash',
+      verdict: 'defer',
+      outcome: 'allowed-once',
+      decidedBy: 'human',
+      rationale: '先运行测试。',
+      signature: { toolName: 'bash', key: FINGERPRINT_KEY, text: 'bash: npm test', command: 'npm test', paths: [] },
+    }]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('rule-entry')))
+    for (const cleanup of rendered.cleanups) cleanup()
+    logResponder = null
+
+    const form = findNodes(rendered.tree, node => node?.props?.className === 'ap-actions')[0]
+    expect(form).toBeDefined()
+    // 三行编辑各带**可见标签**（用户 2026-09-18 选定；原先两个输入框只有 aria-label，界面上看不出哪栏是什么）
+    expect(findNodes(form, node => node?.props?.className === 'ap-field')
+      .map(row => row.children?.[0]?.children?.[0])).toEqual(['匹配条件', '匹配值', '规则标签'])
+    // 作用域只选一次（data-scope），两个动作按钮共用它
+    expect(findNodes(form, node => node?.props?.['data-scope'] !== undefined)
+      .map(node => node.props['data-scope'])).toEqual(['project', 'global'])
+    expect(findButton(form, '以后直接放行')).toBeDefined()
+    expect(findButton(form, '以后直接转人工')).toBeDefined()
+    // 旧的 4 个作用域按钮与「升级 / 降级」措辞不再出现
+    expect(findButton(rendered.tree, '升级为白名单')).toBeUndefined()
+    expect(findButton(rendered.tree, '降级为黑名单')).toBeUndefined()
+  })
+
   /**
-   * 渲染时间线 → 展开第一条记录 → 点一次「升级为白名单 · 本项目」，返回稳定后的元素树。
-   * 宿主 /rule 的回执由用例给定，用来验证三种查重结果各自的文案。
+   * 渲染时间线 → 展开第一条记录 → 打开「加入名单」入口 → 点一次「以后直接放行」，
+   * 返回稳定后的元素树。宿主 /rule 的回执由用例给定，用来验证三种查重结果各自的文案。
+   * 表单自 2026-09-18 起默认收起，所以这里比过去多一步「点开入口」。
    * @param react 假 react
    * @param pane 时间线面板注册项
    * @param reply 宿主 /rule 的回执（ok 由这里补）
@@ -1505,26 +1825,9 @@ describe('升级/降级的查重文案', () => {
    */
   async function promoteOnce(react, pane, reply) {
     ruleResponder = () => ({ ok: true, ...reply })
-    let expanded = false
-    let clicked = false
-    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
-      if (expanded === false) {
-        const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
-        if (head === undefined) return
-        expanded = true
-        head.props.onClick()
-        return
-      }
-      if (clicked) return
-      const actions = findNodes(tree, node => node?.props?.className === 'ap-actions')[0]
-      if (actions === undefined) return
-      const button = findNodes(actions, node => node?.type === 'button' && node.children?.[0] === '本项目')[0]
-      if (button === undefined) return
-      clicked = true
-      button.props.onClick()
-    })
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN },
+      steps(expandRow(), openToggle('rule-entry'), clickFormAction('以后直接放行')))
     for (const cleanup of rendered.cleanups) cleanup()
-    expect(clicked).toBe(true)
     return rendered.tree
   }
 
@@ -1636,7 +1939,7 @@ describe('升级/降级的查重文案', () => {
     expect(findButton(rendered.tree, '撤销这次加入')).toBeUndefined()
   })
 
-  it('达阈值自动写入的记录：详情里说明它是自动加入的，撤销入口照旧给', async () => {
+  it('达阈值自动写入的记录：折叠行标出「+白名单」，详情里说明未询问，撤销入口照旧给', async () => {
     const registration = await loadClient()
     const react = fakeReact()
     const moduleExports = registration.factory(specifier => {
@@ -1654,13 +1957,14 @@ describe('升级/降级的查重文案', () => {
       decidedBy: 'auto',
       rationale: '连续放行达阈值。',
       signature: { toolName: 'pwsh', key: 'k', text: 'pwsh: pnpm test', command: 'pnpm test', paths: [] },
-      // 达阈值自动写入（没问过用户）：记录里带 auto 标记与撤销凭据
+      // 达阈值自动写入（没问过用户）：记录里带 auto 标记与撤销凭据；条件是审查那次的模型建议
       ruleApplied: {
         scope: 'project',
         list: 'allow',
         ruleId: 'rule-auto',
         label: '跑测试',
         auto: true,
+        optimizedBy: 'record',
         match: { kind: 'command_prefix', value: 'pnpm test' },
       },
     }]
@@ -1668,19 +1972,116 @@ describe('升级/降级的查重文案', () => {
     const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
 
     let expanded = false
+    let collapsed = ''
     const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
       if (expanded) return
       const head = findNodes(tree, node => node?.props?.className === 'ap-rowHead')[0]
       if (head === undefined) return
       expanded = true
+      // 展开**之前**先留一份折叠态：这条记录不展开就该看到「已自动加入白名单」标识
+      collapsed = JSON.stringify(tree)
       head.props.onClick()
     })
     for (const cleanup of rendered.cleanups) cleanup()
     logResponder = null
+    // 折叠行第一行就给短标识 +白名单（2026-09-18 行头压到两行后由长句改短句），
+    // 条件来源（模型建议）与作用域 + 标签一起挂在 tooltip 上
+    expect(collapsed).toContain('+白名单')
+    const badge = findAutoBadge(rendered.tree)
+    expect(badge.props.title).toBe('连续放行达阈值后自动写入白名单，未询问；条件来自审查模型的建议：本项目 · 跑测试')
     const dump = JSON.stringify(rendered.tree)
     // 「没问过你」这件事必须在界面上说清楚，免得看起来像自己加的；撤销入口照旧给
-    expect(dump).toContain('连续放行达阈值，自动加入，未询问')
+    expect(dump).toContain('连续放行达阈值，自动加入，未询问；条件来自审查模型的建议')
     expect(findButton(rendered.tree, '撤销这次加入')).toBeDefined()
+  })
+
+  it('折叠行标出「+白名单」标识；条件来源（模型建议 / 权限指纹 / 没有来源字段的老记录）在 tooltip 里', async () => {
+    const registration = await loadClient()
+    const react = fakeReact()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx, slotRegistrations } = harness()
+    /**
+     * 一条「达阈值自动写入」的记录：条件来源（by）与「其实没写条目」（covered）由用例决定。
+     * @param {string} id 记录 id（同时用来拼它写进去的规则 id）
+     * @param {string} [by] 条件来源：record = 审查模型的建议，signature = 本次动作的权限指纹
+     * @param {boolean} [covered] 是否命中「已有规则已覆盖」那条路
+     * @returns {object} 审批记录
+     */
+    const autoRecord = (id, by, covered) => ({
+      id,
+      time: '2026-09-18T10:00:00.000Z',
+      sessionId: SESSION_KNOWN,
+      toolName: 'pwsh',
+      verdict: 'allow',
+      outcome: 'allow',
+      decidedBy: 'auto',
+      rationale: '连续放行达阈值。',
+      signature: { toolName: 'pwsh', key: 'k', text: 'pwsh: pnpm test', command: 'pnpm test', paths: [] },
+      ruleApplied: {
+        scope: 'project',
+        list: 'allow',
+        ruleId: 'rule-' + id,
+        label: '跑测试',
+        auto: true,
+        ...(by === undefined ? {} : { optimizedBy: by }),
+        ...(covered === true ? { covered: true } : {}),
+      },
+    })
+    logResponder = () => [
+      autoRecord('by-model', 'record'),
+      autoRecord('by-fingerprint', 'signature'),
+      // 加来源字段之前写下的记录：只认 auto 标记，不许瞎标来源
+      autoRecord('by-old'),
+      // 已有规则覆盖这次动作：一条都没写进去，标识必须说清楚
+      autoRecord('by-covered', 'record', true),
+    ]
+    moduleExports.apply(ctx)
+    const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+    const rendered = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN })
+    for (const cleanup of rendered.cleanups) cleanup()
+    // 注意：logResponder 要留到本用例最后再清 —— 下面还要用同一批记录再渲染一次
+    const badges = findNodes(rendered.tree, node => {
+      const className = node?.props?.className
+      if (typeof className !== 'string' || className.split(' ').includes('ap-badge') !== true) return false
+      const label = node.children?.[0]
+      return typeof label === 'string' && (label === '+白名单' || label === '+黑名单' || label.endsWith('已覆盖'))
+    })
+    // 四条记录的折叠行标识：短标记统一是 `+白名单`；覆盖命中那次改口径写明「已覆盖」
+    // ——条件来源（模型建议 / 权限指纹）不再挤在标识文字里，改由 tooltip 承载（下面逐条断言）
+    expect(badges.map(node => node.children[0])).toEqual([
+      '+白名单',
+      '+白名单',
+      '+白名单',
+      '白名单已覆盖',
+    ])
+    // 覆盖命中那次没新增条目：不能用「已自动加入」的措辞，也不该是提示色
+    expect(badges[3].props.className).toContain('ap-badgeMuted')
+    expect(badges[0].props.title).toBe('连续放行达阈值后自动写入白名单，未询问；条件来自审查模型的建议：本项目 · 跑测试')
+    expect(badges[1].props.title).toContain('条件是本次动作的权限指纹')
+    expect(badges[2].props.title).not.toContain('条件是')
+    // 覆盖命中的 tooltip 不能照抄「已写入」的说法
+    expect(badges[3].props.title).toBe('连续放行达阈值触发了自动写入，但已有规则已覆盖这次动作、未新增条目：本项目 · 跑测试')
+
+    // 覆盖命中那条展开后只说一句「达阈值但已有规则覆盖、未新增」：不能出现「未重复添加」
+    // 紧接着「自动加入」这种自相矛盾的读法，也不该给撤销入口（那条规则是别人的）
+    let expanded = false
+    const opened = await renderStable(react, pane.component, { sessionId: SESSION_KNOWN }, tree => {
+      if (expanded) return
+      const heads = findNodes(tree, node => node?.props?.className === 'ap-rowHead')
+      if (heads.length < 4) return
+      expanded = true
+      heads[3].props.onClick()
+    })
+    for (const cleanup of opened.cleanups) cleanup()
+    logResponder = null
+    const detail = JSON.stringify(opened.tree)
+    expect(detail).toContain('（连续放行达阈值，但已有规则覆盖这次动作，未新增条目）')
+    expect(detail).not.toContain('未重复添加')
+    expect(findButton(opened.tree, '撤销这次加入')).toBeUndefined()
   })
 
   it('分别提示「已更新同名规则 / 已被已有规则覆盖 / 已合并窄规则」', async () => {
@@ -1782,7 +2183,7 @@ async function rootType(react, component) {
   const frame = react.__pushFrame()
   try {
     react.__resetCursor()
-    const tree = evaluate(component({ sessionId: 'session-1' }))
+    const tree = evaluate(component({ sessionId: 'session-1' }), 0, react)
     return tree.type
   } finally {
     react.__popFrame()
