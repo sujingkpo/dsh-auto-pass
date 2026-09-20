@@ -1005,6 +1005,47 @@ describe('策略 HTTP 入口', () => {
     expect(blockedWrite.state.code).toBe(503)
   })
 
+  it('/config 的「自动打开审批时间线」按会话区分：带 session + cwd 写该会话那份，缺 cwd 直接 400', async () => {
+    const root = tempDir()
+    const projectDir = join(root, 'project')
+    const { ctx, routes } = fakeContext()
+    apply(ctx, { policyFile: join(root, 'home', 'policy.json') })
+    const handler = routes[0].handler
+    const sessionA = 'session-aaaa'
+    const sessionB = 'session-bbbb'
+
+    // 带 session + cwd：这个会话还没存过 → 跟随全局，scoped=false
+    const read = fakeHttp('GET', RECORD_CONFIG_PATH + '?cwd=' + encodeURIComponent(projectDir) + '&session=' + sessionA)
+    await handler(read.req, read.res)
+    expect(JSON.parse(read.state.body).session).toEqual({ sessionId: sessionA, autoOpenTimeline: true, scoped: false })
+
+    // 只改这个会话：落进该项目策略文件的 prefs.autoOpenTimelineSessions，不写设置命名空间
+    const write = fakeHttp('POST', RECORD_CONFIG_PATH,
+      JSON.stringify({ autoOpenTimeline: false, cwd: projectDir, session: sessionA }))
+    await handler(write.req, write.res)
+    expect(write.state.code).toBe(200)
+    expect(JSON.parse(write.state.body).session).toEqual({ sessionId: sessionA, autoOpenTimeline: false, scoped: true })
+    expect(JSON.parse(readFileSync(join(projectDir, '.dsh-auto-pass', 'policy.json'), 'utf8')).prefs)
+      .toEqual({ autoOpenTimelineSessions: { [sessionA]: false } })
+
+    // 同一个工作区里的另一个会话不受影响（按会话隔离）
+    const other = fakeHttp('GET', RECORD_CONFIG_PATH + '?cwd=' + encodeURIComponent(projectDir) + '&session=' + sessionB)
+    await handler(other.req, other.res)
+    expect(JSON.parse(other.state.body).session).toEqual({ sessionId: sessionB, autoOpenTimeline: true, scoped: false })
+
+    // 带 session 却没有 cwd：直接 400——绝不静默写全局（那会改掉所有会话的默认值）
+    const noCwd = fakeHttp('POST', RECORD_CONFIG_PATH, JSON.stringify({ autoOpenTimeline: false, session: sessionA }))
+    await handler(noCwd.req, noCwd.res)
+    expect(noCwd.state.code).toBe(400)
+    expect(JSON.parse(noCwd.state.body).error).toContain('cwd required')
+    // 非法 session（空串 / 只有空白）同样 400
+    const badSession = fakeHttp('POST', RECORD_CONFIG_PATH,
+      JSON.stringify({ autoOpenTimeline: false, cwd: projectDir, session: '   ' }))
+    await handler(badSession.req, badSession.res)
+    expect(badSession.state.code).toBe(400)
+    expect(JSON.parse(badSession.state.body).error).toContain('invalid session')
+  })
+
   it('时间线上手填的匹配条件原样写入，不再让模型改写；不覆盖本次动作的手填条件当场拒绝', async () => {
     const root = tempDir()
     const logFile = join(root, 'approvals.json')

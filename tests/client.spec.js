@@ -200,21 +200,36 @@ let policyResponder = null
 let configRequests = []
 
 /**
- * 模拟「某个工作区在项目策略文件里单独存过 prefs.autoOpenTimeline」：cwd -> boolean。
- * /config 带 cwd 时据此给出 workspace 段（与宿主的 configSnapshot 同口径）。
+ * 模拟「某个工作区在项目策略文件里单独存过 prefs.autoOpenTimeline」（老形状，宿主仍在回执里照给
+ * workspace 段但客户端不再据此判定）：cwd -> boolean。
  */
 let workspaceAutoOpen = {}
+
+/**
+ * 模拟「某个**会话**在项目策略文件里单独存过 prefs.autoOpenTimelineSessions[sessionId]」：
+ * sessionId -> boolean。/config 带 session 时据此给出 session 段（与宿主的 configSnapshot 同口径，
+ * 2026-09-20 起自动打开时间线按会话区分）。
+ */
+let sessionAutoOpen = {}
 
 /** 观察器用例里那个当前会话的工作区（harness 的 sessions 快照里的 cwd）。 */
 const WORKSPACE_CWD = 'D:\\work\\github\\dsh-auto'
 
-/** /config 的回执替身：全局那份 + （带 cwd 时）本工作区的生效值。 */
-function configPayload(cwd) {
+/** /config 的回执替身：全局那份 + （带 cwd / session 时）本工作区、本会话的生效值。 */
+function configPayload(cwd, sessionId) {
   const globalAuto = true
   const scoped = cwd === undefined ? undefined : workspaceAutoOpen[cwd]
+  const sessionScoped = cwd === undefined || sessionId === undefined ? undefined : sessionAutoOpen[sessionId]
   return {
     ok: true,
     settings: { placement: 'all', notice: true, denyDirect: false, autoOpenTimeline: globalAuto, askRejectReason: true },
+    ...(sessionId === undefined ? {} : {
+      session: {
+        sessionId,
+        autoOpenTimeline: typeof sessionScoped === 'boolean' ? sessionScoped : globalAuto,
+        scoped: typeof sessionScoped === 'boolean',
+      },
+    }),
     ...(cwd === undefined ? {} : {
       workspace: {
         cwd,
@@ -291,6 +306,7 @@ function installBrowserStubs() {
   policyResponder = null
   configRequests = []
   workspaceAutoOpen = {}
+  sessionAutoOpen = {}
   const store = new Map()
   globalThis.localStorage = {
     getItem: key => (store.has(key) ? store.get(key) : null),
@@ -361,14 +377,20 @@ function installBrowserStubs() {
     if (target.includes('/config')) {
       const body = options?.body === undefined ? undefined : JSON.parse(String(options.body))
       const fromQuery = target.includes('?cwd=')
-        ? decodeURIComponent(target.slice(target.indexOf('?cwd=') + 5))
+        ? decodeURIComponent(target.slice(target.indexOf('?cwd=') + 5).split('&')[0])
+        : undefined
+      const sessionFromQuery = target.includes('session=')
+        ? decodeURIComponent(target.slice(target.indexOf('session=') + 8).split('&')[0])
         : undefined
       const cwd = body?.cwd ?? fromQuery
+      const sessionId = body?.session ?? sessionFromQuery
       if (body !== undefined && typeof body.autoOpenTimeline === 'boolean' && cwd !== undefined) {
-        workspaceAutoOpen[cwd] = body.autoOpenTimeline
+        // 带 session 的写的是「本会话」那份（宿主写进该工作区策略文件的 prefs.autoOpenTimelineSessions）
+        if (typeof body.session === 'string' && body.session !== '') sessionAutoOpen[body.session] = body.autoOpenTimeline
+        else workspaceAutoOpen[cwd] = body.autoOpenTimeline
       }
-      configRequests.push({ method: options?.method ?? 'GET', cwd, body })
-      return { json: async () => configPayload(cwd) }
+      configRequests.push({ method: options?.method ?? 'GET', cwd, session: sessionId, body })
+      return { json: async () => configPayload(cwd, sessionId) }
     }
     return { json: async () => configPayload(undefined) }
   })
@@ -409,12 +431,15 @@ function harness(options = {}) {
   }
   // 会话列表快照替身：时间线在「全部会话」下靠它把 sessionId 翻成会话名（与 DSH 左侧列表同一份投影）；
   // current 是「当前会话」，审批观察器靠它决定看哪个会话的记录
+  // current 可变：用例用 sessions.current = 'session-other' 模拟「用户切到别的会话」
   const sessions = {
+    current: SESSION_KNOWN,
     list: {
       getSnapshot: () => ({
-        current: SESSION_KNOWN,
+        current: sessions.current,
         byId: {
           [SESSION_KNOWN]: { displayTitle: '审批面板改造', cwd: 'D:\\work\\github\\dsh-auto' },
+          'session-other': { displayTitle: '别的会话', cwd: 'D:\\work\\github\\dsh-auto' },
         },
       }),
     },
@@ -452,7 +477,7 @@ function harness(options = {}) {
     },
     effect: fn => fn(),
   }
-  return { ctx, slots, slotRegistrations, tabRegistrations, openTabs, sidebar }
+  return { ctx, slots, slotRegistrations, tabRegistrations, openTabs, sidebar, sessions }
 }
 
 /**
@@ -2329,7 +2354,7 @@ describe('审批触发后自动打开右侧栏时间线', () => {
     }
   })
 
-  it('这个开关按工作区取值：本工作区单独关掉后，即使全局开着也不自动展开', async () => {
+  it('这个开关按会话取值：本会话单独关掉后，即使全局开着也不自动展开', async () => {
     vi.useFakeTimers()
     waitTick = () => vi.advanceTimersByTimeAsync(0)
     try {
@@ -2340,8 +2365,8 @@ describe('审批触发后自动打开右侧栏时间线', () => {
         throw new Error('unexpected require: ' + specifier)
       })
       const { ctx, openTabs, sidebar } = harness()
-      // 该项目在策略文件里存过 prefs.autoOpenTimeline=false（全局那份仍是 true）
-      workspaceAutoOpen = { [WORKSPACE_CWD]: false }
+      // 该会话在策略文件里存过 prefs.autoOpenTimelineSessions[session]=false（全局那份仍是 true）
+      sessionAutoOpen = { [SESSION_KNOWN]: false }
       let records = [{ id: 'record-history', sessionId: SESSION_KNOWN, time: staleAt() }]
       logResponder = () => records
       moduleExports.apply(ctx)
@@ -2350,9 +2375,10 @@ describe('审批触发后自动打开右侧栏时间线', () => {
         for (let index = 0; index < 12; index += 1) await Promise.resolve()
       }
 
-      // 观察器读的是**带 cwd** 的那一份（不是全局那份）
+      // 观察器读的是**带 cwd + session** 的那一份（不是全局那份）
       await tick(POLL)
-      expect(configRequests.some(item => item.method === 'GET' && item.cwd === WORKSPACE_CWD)).toBe(true)
+      expect(configRequests.some(item => item.method === 'GET' && item.cwd === WORKSPACE_CWD
+        && item.session === SESSION_KNOWN)).toBe(true)
       expect(sidebar.expanded).toBe(false)
       // 新审批来了：全局开着、本工作区关着 → 不动用户的侧栏
       records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
@@ -2498,10 +2524,15 @@ describe('审批触发后自动打开右侧栏时间线', () => {
       await tick(POLL)
       expect(await badges()).toEqual([])
 
-      // 面板开着的时候来了新记录（别的会话）：先亮角标提醒
+      // 面板开着的时候，**当前会话**来了新记录：先亮角标提醒
+      records = [{ id: 'mine-1', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
+      await tick(POLL)
+      expect((await badges())[0]?.children[0]).toBe('1')
+
+      // 别的会话的记录不进当前会话的角标（按会话隔离，用户 2026-09-20）
       records = [{ id: 'other-1', sessionId: 'session-other', time: freshAt() }, ...records]
       await tick(POLL)
-      expect((await badges()).length).toBe(1)
+      expect((await badges())[0]?.children[0]).toBe('1')
 
       // 在界面上随意操作一下（这里点面板里的任意位置；聚焦 / 滚动 / 滚轮 / 键盘同一条路）→ 清除
       const root = findNodes(rendered.tree, node => node?.props?.className === 'ap-root')[0]
@@ -2522,7 +2553,7 @@ describe('审批触发后自动打开右侧栏时间线', () => {
     }
   })
 
-  it('未读角标：别的会话的新审批也计数，时间线一显示在眼前就清零', async () => {
+  it('未读角标按会话隔离：别的会话记录只算在它自己那份，打开时间线只清当前会话', async () => {
     vi.useFakeTimers()
     waitTick = () => vi.advanceTimersByTimeAsync(0)
     try {
@@ -2532,7 +2563,10 @@ describe('审批触发后自动打开右侧栏时间线', () => {
         if (specifier === 'react') return react
         throw new Error('unexpected require: ' + specifier)
       })
-      const { ctx, slotRegistrations } = harness()
+      const { ctx, slotRegistrations, openTabs, sidebar, sessions } = harness()
+      // 侧栏展开着、我们的 tab 也在（= 用户停在别的侧边工具上）：自动展开按口径不动，用例只盯角标
+      sidebar.expanded = true
+      sidebar.tabs = [{ id: 'tab-guide', kind: 'guide' }, { id: 'tab-ours', kind: 'dsh-auto-pass-log' }]
       let records = [{ id: 'history-1', sessionId: SESSION_KNOWN, time: staleAt() }]
       logResponder = () => records
       moduleExports.apply(ctx)
@@ -2549,31 +2583,109 @@ describe('审批触发后自动打开右侧栏时间线', () => {
       await tick(POLL)
       expect(await badges()).toEqual([])
 
-      // 别的会话来了两条新审批：自动展开按口径不动（不是当前会话），角标照旧提示
+      // 当前会话来了一条新审批 → 角标 1
+      records = [{ id: 'mine-1', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
+      await tick(POLL)
+      const shown = await badges()
+      expect(shown.length).toBe(1)
+      expect(shown[0].children[0]).toBe('1')
+      // 角标在 chip 的**最前面**（用户 2026-09-20）：第一个孩子就是它，图标/标题跟在后面
+      const chip = (await renderStable(react, title.component, {})).tree
+      expect(chip.children[0].props.className).toBe('ap-tabBadge')
+      expect(chip.children[0].children[0]).toBe('1')
+      expect(chip.children[1].type).toBe('svg')
+
+      // 别的会话来了两条：**不在当前会话处理**——角标还是 1，也不自动展开
       records = [
         { id: 'other-1', sessionId: 'session-other', time: freshAt() },
         { id: 'other-2', sessionId: 'session-other', time: freshAt() },
         ...records,
       ]
       await tick(POLL)
-      const shown = await badges()
-      expect(shown.length).toBe(1)
-      expect(shown[0].children[0]).toBe('2')
-      // 角标在 chip 的**最前面**（用户 2026-09-20）：第一个孩子就是它，图标/标题跟在后面
-      const chip = (await renderStable(react, title.component, {})).tree
-      expect(chip.children[0].props.className).toBe('ap-tabBadge')
-      expect(chip.children[0].children[0]).toBe('2')
-      expect(chip.children[1].type).toBe('svg')
+      expect((await badges())[0]?.children[0]).toBe('1')
+      expect(openTabs).toEqual([])
 
-      // 时间线显示在眼前 = 你已经看过了 → 清零
+      // 切到那个会话：角标是它自己的两条（按会话隔离）
+      sessions.current = 'session-other'
+      await tick(POLL)
+      expect((await badges())[0]?.children[0]).toBe('2')
+
+      // 时间线显示在眼前（本会话）= 看过了 → 清零
       const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
       const rendered = await renderStable(react, pane.component, {
-        sessionId: SESSION_KNOWN,
+        sessionId: 'session-other',
         useTabInfo: () => ({ tab: { visible: true } }),
       })
       await tick(0)
       expect(await badges()).toEqual([])
       for (const cleanup of rendered.cleanups) cleanup()
+
+      // 切回来：自己那条未读还在（清的只是各会话自己那份）
+      sessions.current = SESSION_KNOWN
+      await tick(POLL)
+      expect((await badges())[0]?.children[0]).toBe('1')
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
+  })
+
+  it('切进攒着未读的会话会展开一次：离开超过 1 分钟，或未读超过 5 条', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, openTabs, sidebar, sessions } = harness()
+      let records = [{ id: 'history-1', sessionId: SESSION_KNOWN, time: staleAt() }]
+      logResponder = () => records
+      moduleExports.apply(ctx)
+      const tick = async (ms) => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+
+      await tick(POLL) // 基线：刷新页面时堆着的历史记录不算未读
+      expect(openTabs).toEqual([])
+
+      // 别的会话攒了 2 条（从没看过这个会话 → 「离开」超过 1 分钟）→ 切过去时展开一次
+      records = [
+        { id: 'other-1', sessionId: 'session-other', time: staleAt() },
+        { id: 'other-2', sessionId: 'session-other', time: staleAt() },
+        ...records,
+      ]
+      await tick(POLL)
+      expect(openTabs).toEqual([]) // 还没切过去，不在当前会话处理
+      sessions.current = 'session-other'
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log'])
+
+      // 刚看过它（< 1 分钟）且未读不多 → 切走再切回都不再弹
+      sidebar.expanded = true // 真机 openTab 会把整栏展开：此时我们停在时间线自己身上
+      records = [{ id: 'other-3', sessionId: 'session-other', time: staleAt() }, ...records]
+      await tick(POLL)
+      sessions.current = SESSION_KNOWN
+      await tick(POLL)
+      sessions.current = 'session-other'
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log'])
+
+      // 未读超过 5 条时，即便刚看过也照旧展开一次（用户把侧栏收起来了）
+      sidebar.expanded = false
+      records = [1, 2, 3, 4, 5, 6]
+        .map(n => ({ id: 'pile-' + n, sessionId: 'session-other', time: staleAt() }))
+        .concat(records)
+      await tick(POLL)
+      sessions.current = SESSION_KNOWN
+      await tick(POLL)
+      sessions.current = 'session-other'
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log', 'dsh-auto-pass-log'])
     } finally {
       logResponder = null
       waitTick = defaultWaitTick
@@ -2582,8 +2694,8 @@ describe('审批触发后自动打开右侧栏时间线', () => {
   })
 })
 
-describe('「自动打开审批时间线」按工作区区分（2026-09-18 用户要求）', () => {
-  it('面板读写的是本工作区（带 cwd），设置页卡片读写的是全局默认（不带 cwd）', async () => {
+describe('「自动打开审批时间线」按会话区分（2026-09-20 用户要求，此前按工作区）', () => {
+  it('面板读写的是本会话（带 cwd + session），设置页卡片读写的是全局默认（都不带）', async () => {
     const registration = await loadClient()
     const react = fakeReact()
     const moduleExports = registration.factory(specifier => {
@@ -2593,25 +2705,28 @@ describe('「自动打开审批时间线」按工作区区分（2026-09-18 用�
     const { ctx, slotRegistrations } = harness()
     moduleExports.apply(ctx)
 
-    // 「审批设置」面板：知道当前工作区 → 读数带 ?cwd=，写数带 cwd（落进该项目的策略文件）
+    // 「审批设置」面板：知道当前工作区与会话 → 读数带 ?cwd= + ?session=，写数带 cwd + session
+    // （落进该项目策略文件的 prefs.autoOpenTimelineSessions[sessionId]）
     const view = slot(slotRegistrations, 'conversation.view', 'dsh-auto-pass')
     const panel = await renderStable(react, view.component, { sessionId: SESSION_KNOWN }, steps(toggleSwitch(2, false)))
     for (const cleanup of panel.cleanups) cleanup()
-    expect(configRequests.some(item => item.method === 'GET' && item.cwd === WORKSPACE_CWD)).toBe(true)
+    expect(configRequests.some(item => item.method === 'GET' && item.cwd === WORKSPACE_CWD
+      && item.session === SESSION_KNOWN)).toBe(true)
     const scopedWrite = configRequests.filter(item => item.method === 'POST').pop()
     expect(scopedWrite.cwd).toBe(WORKSPACE_CWD)
-    expect(scopedWrite.body).toEqual({ autoOpenTimeline: false, cwd: WORKSPACE_CWD })
-    // 面板里那句说明是「本工作区」版（设置页那份是所有工作区的默认值）
-    expect(JSON.stringify(panel.tree)).toContain('本工作区：有刚发生的审批时会自动展开时间线')
+    expect(scopedWrite.body).toEqual({ autoOpenTimeline: false, cwd: WORKSPACE_CWD, session: SESSION_KNOWN })
+    // 面板里那句说明是「本会话」版（设置页那份是所有会话的默认值）
+    expect(JSON.stringify(panel.tree)).toContain('本会话：有刚发生的审批时会自动展开时间线')
 
-    // 设置页卡片：没有工作区上下文 → 读写全局那份（所有工作区的默认值）
+    // 设置页卡片：没有会话上下文 → 读写全局那份（所有会话的默认值）
     const card = slot(slotRegistrations, 'settings.plugin.item', 'dsh-auto-pass')
     const settings = await renderStable(react, card.component, {}, steps(toggleSwitch(2, false)))
     for (const cleanup of settings.cleanups) cleanup()
     const globalWrite = configRequests.filter(item => item.method === 'POST').pop()
     expect(globalWrite.cwd).toBeUndefined()
+    expect(globalWrite.session).toBeUndefined()
     expect(globalWrite.body).toEqual({ autoOpenTimeline: false })
-    expect(JSON.stringify(settings.tree)).toContain('这里是所有工作区的默认值')
+    expect(JSON.stringify(settings.tree)).toContain('这里是所有会话的默认值')
   })
 })
 

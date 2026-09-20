@@ -859,6 +859,32 @@ describe('policy store', () => {
     // 重启后从项目文件读回
     expect(store().pref(cwd, 'autoOpenTimeline')).toBe(false)
   })
+
+  it('会话偏好 prefs.<key>Sessions 落进同一份项目文件：按会话各存一份，删掉即回落全局', () => {
+    const instance = store()
+    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-a')).toBeUndefined()
+    expect(instance.setSessionPref(cwd, 'autoOpenTimeline', 'session-a', false)).toBe(true)
+    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-a')).toBe(false)
+    // 同一个工作区里的另一个会话不受影响（2026-09-20：按会话隔离）
+    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-b')).toBeUndefined()
+    expect(instance.setSessionPref(cwd, 'autoOpenTimeline', 'session-b', true)).toBe(true)
+    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-a')).toBe(false)
+    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-b')).toBe(true)
+    // 老的工作区那层与它并存（不再参与判定，但不会被踩掉）
+    expect(instance.setPref(cwd, 'autoOpenTimeline', true)).toBe(true)
+    expect(instance.pref(cwd, 'autoOpenTimeline')).toBe(true)
+    expect(JSON.parse(readFileSync(projectPolicyFile(cwd), 'utf8')).prefs)
+      .toEqual({ autoOpenTimeline: true, autoOpenTimelineSessions: { 'session-a': false, 'session-b': true } })
+    // 删掉某条会话的覆盖（undefined）→ 这个会话回到「没存过」，调用方据此回落全局
+    expect(instance.setSessionPref(cwd, 'autoOpenTimeline', 'session-a', undefined)).toBe(true)
+    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-a')).toBeUndefined()
+    // 没有 cwd / 空 sessionId：写失败（调用方如实报错，绝不把「本会话」静默写成全局）
+    expect(instance.setSessionPref(undefined, 'autoOpenTimeline', 'session-a', true)).toBe(false)
+    expect(instance.setSessionPref(cwd, 'autoOpenTimeline', '', true)).toBe(false)
+    expect(instance.sessionPref(undefined, 'autoOpenTimeline', 'session-a')).toBeUndefined()
+    // 重启后从项目文件读回
+    expect(store().sessionPref(cwd, 'autoOpenTimeline', 'session-b')).toBe(true)
+  })
 })
 
 describe('observe（连续计数与升级建议）', () => {

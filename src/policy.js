@@ -17,6 +17,8 @@
  * @modify 2026-09-16 计数按工作区拆成 counters/<slug>.json（用户要求）：pruneCounters 改成单工作区口径、新增 canonicalizeMemoryCounters / defaultCounterDir / COUNTER_FILE_VERSION；启动时把老全局文件里的 `<cwd>\u0000<memoryKey>` 计数迁移过去并折算瘦身
  * @modify 2026-09-18 项目策略文件多一段 prefs（工作区级界面偏好，目前只有 autoOpenTimeline），
  *   新增 pref / setPref：跟项目规则同一份文件，所以「这个工作区要不要自动开时间线」跟着项目走
+ * @modify 2026-09-20 同一段再加一层会话级映射 prefs.<key>Sessions[sessionId]（sessionPref /
+ *   setSessionPref）：自动打开时间线改成**按会话**区分（用户要求），工作区那层保留在文件里但不再参与判定
  */
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -1022,6 +1024,50 @@ export function createPolicyStore(options = {}) {
     return write(project.file, project.doc) === true
   }
 
+  /** 会话级偏好存在 prefs 里的映射键：autoOpenTimeline → autoOpenTimelineSessions。 */
+  function sessionMapKey(key) {
+    return key + 'Sessions'
+  }
+
+  /** 取 prefs.<key>Sessions 这张表（形状不对就当没有）。 */
+  function sessionPrefMap(cwd, key) {
+    const map = projectDoc(cwd)?.doc?.prefs?.[sessionMapKey(key)]
+    return map !== null && typeof map === 'object' && !Array.isArray(map) ? map : undefined
+  }
+
+  /**
+   * 读一个**会话**的界面偏好（存在该项目策略文件 prefs.<key>Sessions[sessionId] 里）。
+   * 会话属于某个工作区，所以仍然要 cwd 才能定位文件；没 cwd、没存过、sessionId 为空 → undefined，
+   * 调用方回落到全局设置页那份值（2026-09-20 用户要求：原先按工作区区分的那份改按会话区分）。
+   * @param cwd 工作区目录
+   * @param key 偏好键（目前只有 autoOpenTimeline）
+   * @param sessionId 会话 id
+   * @returns {*} 存下来的值；没有时 undefined
+   */
+  function sessionPref(cwd, key, sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return undefined
+    const value = sessionPrefMap(cwd, key)?.[sessionId]
+    return value === undefined ? undefined : value
+  }
+
+  /**
+   * 写一个**会话**的界面偏好；`value === undefined` 表示删掉这条会话的覆盖（回到全局默认）。
+   * 与项目规则同一份文件；**没有 cwd 或 sessionId 时返回 false**——调用方如实报错，
+   * 绝不把「这个会话的开关」静默写成全局默认（那会改掉所有会话）。
+   * @returns {boolean} 是否落盘成功
+   */
+  function setSessionPref(cwd, key, sessionId, value) {
+    if (typeof sessionId !== 'string' || sessionId === '') return false
+    const project = projectDoc(cwd)
+    if (project === undefined) return false
+    const mapKey = sessionMapKey(key)
+    const next = { ...(sessionPrefMap(cwd, key) ?? {}) }
+    if (value === undefined) delete next[sessionId]
+    else next[sessionId] = value
+    project.doc.prefs = { ...project.doc.prefs, [mapKey]: next }
+    return write(project.file, project.doc) === true
+  }
+
   function view(doc) {
     return Object.freeze({
       allow: Object.freeze([...doc.rules.allow]),
@@ -1274,6 +1320,9 @@ export function createPolicyStore(options = {}) {
     /** 工作区级界面偏好：读 / 写该工作区项目策略文件里的 prefs（见上面那两个函数）。 */
     pref,
     setPref,
+    /** 会话级界面偏好：读 / 写同一份文件里 prefs.<key>Sessions[sessionId]（2026-09-20 起自动打开时间线按会话区分）。 */
+    sessionPref,
+    setSessionPref,
     /** 落一条白/黑名单规则（时间线升级/降级与记忆自动升级都走这里）。 */
     addRule,
     /** 改一条已有规则（面板里微调匹配条件/标签，按 id 原地更新）。 */

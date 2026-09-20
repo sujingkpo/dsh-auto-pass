@@ -19,6 +19,10 @@
  *   （record=审查模型的建议 / signature=本次动作的权限指纹）：审批时间线的折叠行据此标出标识
  * @modify 2026-09-18 「自动打开审批时间线」按工作区区分：/config 认 ?cwd=，回执多一段
  *   workspace{autoOpenTimeline,scoped}；POST 带 cwd 时把它写进该工作区的项目策略文件 prefs
+ * @modify 2026-09-20 改成**按会话**区分（用户要求）：/config 再认 ?session=，回执多一段
+ *   session{sessionId,autoOpenTimeline,scoped}；POST 带 session + cwd 时写进该工作区项目策略文件的
+ *   prefs.autoOpenTimelineSessions[sessionId]。会话级写不成（没有 cwd）**直接 400**，绝不静默写全局——
+ *   那会改掉所有会话的默认值。工作区那层保留（回执里照给 workspace 段）但不再参与判定
  */
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -378,7 +382,7 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
       }
       // 全部界面偏好一次给全：placement 决定面板挂哪，notice / denyDirect 是两个行为开关。
       // 带 ?cwd= 时额外给出**本工作区**的生效值（自动打开时间线这个开关按工作区区分）
-      writeJson(200, configSnapshot(ctx, config, policies, records, requestedCwd(url.searchParams.get('cwd'))))
+      writeJson(200, configSnapshot(ctx, config, policies, records, requestedCwd(url.searchParams.get('cwd')), requestedSession(url.searchParams.get('session'))))
       return
     }
     if (pathname === POLICY_PATH) {
@@ -436,6 +440,8 @@ const CONFIG_SETTINGS = Object.freeze({
 
 /** 请求里带的工作区目录（`?cwd=` 或请求体的 cwd）的长度上限：只用来定位项目策略文件。 */
 const MAX_CWD_CHARS = 512
+/** 会话 id 的长度上限（只是防脏值；宿主自己的 sessionId 都很短）。 */
+const MAX_SESSION_CHARS = 200
 
 /**
  * 清洗请求里的工作区目录：只认非空字符串、超长的当没有。
@@ -449,17 +455,32 @@ function requestedCwd(value) {
 }
 
 /**
- * `/config` 的回执（GET 与 POST 共用）：全局设置 + （带 cwd 时）本工作区生效值。
- * 自动打开审批时间线按工作区区分（用户 2026-09-18）：workspace.scoped 表示这个工作区
- * 在项目策略文件里单独存过值，autoOpenTimeline 已经是「项目覆盖 → 全局设置 → config → 默认」
- * 之后的生效值，客户端据此决定是否自动展开时间线。
+ * 清洗请求里的会话 id：只认非空字符串、超长的当没有。
+ * 这个值只用来定位 `prefs.autoOpenTimelineSessions[sessionId]`。
+ * @returns {string|undefined} 会话 id
+ */
+function requestedSession(value) {
+  if (typeof value !== 'string') return undefined
+  const sessionId = value.trim()
+  return sessionId === '' || sessionId.length > MAX_SESSION_CHARS ? undefined : sessionId
+}
+
+/**
+ * `/config` 的回执（GET 与 POST 共用）：全局设置 + （带 cwd / session 时）本工作区与本会话的生效值。
+ * 自动打开审批时间线**按会话区分**（用户 2026-09-20；此前按工作区，2026-09-18）：session.scoped 表示
+ * 这个会话在项目策略文件里单独存过值，autoOpenTimeline 已经是「会话覆盖 → 全局设置 → config → 默认」
+ * 之后的生效值，客户端据此决定是否自动展开时间线。workspace 段仍在回执里（老字段照给，不参与判定）。
  * @param cwd 请求带的工作区目录（没有就只给全局那份）
+ * @param sessionId 请求带的会话 id（没有就不给 session 段）
  * @returns {object} 回执体
  */
-function configSnapshot(ctx, config, policies, records, cwd) {
+function configSnapshot(ctx, config, policies, records, cwd, sessionId) {
   const settings = typeof ctx.get === 'function' ? ctx.get('settings') : undefined
   const autoOpenTimeline = effectiveFlag(ctx, config, 'autoOpenTimeline')
   const scopedValue = cwd === undefined ? undefined : policies.pref(cwd, 'autoOpenTimeline')
+  const sessionValue = cwd === undefined || sessionId === undefined
+    ? undefined
+    : policies.sessionPref(cwd, 'autoOpenTimeline', sessionId)
   return {
     ok: true,
     settings: {
@@ -469,6 +490,13 @@ function configSnapshot(ctx, config, policies, records, cwd) {
       autoOpenTimeline,
       askRejectReason: effectiveAskRejectReason(ctx, config),
     },
+    ...(sessionId === undefined ? {} : {
+      session: {
+        sessionId,
+        autoOpenTimeline: typeof sessionValue === 'boolean' ? sessionValue : autoOpenTimeline,
+        scoped: typeof sessionValue === 'boolean',
+      },
+    }),
     ...(cwd === undefined ? {} : {
       workspace: {
         cwd,
@@ -487,9 +515,13 @@ function configSnapshot(ctx, config, policies, records, cwd) {
 /**
  * 写入界面偏好：请求体里的白名单键逐个校验后（placement / notice / denyDirect /
  * autoOpenTimeline / askRejectReason）合并写进设置命名空间（settings.update 是 patch 语义，
- * 未提到的键保持原值）。**`autoOpenTimeline` 例外**：带 cwd 时写进该工作区的项目策略文件
- * （`prefs.autoOpenTimeline`，那份是「本工作区」的值），不带 cwd 才写全局设置（设置页卡片 =
- * 所有工作区的默认值）。没有可写 settings 且这一笔确实要写全局时返回 503。
+ * 未提到的键保持原值）。**`autoOpenTimeline` 例外**，它分三层：
+ * ① 带 `session` + cwd → 写该会话那份（`prefs.autoOpenTimelineSessions[sessionId]`，2026-09-20 起
+ *    这是主路径）；带 session 却没 cwd → **400 cwd-required**（不能把「本会话」写成全局，那会改掉
+ *    所有会话的值）；
+ * ② 只带 cwd（老客户端）→ 写该工作区那份（`prefs.autoOpenTimeline`，保留兼容）；
+ * ③ 都不带 → 写全局设置（设置页卡片 = 所有会话的默认值）。
+ * 没有可写 settings 且这一笔确实要写全局时返回 503。
  */
 async function updateConfig(req, ctx, writeJson, config, policies, records) {
   const body = await readJsonBody(req)
@@ -511,12 +543,30 @@ async function updateConfig(req, ctx, writeJson, config, policies, records) {
     return
   }
   const cwd = requestedCwd(body.cwd)
-  if (patch.autoOpenTimeline !== undefined && cwd !== undefined
+  const sessionId = requestedSession(body.session)
+  if (patch.autoOpenTimeline !== undefined && body.session !== undefined && sessionId === undefined) {
+    // session 字段给了但不可用（空串 / 超长）：宁可报错也不把它当「全局」，否则一次误传会把
+    // 所有会话的默认值改掉
+    writeJson(400, { ok: false, error: 'invalid session' })
+    return
+  }
+  if (patch.autoOpenTimeline !== undefined && sessionId !== undefined && cwd === undefined) {
+    // 「本会话」的开关必须能定位到工作区文件才写得了；写不成就如实报错，别静默降级成全局
+    writeJson(400, { ok: false, error: 'cwd required for a session-scoped setting' })
+    return
+  }
+  if (patch.autoOpenTimeline !== undefined && sessionId !== undefined
+    && policies.setSessionPref(cwd, 'autoOpenTimeline', sessionId, patch.autoOpenTimeline) === true) {
+    delete patch.autoOpenTimeline
+  } else if (patch.autoOpenTimeline !== undefined && sessionId !== undefined) {
+    // 项目写盘失败（只读项目 / 策略能力被关掉）：降级写全局默认——跟 addRule 同口径，
+    // 「别让这个开关变成死的」，日志里留一句说明这次放宽到了所有会话
+    ctx.logger.warn('dsh-auto-pass: 会话偏好写入失败，改为写入全局设置：' + cwd + ' / ' + sessionId)
+  } else if (patch.autoOpenTimeline !== undefined && cwd !== undefined
     && policies.setPref(cwd, 'autoOpenTimeline', patch.autoOpenTimeline) === true) {
     delete patch.autoOpenTimeline
   } else if (patch.autoOpenTimeline !== undefined && cwd !== undefined) {
-    // 项目写盘失败（只读项目 / 策略能力被关掉）：降级写全局默认——跟 addRule 同口径，
-    // 「别让这个开关变成死的」，日志里留一句说明这次放宽到了所有工作区
+    // 老路径（只带 cwd，没有 session）：同上，失败降级写全局
     ctx.logger.warn('dsh-auto-pass: 工作区偏好写入失败，改为写入全局设置：' + cwd)
   }
   if (Object.keys(patch).length > 0) {
@@ -527,8 +577,8 @@ async function updateConfig(req, ctx, writeJson, config, policies, records) {
     }
     await settings.update(SETTINGS_NAMESPACE, patch)
   }
-  // 回执与 GET 同形状：客户端拿到就能直接套用（含本工作区的生效值）
-  writeJson(200, configSnapshot(ctx, config, policies, records, cwd))
+  // 回执与 GET 同形状：客户端拿到就能直接套用（含本工作区 / 本会话的生效值）
+  writeJson(200, configSnapshot(ctx, config, policies, records, cwd, sessionId))
 }
 
 /** 读取请求体文本（超长请求由调用方的 try/catch 兜住）。 */

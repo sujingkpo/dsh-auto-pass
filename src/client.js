@@ -49,7 +49,7 @@
  *   ④ 移除「本次会话 / 全部会话」切换（面板固定看本次会话），记录字段与宿主 /log 接口一律保留——
  *      随之删掉会话名那行小字（.ap-session）与 t.scopeSession / t.scopeAll，sessionNameOf 成为死代码被删
  * @modify 2026-09-18 「自动打开审批时间线」按钮按工作区区分（用户要求）：runtimeStore 多出
- *   workspaceCwd / autoOpenWorkspace / autoOpenScoped 与 autoOpenFor(cwd)，load/save 接受 cwd
+ *   sessionId / autoOpenSession / autoOpenScoped 与 autoOpenFor(sessionId)，load(cwd, sessionId) / save(patch, {cwd, session})
  *   （POST 带 cwd 时宿主写该项目策略文件的 prefs）；面板里的开关读写本工作区那份，
  *   设置页卡片仍是所有工作区的默认值
  */
@@ -84,6 +84,14 @@ window.__ModuleLoader__.load({
      * 于是「刚切过去 / 刚刷新就赶上审批」照样会弹，而翻到的历史记录只记基线。
      */
     const AUTO_OPEN_FRESH_MS = 60_000
+    /**
+     * 切进一个会话时允许自动展开的未读上限（用户 2026-09-20 口径）：攒得比这还多就一定弹一次。
+     */
+    const UNREAD_AUTO_OPEN_MAX = 5
+    /**
+     * 切进一个会话时，「上次看过它」距今超过这个时长（毫秒）而期间攒了未读 → 自动展开一次。
+     */
+    const AUTO_OPEN_AFTER_AWAY_MS = 60_000
     /**
      * 未读角标每次取多少条记录：一次请求同时喂「自动展开」与「未读计数」（不带 session 查全部会话，
      * 最新在前）。只关心刚发生的审批，30 条足够。
@@ -306,8 +314,8 @@ window.__ModuleLoader__.load({
         denyDirectTitle: '黑名单直接拒绝',
         denyDirectHint: '命中黑名单时直接把这次调用判为拒绝（工具调用失败），不再弹人工审批卡',
         autoOpenTitle: '自动打开审批时间线',
-        autoOpenHint: '有刚发生的审批（1 分钟内）时自动展开审批时间线；切会话 / 刷新后翻到的历史记录不弹，已显示、或时间线 tab 还开着而右侧栏停在其他工具上时也不打扰（手动关掉时间线 tab 后，下一次审批会把它重新打开）——其余情况由 tab 上的未读角标提示（这里是所有工作区的默认值）',
-        autoOpenHintWorkspace: '本工作区：有刚发生的审批时会自动展开时间线（右侧栏收起、或你手动关掉了时间线 tab，都算「该展开」）；历史记录、已显示、以及时间线 tab 还开着而停在别的工具上，都不打扰——由 tab 上的未读角标提示',
+        autoOpenHint: '有刚发生的审批（1 分钟内）时自动展开审批时间线；切进一个攒着未读的会话（离开超过 1 分钟、或未读超过 5 条）也会展开一次。切会话 / 刷新后翻到的历史记录不弹，已显示、或时间线 tab 还开着而右侧栏停在其他工具上时也不打扰（手动关掉时间线 tab 后，下一次审批会把它重新打开）——其余情况由 tab 上的未读角标提示，**角标按会话隔离、只显示当前会话的未读数**（这里是所有会话的默认值）',
+        autoOpenHintSession: '本会话：有刚发生的审批时会自动展开时间线（右侧栏收起、或你手动关掉了时间线 tab，都算「该展开」）；切进本会话时若还攒着未读（离开超过 1 分钟、或超过 5 条）也会展开一次；已显示、或时间线 tab 还开着而停在别的工具上都不打扰——由 tab 上的未读角标提示（只算本会话）',
         unreadTitle: '有未读的审批记录（打开时间线、或在界面里任意操作即清除）',
         askReasonTitle: '拒绝后追问理由',
         askReasonHint: '你拒绝一次审批后，插件问一句拒绝理由并注入模型上下文（默认选项就是本次的模型审批意见）',
@@ -483,8 +491,8 @@ window.__ModuleLoader__.load({
         denyDirectTitle: 'Reject on denylist',
         denyDirectHint: 'A denylist hit fails the tool call outright instead of opening a human approval card',
         autoOpenTitle: 'Open the approval timeline automatically',
-        autoOpenHint: 'Expand the approval timeline when an approval just happened (within a minute); records found after switching sessions or reloading never pop, and it stays put while the timeline is visible or the sidebar is on another tool with our tab still open (closing the timeline tab yourself means the next approval reopens it) — everything else shows as the unread badge on the tab (this is the default for every workspace)',
-        autoOpenHintWorkspace: 'This workspace: a just-happened approval expands the timeline when the sidebar is collapsed or when you have closed the timeline tab yourself; history, a visible timeline, and another tool being on screen while our tab is still open are left alone and reported by the tab badge instead',
+        autoOpenHint: 'Expand the approval timeline when an approval just happened (within a minute); switching into a session that piled up unread records (away for over a minute, or more than 5 unread) also expands it once. Records found after switching sessions or reloading never pop, and it stays put while the timeline is visible or the sidebar is on another tool with our tab still open (closing the timeline tab yourself means the next approval reopens it) — everything else shows as the unread badge, which is **per session and counts only the session you are in** (this is the default for every session)',
+        autoOpenHintSession: 'This session: a just-happened approval expands the timeline when the sidebar is collapsed or when you have closed the timeline tab yourself, and switching back into this session expands it once when unread records piled up (away for over a minute, or more than 5 unread); a visible timeline and another tool being on screen while our tab is still open are left alone and reported by the tab badge instead (this session only)',
         unreadTitle: 'Unread approval records (cleared once you open the timeline or touch the UI)',
         askReasonTitle: 'Ask for a rejection reason',
         askReasonHint: 'After you reject an approval, the plugin asks for a reason and injects it into the model context (the model review note is the default answer)',
@@ -843,19 +851,20 @@ window.__ModuleLoader__.load({
      * 界面偏好状态：唯一真值在宿主（config 默认值 + 设置命名空间覆盖）。
      * placement 决定面板挂在哪里（变更会广播出去重新挂载），notice / denyDirect 是两个行为开关
      * （关掉通知注入、开启黑名单直接拒绝）。设置页卡片与审批设置面板共用这一份状态。
-     * **「自动打开审批时间线」按工作区区分**（用户 2026-09-18）：设置页那份是所有工作区的默认值
-     * （`autoOpenTimeline`），每个工作区可以在「审批设置」面板里单独设一份（宿主存在该项目策略
-     * 文件的 prefs 里）；`load(cwd)` 拿回来的 `workspace` 段带着本工作区的生效值。
+     * **「自动打开审批时间线」按会话区分**（用户 2026-09-20，此前按工作区）：设置页那份是所有会话的
+     * 默认值（`autoOpenTimeline`），每个会话可以在「审批设置」面板里单独设一份（宿主存在该项目策略
+     * 文件的 `prefs.autoOpenTimelineSessions[<sessionId>]` 里）；`load(cwd, sessionId)` 拿回来的
+     * `session` 段带着本会话的生效值。工作区那层（老 `workspace` 段）保留在回执里但不再参与判定。
      */
     const runtimeStore = {
       placement: 'all',
       notice: true,
       denyDirect: false,
-      // 设置页那份「自动打开审批时间线」= 所有工作区的默认值（默认开）
+      // 设置页那份「自动打开审批时间线」= 所有会话的默认值（默认开）
       autoOpenTimeline: true,
-      // 本工作区单独设过的那份（宿主回执里带 cwd 时才有）+ 它是哪个工作区的
-      workspaceCwd: undefined,
-      autoOpenWorkspace: undefined,
+      // 本会话单独设过的那份（宿主回执里带 session 时才有）+ 它是哪个会话的
+      sessionId: undefined,
+      autoOpenSession: undefined,
       autoOpenScoped: false,
       // 人工拒绝后追问一句拒绝理由（默认开）
       askRejectReason: true,
@@ -870,14 +879,14 @@ window.__ModuleLoader__.load({
         for (const listener of [...this.listeners]) listener(this.placement)
       },
       /**
-       * 某个工作区此刻**生效**的「自动打开审批时间线」：该工作区存过就用它的，否则用全局那份。
-       * 观察器与面板都只认它——所以声明式地要求「就是问这个 cwd 的值」，上一个工作区的值不会被借用。
-       * @param cwd 工作区目录（拿不到时只能回落到全局那份）
+       * 某个会话此刻**生效**的「自动打开审批时间线」：该会话存过就用它的，否则用全局那份。
+       * 观察器与面板都只认它——所以声明式地要求「就是问这个 sessionId 的值」，上一个会话的值不会被借用。
+       * @param sessionId 会话 id（拿不到时只能回落到全局那份）
        * @returns {boolean} 生效值
        */
-      autoOpenFor(cwd) {
-        if (typeof cwd === 'string' && cwd !== '' && this.workspaceCwd === cwd
-          && typeof this.autoOpenWorkspace === 'boolean') return this.autoOpenWorkspace
+      autoOpenFor(sessionId) {
+        if (typeof sessionId === 'string' && sessionId !== '' && this.sessionId === sessionId
+          && typeof this.autoOpenSession === 'boolean') return this.autoOpenSession
         return this.autoOpenTimeline
       },
       /** 把宿主回执（`settings` 全局 + `workspace` 本工作区）套用到本地状态；认不出的值保持原样。 */
@@ -892,22 +901,25 @@ window.__ModuleLoader__.load({
         if (typeof settings.denyDirect === 'boolean') this.denyDirect = settings.denyDirect
         if (typeof settings.autoOpenTimeline === 'boolean') this.autoOpenTimeline = settings.autoOpenTimeline
         if (typeof settings.askRejectReason === 'boolean') this.askRejectReason = settings.askRejectReason
-        const workspace = payload.workspace
-        if (workspace !== null && typeof workspace === 'object' && typeof workspace.cwd === 'string' && workspace.cwd !== '') {
-          this.workspaceCwd = workspace.cwd
-          this.autoOpenWorkspace = typeof workspace.autoOpenTimeline === 'boolean' ? workspace.autoOpenTimeline : undefined
-          this.autoOpenScoped = workspace.scoped === true
+        const session = payload.session
+        if (session !== null && typeof session === 'object' && typeof session.sessionId === 'string' && session.sessionId !== '') {
+          this.sessionId = session.sessionId
+          this.autoOpenSession = typeof session.autoOpenTimeline === 'boolean' ? session.autoOpenTimeline : undefined
+          this.autoOpenScoped = session.scoped === true
         } else {
-          // 不带 cwd 的回执：清掉工作区态，免得把上一个工作区的值当成这个工作区的
-          this.workspaceCwd = undefined
-          this.autoOpenWorkspace = undefined
+          // 不带 session 的回执（例如设置页卡片那次）：清掉会话态，免得把上一个会话的值当成这个会话的
+          this.sessionId = undefined
+          this.autoOpenSession = undefined
           this.autoOpenScoped = false
         }
       },
-      /** 读界面偏好；带 cwd 时一并拿回该工作区的生效值（自动打开时间线按工作区区分）。 */
-      async load(cwd) {
+      /** 读界面偏好；带 cwd / sessionId 时一并拿回该工作区、该会话的生效值（自动打开时间线按会话区分）。 */
+      async load(cwd, sessionId) {
         try {
-          const query = typeof cwd === 'string' && cwd !== '' ? '?cwd=' + encodeURIComponent(cwd) : ''
+          const params = []
+          if (typeof cwd === 'string' && cwd !== '') params.push('cwd=' + encodeURIComponent(cwd))
+          if (typeof sessionId === 'string' && sessionId !== '') params.push('session=' + encodeURIComponent(sessionId))
+          const query = params.length === 0 ? '' : '?' + params.join('&')
           const response = await fetch(API_CONFIG + query, { headers: { accept: 'application/json' } })
           const data = await response.json()
           this.apply(data)
@@ -920,10 +932,17 @@ window.__ModuleLoader__.load({
       },
       /**
        * 写一个偏好并套用宿主回执；失败抛出由调用方回滚。
-       * 带 cwd 的 `autoOpenTimeline` 写的是**该工作区**那份（宿主落进它的项目策略文件）。
+       * `scope` 给 `{cwd, session}` 时，`autoOpenTimeline` 写的是**该会话**那份
+       * （宿主落进该工作区项目策略文件的 prefs.autoOpenTimelineSessions）。
        */
-      async save(patch, cwd) {
-        const body = typeof cwd === 'string' && cwd !== '' ? { ...patch, cwd } : patch
+      async save(patch, scope) {
+        const body = scope === undefined || scope === null
+          ? patch
+          : {
+            ...patch,
+            ...(typeof scope.cwd === 'string' && scope.cwd !== '' ? { cwd: scope.cwd } : {}),
+            ...(typeof scope.session === 'string' && scope.session !== '' ? { session: scope.session } : {}),
+          }
         const response = await fetch(API_CONFIG, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -973,26 +992,56 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 未读角标：本轮页面里「已经落盘、但你还没看过」的审批记录数。
-     * 首次观测只记基线（刷新页面后堆在那里的历史记录不算未读）；时间线显示在眼前即清零。
-     * **它是「自动展开」之外的兜底提示**：审批发生在别的会话、或右侧栏展开着停在别的工具上时，
-     * 自动展开按口径不动（不抢焦点），但角标照旧告诉你「有新的」（2026-09-20 用户要求）。
+     * 未读角标：**按会话隔离**（用户 2026-09-20 要求）——每个会话各自一份「已经落盘、但你还没看过」
+     * 的记录集合，tab 上的角标只显示**当前会话**那个数字；别的会话的审批不在当前会话处理，只在自己的
+     * 会话里计数（切过去时才看得到）。
+     * 首次观测只记基线（刷新页面后堆在那里的历史记录不算未读）；时间线显示在眼前、或（已经打开时）
+     * 任意操作即清零；另有 seenAt 记「上次看过这个会话」的时刻，供切换会话时的自动展开判定使用。
+     * **它是「自动展开」之外的兜底提示**：右侧栏展开着停在别的工具上时自动展开不动，角标照旧提示。
      */
     const unreadStore = {
-      count: 0,
+      /** 全局已知记录 id：避免同一批记录反复计数（整页会话生命周期内有效）。 */
       known: new Set(),
-      unread: new Set(),
+      /** sessionId → 未读记录 id 集合（按会话隔离）。 */
+      buckets: new Map(),
+      /** sessionId → 上次「看过这个会话的时间线」的时刻（毫秒）；没看过就没有这个键。 */
+      seenAt: new Map(),
       baselined: false,
+      /** 当前会话：角标只显示它自己的未读数（'':拿不到会话时的空桶）。 */
+      current: '',
       listeners: new Set(),
       subscribe(listener) {
         this.listeners.add(listener)
         return () => { this.listeners.delete(listener) }
       },
-      refresh() {
-        this.count = this.unread.size
-        for (const listener of [...this.listeners]) listener(this.count)
+      /** 广播当前会话的未读数。 */
+      emit() {
+        const count = this.countFor(this.current)
+        for (const listener of [...this.listeners]) listener(count)
       },
-      /** 记一批记录（最新在前）：首次调用只建基线，之后新出现的 id 计入未读。 */
+      /** 某个会话的未读数（角标与切换判定都只认它）。 */
+      countFor(sessionId) {
+        const bucket = this.buckets.get(sessionId === undefined ? '' : String(sessionId))
+        return bucket === undefined ? 0 : bucket.size
+      },
+      /** 切到某个会话：角标跟着换到它的数字（没变就不广播）。 */
+      setCurrent(sessionId) {
+        const next = sessionId === undefined ? '' : String(sessionId)
+        if (next === this.current) return
+        this.current = next
+        this.emit()
+      },
+      /** 记下「你看过这个会话了」（面板可见、任意操作、以及自动展开成功时）。 */
+      markSeen(sessionId) {
+        if (sessionId === undefined || sessionId === '') return
+        this.seenAt.set(String(sessionId), Date.now())
+      },
+      /** 距上次看过这个会话有多久（毫秒）；从没看过 = Infinity（切过去就该弹一次）。 */
+      awayMs(sessionId) {
+        const at = this.seenAt.get(sessionId === undefined ? '' : String(sessionId))
+        return at === undefined ? Number.POSITIVE_INFINITY : Date.now() - at
+      },
+      /** 记一批记录（最新在前）：首次调用只建基线；之后按 sessionId 分桶，只对当前会话广播。 */
       note(records) {
         let changed = false
         for (const record of records) {
@@ -1000,21 +1049,35 @@ window.__ModuleLoader__.load({
           if (key === '' || this.known.has(key)) continue
           this.known.add(key)
           if (this.baselined === true) {
-            this.unread.add(key)
-            changed = true
+            const sessionId = String(record?.sessionId ?? '')
+            const bucket = this.buckets.get(sessionId) ?? new Set()
+            bucket.add(key)
+            this.buckets.set(sessionId, bucket)
+            if (sessionId === this.current) changed = true
           }
         }
         if (this.baselined !== true) {
           this.baselined = true
           return
         }
-        if (changed) this.refresh()
+        if (changed) this.emit()
       },
-      /** 时间线显示在眼前 = 你已经看过了：清零。 */
-      clear() {
-        if (this.unread.size === 0) return
-        this.unread.clear()
-        this.refresh()
+      /** 某个会话的未读清零（时间线显示在眼前 / 任意操作）。 */
+      clear(sessionId) {
+        const key = sessionId === undefined ? '' : String(sessionId)
+        const bucket = this.buckets.get(key)
+        if (bucket === undefined || bucket.size === 0) return
+        bucket.clear()
+        this.buckets.delete(key)
+        if (key === this.current) this.emit()
+      },
+      /** 测试与调试用：把这块状态恢复成刚加载页面时的样子。 */
+      reset() {
+        this.known.clear()
+        this.buckets.clear()
+        this.seenAt.clear()
+        this.baselined = false
+        this.current = ''
       },
     }
 
@@ -1054,10 +1117,10 @@ window.__ModuleLoader__.load({
     /**
      * 看一次「当前会话有没有刚触发的审批」。
      *
-     * 判定规则全部交给 maybeAutoOpenTimeline（用户 2026-09-18 修订）：触发审批 + 时间线没显示在眼前
-     * + 右侧栏整栏收起时才自动打开。所以这里没有「本会话只开一次」的记忆：approvalWatch.seen
-     * 只用来发现「最新一条记录的 id 变了」，变了就说明刚发生了审批。**首次观测只记基线**——
-     * 页面刷新后会话里往往已经堆着历史记录，那不是「刚触发的审批」，不该把时间线弹开。
+     * 判定规则全部交给 maybeAutoOpenTimeline / maybeAutoOpenOnSwitch（用户 2026-09-20 修订）：
+     * ① 当前会话里出现「刚发生」的审批；② 切换进一个攒了未读的会话（离开超过 1 分钟，或未读 > 5 条）。
+     * approvalWatch.seen 只用来发现「这个会话最新一条记录的 id 变了」，变了就说明刚发生了审批。
+     * **首次观测只记基线**——页面刷新后会话里往往已经堆着历史记录，那不是「刚触发的审批」，不该弹开。
      * 观察器与面板无关：用户停在「轨迹」标签页、或 placement 只挂右侧栏时同样会触发
      * （旧实现把探针写在「拿不到项目目录」的分支里，正常情况根本不执行，等于没生效）。
      * @returns {Promise<void>} 无返回值；任何失败只记日志，绝不影响面板自身
@@ -1066,12 +1129,15 @@ window.__ModuleLoader__.load({
       if (mountState.sidebar === undefined) return
       const sessionId = currentSessionId()
       if (sessionId === undefined) return
-      // 换了会话/工作区就重读一次界面偏好：这个开关是按工作区存的，用上一个工作区的值会判错
+      // 换了会话/工作区就重读一次界面偏好：这个开关是按会话存的，用上一个会话的值会判错。
+      // previousSession 同时用来识别「刚切进来」——切换判定只在那一刻做一次。
+      const previousSession = approvalWatch.sessionId
+      const switched = previousSession !== undefined && previousSession !== sessionId
       const cwd = workspaceOf(sessionId)
       if (approvalWatch.sessionId !== sessionId || approvalWatch.workspace !== cwd) {
         approvalWatch.sessionId = sessionId
         approvalWatch.workspace = cwd
-        await runtimeStore.load(cwd)
+        await runtimeStore.load(cwd, sessionId)
       }
       // 一次请求同时喂两件事：全部会话的最新若干条里挑出「当前会话的最新记录」（决定要不要自动展开）
       // 与「本轮页面还没看过的记录」（未读角标）。**开关关着也要轮询**——角标是自动展开之外的兜底提示。
@@ -1087,7 +1153,11 @@ window.__ModuleLoader__.load({
         return
       }
       unreadStore.note(records)
-      if (runtimeStore.autoOpenFor(cwd) !== true) return
+      unreadStore.setCurrent(sessionId)
+      // 切换进某会话的判定与「本会话里出现新记录」相互独立，各判各的（开关与焦点门槛都还在
+      // maybeAutoOpenTimeline 里再判一遍）
+      if (switched) maybeAutoOpenOnSwitch(sessionId)
+      if (runtimeStore.autoOpenFor(sessionId) !== true) return
       // 记录按时间倒序、合并了所有工作区：当前会话那条不一定是第一条，往前找
       const mine = records.find(record => record?.sessionId === sessionId)
       const newest = mine === undefined ? '' : recordKey(mine)
@@ -1096,6 +1166,25 @@ window.__ModuleLoader__.load({
       approvalWatch.seen.set(sessionId, newest)
       // 只认「刚发生」的审批：切会话 / 刷新页面翻到的历史记录只记基线，不弹面板（2026-09-20 用户口径）
       if (newest === '' || !isFreshRecord(mine?.time)) return
+      maybeAutoOpenTimeline(sessionId)
+    }
+
+    /**
+     * 切换进某个会话时要不要自动展开一次（用户 2026-09-20 口径）。
+     *
+     * 两个条件满足其一就打开：① 该会话攒的未读超过 UNREAD_AUTO_OPEN_MAX 条（太多了，必须让你看见）；
+     * ② 距你上次看过这个会话的时间线超过 AUTO_OPEN_AFTER_AWAY_MS（从没看过也算）而期间产生过审批。
+     * 没有未读就什么都不做——「没产生过审批事件」不该打扰你。只在切换那一刻判一次，因此每次进入
+     * 最多弹一次；真正的开关与焦点门槛仍在 maybeAutoOpenTimeline 里。
+     * @param {string} sessionId 刚切进来的会话
+     * @returns {void}
+     */
+    function maybeAutoOpenOnSwitch(sessionId) {
+      const unread = unreadStore.countFor(sessionId)
+      if (unread === 0) return
+      const piled = unread > UNREAD_AUTO_OPEN_MAX
+      const away = unreadStore.awayMs(sessionId) > AUTO_OPEN_AFTER_AWAY_MS
+      if (!piled && !away) return
       maybeAutoOpenTimeline(sessionId)
     }
 
@@ -1143,7 +1232,7 @@ window.__ModuleLoader__.load({
      * @returns {void} 无返回值；任何失败只影响这次自动展开
      */
     function maybeAutoOpenTimeline(sessionId) {
-      if (runtimeStore.autoOpenFor(workspaceOf(sessionId)) !== true) return
+      if (runtimeStore.autoOpenFor(sessionId) !== true) return
       if (mountState.sidebar === undefined) return
       if (mountState.timelineShown === true) return
       // 侧栏展开着 = 用户正在用侧栏里的别的东西（时间线没显示已经由上一行保证了）：
@@ -1166,12 +1255,17 @@ window.__ModuleLoader__.load({
         }
       }
       if (attempt()) {
+        // 打开了 = 你这就看到了：记一笔「看过这个会话」，切会话判定据此不再重复弹
+        unreadStore.markSeen(sessionId)
         beacon('auto-open-timeline', sessionId)
         return
       }
       // 只重试一次：首个审批出现时，官方 sidebar-right 服务可能还没把座位绑定到当前会话
       setTimeout(() => {
-        if (attempt()) beacon('auto-open-timeline', sessionId + '(retry)')
+        if (attempt()) {
+          unreadStore.markSeen(sessionId)
+          beacon('auto-open-timeline', sessionId + '(retry)')
+        }
       }, AUTO_OPEN_RETRY_MS)
     }
 
@@ -2515,16 +2609,16 @@ window.__ModuleLoader__.load({
 
     /**
      * 四个行为开关的键 + 文案（设置页卡片与「审批设置」面板共用同一份顺序）。
-     * @param perWorkspace 面板里（知道 cwd）用「本工作区」那句说明——自动打开时间线按工作区区分
+     * @param perSession 面板里（知道 cwd + sessionId）用「本会话」那句说明——自动打开时间线按会话区分
      */
-    function behaviorSwitchSpecs(perWorkspace) {
+    function behaviorSwitchSpecs(perSession) {
       return [
         { key: 'notice', label: t.noticeTitle, hint: t.noticeHint },
         { key: 'denyDirect', label: t.denyDirectTitle, hint: t.denyDirectHint },
         {
           key: 'autoOpenTimeline',
           label: t.autoOpenTitle,
-          hint: perWorkspace === true ? t.autoOpenHintWorkspace : t.autoOpenHint,
+          hint: perSession === true ? t.autoOpenHintSession : t.autoOpenHint,
         },
         { key: 'askRejectReason', label: t.askReasonTitle, hint: t.askReasonHint },
       ]
@@ -2534,46 +2628,49 @@ window.__ModuleLoader__.load({
      * 行为开关组：注入审批结果到上下文 / 黑名单直接拒绝 / 自动打开审批时间线 / 拒绝后追问理由。
      * 四个值都来自宿主 /config；写回是**先乐观置本地值**，失败回滚并提示，
      * 绝不让界面显示一个没写进宿主的状态。设置页卡片与「审批设置」面板都渲染这一个组件。
-     * **「自动打开审批时间线」按工作区区分**（用户 2026-09-18）：面板里知道 cwd，显示与写入的都是
-     * **本工作区**那份（落进该项目的策略文件）；设置页卡片没有工作区上下文，编辑的是全局默认值。
-     * @param props.scope 'workspace' = 面板（按工作区），其余 = 设置页（全局默认）
-     * @param props.cwd 当前工作区目录（scope=workspace 时用）
+     * **「自动打开审批时间线」按会话区分**（用户 2026-09-20，此前按工作区）：面板里知道 cwd +
+     * sessionId，显示与写入的都是**本会话**那份（落进该工作区策略文件的
+     * `prefs.autoOpenTimelineSessions[sessionId]`）；设置页卡片没有会话上下文，编辑的是全局默认值。
+     * @param props.scope 'workspace' = 面板（按会话），其余 = 设置页（全局默认）
+     * @param props.cwd 当前工作区目录（scope=workspace 时用，定位项目策略文件）
+     * @param props.sessionId 当前会话（scope=workspace 时用，按会话区分）
      */
-    function BehaviorSettings({ scope, cwd }) {
+    function BehaviorSettings({ scope, cwd, sessionId }) {
       const [, bump] = react.useState(0)
       const [saved, setSaved] = react.useState(false)
       const [error, setError] = react.useState('')
       react.useEffect(() => runtimeStore.subscribe(() => bump(value => value + 1)), [])
-      const perWorkspace = scope === 'workspace' && typeof cwd === 'string' && cwd !== ''
-      /** 这个开关此刻显示的值（自动打开时间线在面板里是本工作区的生效值）。 */
-      const valueOf = key => key === 'autoOpenTimeline' && perWorkspace
-        ? runtimeStore.autoOpenFor(cwd)
+      const perSession = scope === 'workspace' && typeof cwd === 'string' && cwd !== ''
+        && typeof sessionId === 'string' && sessionId !== ''
+      /** 这个开关此刻显示的值（自动打开时间线在面板里是本会话的生效值）。 */
+      const valueOf = key => key === 'autoOpenTimeline' && perSession
+        ? runtimeStore.autoOpenFor(sessionId)
         : runtimeStore[key]
       /** 写一个开关：乐观置值 → 写宿主 → 成功提示 / 失败回滚。 */
       const save = (key, next) => {
         setError('')
         setSaved(false)
         const previous = valueOf(key)
-        const scoped = key === 'autoOpenTimeline' && perWorkspace
+        const scoped = key === 'autoOpenTimeline' && perSession
         if (scoped) {
-          runtimeStore.workspaceCwd = cwd
-          runtimeStore.autoOpenWorkspace = next
+          runtimeStore.sessionId = sessionId
+          runtimeStore.autoOpenSession = next
         } else {
           runtimeStore[key] = next
         }
         runtimeStore.emit()
-        runtimeStore.save({ [key]: next }, scoped ? cwd : undefined)
+        runtimeStore.save({ [key]: next }, scoped ? { cwd, session: sessionId } : undefined)
           .then(() => { setSaved(true); bump(value => value + 1) })
           .catch(cause => {
             console.warn(LOG, '保存界面偏好失败', cause)
-            if (scoped) runtimeStore.autoOpenWorkspace = previous
+            if (scoped) runtimeStore.autoOpenSession = previous
             else runtimeStore[key] = previous
             runtimeStore.emit()
             setError(t.saveFailed + '：' + String(cause?.message ?? cause))
           })
       }
       return react.createElement('div', { className: 'ap-col' },
-        ...behaviorSwitchSpecs(perWorkspace).map(spec => react.createElement(SwitchRow, {
+        ...behaviorSwitchSpecs(perSession).map(spec => react.createElement(SwitchRow, {
           key: spec.key,
           label: spec.label,
           hint: spec.hint,
@@ -2607,12 +2704,12 @@ window.__ModuleLoader__.load({
      * 设置页（容器是 ul，所以必须是 li）与「审批设置」面板共用同一套内容。
      * @param props.tag 宿主标签（设置页传 'li'，对话区面板传 'section'）
      * @param props.desc 卡片说明（设置页多一句：这里还能开关通知与黑名单行为）
-     * @param props.scope / props.cwd 见 BehaviorSettings（面板传 workspace + 当前工作区目录）
+     * @param props.scope / props.cwd / props.sessionId 见 BehaviorSettings（面板传 workspace + 当前工作区目录 + 当前会话）
      */
-    function SettingsCard({ tag, desc, scope, cwd }) {
+    function SettingsCard({ tag, desc, scope, cwd, sessionId }) {
       return card(tag ?? 'section', t.cardName, desc ?? t.placementDesc, react.createElement('div', { className: 'ap-col' },
         react.createElement(PlacementControl, null),
-        react.createElement(BehaviorSettings, { scope, cwd })))
+        react.createElement(BehaviorSettings, { scope, cwd, sessionId })))
     }
 
     /**
@@ -2650,8 +2747,8 @@ window.__ModuleLoader__.load({
           }
           if (!alive) return
           setCwd(next)
-          // 工作区变了就重读一次界面偏好：「自动打开审批时间线」按工作区区分，面板要显示本工作区那份
-          if (runtimeStore.workspaceCwd !== next) await runtimeStore.load(next)
+          // 工作区/会话变了就重读一次界面偏好：「自动打开审批时间线」按会话区分，面板要显示本会话那份
+          if (runtimeStore.sessionId !== sessionId) await runtimeStore.load(next, sessionId)
           await policyStore.load(next)
         }
         void resolve()
@@ -2742,8 +2839,8 @@ window.__ModuleLoader__.load({
                 react.createElement(RuleList, { scope: 'project', list: 'allow', title: t.allowList, rules: projectRules?.allow ?? [], onRemove: remove, onEdit: editRule }),
                 react.createElement(RuleList, { scope: 'project', list: 'deny', title: t.denyList, rules: projectRules?.deny ?? [], onRemove: remove, onEdit: editRule }),
               ]),
-            // 面板里知道当前工作区：自动打开时间线这个开关按工作区读/写（设置页那份是全局默认）
-            react.createElement(SettingsCard, { tag: 'section', scope: 'workspace', cwd }),
+            // 面板里知道当前工作区与会话：自动打开时间线这个开关按会话读/写（设置页那份是全局默认）
+            react.createElement(SettingsCard, { tag: 'section', scope: 'workspace', cwd, sessionId }),
             editNote !== '' && react.createElement('div', { className: 'ap-note' }, editNote),
             (error !== '' || policyStore.error !== '')
               && react.createElement('div', { className: 'ap-note' }, error !== '' ? error : policyStore.error))))
@@ -2762,11 +2859,11 @@ window.__ModuleLoader__.load({
       return react.createElement('span', { className: 'ap-tabTitle' },
         // 角标放在**最前面**（用户 2026-09-20）：chip 里第一眼就要看到「有几条没看」，
         // 图标与标题跟在它后面
-        unreadStore.count > 0
+        unreadStore.countFor(unreadStore.current) > 0
           ? react.createElement('span', {
             className: 'ap-tabBadge',
             title: t.unreadTitle,
-          }, String(unreadStore.count))
+          }, String(unreadStore.countFor(unreadStore.current)))
           : null,
         react.createElement(LogGlyph, { size: 16 }),
         react.createElement('span', { className: 'ap-tabLabel' }, t.timelineTab))
@@ -2783,10 +2880,15 @@ window.__ModuleLoader__.load({
       // 面板都在渲染了，它就确实显示着。
       react.useEffect(() => {
         mountState.timelineShown = visible
-        // 显示在眼前 = 这些记录你已经看到了：未读角标清零
-        if (visible) unreadStore.clear()
+        // 显示在眼前 = **这个会话**的这些记录你已经看到了：该会话的角标清零，并记下「看过的时刻」
+        // （切会话判定据此知道你是不是刚看过它）。别的会话的未读不在这里动——角标按会话隔离。
+        if (visible && sessionId !== '') {
+          unreadStore.setCurrent(sessionId)
+          unreadStore.clear(sessionId)
+          unreadStore.markSeen(sessionId)
+        }
         return () => { mountState.timelineShown = false }
-      }, [visible])
+      }, [visible, sessionId])
       /**
        * 时间线**已经打开**时，任意操作（点一下、聚焦、滚动、滚轮、敲键盘）都算「你看过了」→ 清角标
        * （用户 2026-09-20 要求）。只在可见时装监听：tab 没显示在眼前时角标必须留着，那才是它的用处。
@@ -2796,13 +2898,16 @@ window.__ModuleLoader__.load({
       react.useEffect(() => {
         if (!visible) return undefined
         if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined
-        const clear = () => unreadStore.clear()
+        const clear = () => {
+          unreadStore.clear(sessionId)
+          unreadStore.markSeen(sessionId)
+        }
         const events = ['scroll', 'pointerdown', 'focusin', 'keydown', 'wheel', 'touchstart']
         for (const name of events) document.addEventListener(name, clear, true)
         return () => {
           for (const name of events) document.removeEventListener(name, clear, true)
         }
-      }, [visible])
+      }, [visible, sessionId])
       const [state, setState] = react.useState({ records: [], error: '', loaded: false })
       const [openId, setOpenId] = react.useState('')
       // 快捷筛选：多选叠加（空数组 = 不筛选，显示全部）
@@ -2870,7 +2975,10 @@ window.__ModuleLoader__.load({
       // 升级/降级成功后同时刷新记录与策略快照：记录上会回写「已应用」，设置面板同步见到新规则
       const refresh = () => { void load(); void policyStore.load() }
       /** 面板内的任意交互 = 你看过了（与上面 document 级监听同一个目的，单测从这里驱动）。 */
-      const seen = () => unreadStore.clear()
+      const seen = () => {
+        unreadStore.clear(sessionId)
+        unreadStore.markSeen(sessionId)
+      }
       return react.createElement('div', {
         className: 'ap-root',
         onScroll: seen,
