@@ -942,8 +942,10 @@ describe('客户端半加载与注册', () => {
       const now = new Date()
       return new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo, hour, 4, 5).toISOString()
     }
+    // 同一时间戳既进夹具也做断言：写死日期的话这份用例只在当天是绿的（2026-09-20 实测被它绊住）
+    const todayTop = at(0, 10)
     logResponder = () => [
-      { id: 'today-1', time: at(0, 10), sessionId: SESSION_KNOWN, toolName: 'bash', verdict: 'allow', rationale: '今天第一条。', turn: 2, step: 40, decidedBy: 'auto' },
+      { id: 'today-1', time: todayTop, sessionId: SESSION_KNOWN, toolName: 'bash', verdict: 'allow', rationale: '今天第一条。', turn: 2, step: 40, decidedBy: 'auto' },
       { id: 'today-2', time: at(0, 9), sessionId: SESSION_KNOWN, toolName: 'bash', verdict: 'defer', outcome: 'rejected', rationale: '今天第二条。' },
       { id: 'yesterday-1', time: at(1, 23), sessionId: SESSION_KNOWN, toolName: 'read', verdict: 'allow', rationale: '昨天那条。', decidedBy: 'auto' },
     ]
@@ -962,7 +964,7 @@ describe('客户端半加载与注册', () => {
     // 折叠行第一行只显示时分秒：日期交给组标题（完整时间戳仍挂在 title 上，悬停可核对）
     const clock = findNodes(rows[0], node => node?.props?.className === 'ap-time')[0]
     expect(clock.children[0]).toBe('10:04:05')
-    expect(clock.props.title).toBe('2026-09-18T02:04:05.000Z')
+    expect(clock.props.title).toBe(todayTop)
     // 「第几轮第几步」不再占折叠行（技术字段收在排查信息里，展开那一块才看得到）
     expect(first).not.toContain('第 2 轮')
     // 轨道竖线首尾修剪：每组第一条从圆点起、每组最后一条到圆点止（昨天那组只有一条，两头都要剪）
