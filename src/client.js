@@ -78,6 +78,17 @@ window.__ModuleLoader__.load({
     const POLL_MS = 3_000
     /** 自动打开审批时间线失败后的重试延迟（毫秒）。 */
     const AUTO_OPEN_RETRY_MS = 150
+    /**
+     * 「刚发生」窗口（毫秒）：只有最新记录落在这个窗口内才自动展开审批时间线。
+     * 2026-09-20 用户口径：按**记录新鲜度**判，而不是按「这个会话本轮页面有没有被看过」判——
+     * 于是「刚切过去 / 刚刷新就赶上审批」照样会弹，而翻到的历史记录只记基线。
+     */
+    const AUTO_OPEN_FRESH_MS = 60_000
+    /**
+     * 未读角标每次取多少条记录：一次请求同时喂「自动展开」与「未读计数」（不带 session 查全部会话，
+     * 最新在前）。只关心刚发生的审批，30 条足够。
+     */
+    const UNREAD_FETCH_LIMIT = 30
     /** 右侧栏 tab 类型标识，同时是正文/标题席位的 key。 */
     const SIDEBAR_ID = 'dsh-auto-pass'
     const SIDEBAR_KIND = 'dsh-auto-pass-log'
@@ -295,8 +306,9 @@ window.__ModuleLoader__.load({
         denyDirectTitle: '黑名单直接拒绝',
         denyDirectHint: '命中黑名单时直接把这次调用判为拒绝（工具调用失败），不再弹人工审批卡',
         autoOpenTitle: '自动打开审批时间线',
-        autoOpenHint: '触发审批时自动展开审批时间线；已显示、或右侧栏正停在其他工具上时不打扰（这里是所有工作区的默认值）',
-        autoOpenHintWorkspace: '本工作区：触发审批且右侧栏整栏收起时自动展开时间线；已显示、或停在其他工具上时不打扰',
+        autoOpenHint: '有刚发生的审批（1 分钟内）时自动展开审批时间线；切会话 / 刷新后翻到的历史记录不弹，已显示、或右侧栏正停在其他工具上时也不打扰——这两种情况改由 tab 上的未读角标提示（这里是所有工作区的默认值）',
+        autoOpenHintWorkspace: '本工作区：有刚发生的审批且右侧栏整栏收起时自动展开时间线；历史记录、已显示、或停在其他工具上都不打扰，改由 tab 上的未读角标提示',
+        unreadTitle: '有未读的审批记录（打开时间线即清除）',
         askReasonTitle: '拒绝后追问理由',
         askReasonHint: '你拒绝一次审批后，插件问一句拒绝理由并注入模型上下文（默认选项就是本次的模型审批意见）',
         saveFailed: '保存失败',
@@ -471,8 +483,9 @@ window.__ModuleLoader__.load({
         denyDirectTitle: 'Reject on denylist',
         denyDirectHint: 'A denylist hit fails the tool call outright instead of opening a human approval card',
         autoOpenTitle: 'Open the approval timeline automatically',
-        autoOpenHint: 'Open the approval timeline when an approval is triggered; it stays put while the timeline is visible or the sidebar is on another tool (this is the default for every workspace)',
-        autoOpenHintWorkspace: 'This workspace: expand the approval timeline when an approval is triggered while the sidebar is collapsed; it stays put when the timeline shows or another tool is on screen',
+        autoOpenHint: 'Expand the approval timeline when an approval just happened (within a minute); records found after switching sessions or reloading never pop, and it stays put while the timeline is visible or the sidebar is on another tool — those cases show as the unread badge on the tab (this is the default for every workspace)',
+        autoOpenHintWorkspace: 'This workspace: expand the approval timeline for a just-happened approval while the sidebar is collapsed; history, an already visible timeline, or another tool on screen are left alone and reported by the tab badge instead',
+        unreadTitle: 'Unread approval records (cleared when you open the timeline)',
         askReasonTitle: 'Ask for a rejection reason',
         askReasonHint: 'After you reject an approval, the plugin asks for a reason and injects it into the model context (the model review note is the default answer)',
         saveFailed: 'Save failed',
@@ -632,6 +645,8 @@ window.__ModuleLoader__.load({
         // 右侧栏 chip 标题：图标 + 文案（标题席位 key 与 tab id 同名）
         '.ap-tabTitle{display:inline-flex;align-items:center;gap:6px;min-width:0}',
         '.ap-tabLabel{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+        // 未读角标：挂在标题席位上——侧栏停在别的工具上 / 审批发生在别的会话时的唯一提示
+        '.ap-tabBadge{flex:none;min-width:16px;height:16px;padding:0 5px;border-radius:8px;background:var(--dsw-alias-state-business-primary);color:#fff;font-size:11px;line-height:16px;text-align:center;font-variant-numeric:tabular-nums}',
         '.ap-frame{flex:auto;min-height:0;overflow-y:auto;padding:16px calc(var(--dsh-composer-side-clearance,16px) + 16px) 24px;display:flex;flex-direction:column;align-items:center}',
         '.ap-col{width:100%;max-width:var(--dsh-chat-content-width,748px);display:flex;flex-direction:column;gap:12px}',
         // 卡片外观对齐设置页内置插件卡（.TKtcza_card）：.5px 描边 + 层三底色 + 16px 圆角
@@ -952,6 +967,57 @@ window.__ModuleLoader__.load({
      */
     const approvalWatch = { seen: new Map(), timer: undefined, sessionId: undefined, workspace: undefined }
 
+    /** 记录的身份：id 优先、退回时间戳（宿主写的 id 是 uuid）。 */
+    function recordKey(record) {
+      return String(record?.id ?? record?.time ?? '')
+    }
+
+    /**
+     * 未读角标：本轮页面里「已经落盘、但你还没看过」的审批记录数。
+     * 首次观测只记基线（刷新页面后堆在那里的历史记录不算未读）；时间线显示在眼前即清零。
+     * **它是「自动展开」之外的兜底提示**：审批发生在别的会话、或右侧栏展开着停在别的工具上时，
+     * 自动展开按口径不动（不抢焦点），但角标照旧告诉你「有新的」（2026-09-20 用户要求）。
+     */
+    const unreadStore = {
+      count: 0,
+      known: new Set(),
+      unread: new Set(),
+      baselined: false,
+      listeners: new Set(),
+      subscribe(listener) {
+        this.listeners.add(listener)
+        return () => { this.listeners.delete(listener) }
+      },
+      refresh() {
+        this.count = this.unread.size
+        for (const listener of [...this.listeners]) listener(this.count)
+      },
+      /** 记一批记录（最新在前）：首次调用只建基线，之后新出现的 id 计入未读。 */
+      note(records) {
+        let changed = false
+        for (const record of records) {
+          const key = recordKey(record)
+          if (key === '' || this.known.has(key)) continue
+          this.known.add(key)
+          if (this.baselined === true) {
+            this.unread.add(key)
+            changed = true
+          }
+        }
+        if (this.baselined !== true) {
+          this.baselined = true
+          return
+        }
+        if (changed) this.refresh()
+      },
+      /** 时间线显示在眼前 = 你已经看过了：清零。 */
+      clear() {
+        if (this.unread.size === 0) return
+        this.unread.clear()
+        this.refresh()
+      },
+    }
+
     /**
      * 右侧栏此刻是不是整栏展开着。
      *
@@ -1007,25 +1073,38 @@ window.__ModuleLoader__.load({
         approvalWatch.workspace = cwd
         await runtimeStore.load(cwd)
       }
-      if (runtimeStore.autoOpenFor(cwd) !== true) return
-      let newest = ''
+      // 一次请求同时喂两件事：全部会话的最新若干条里挑出「当前会话的最新记录」（决定要不要自动展开）
+      // 与「本轮页面还没看过的记录」（未读角标）。**开关关着也要轮询**——角标是自动展开之外的兜底提示。
+      let records = []
       try {
-        const response = await fetch(API_LOG + '?session=' + encodeURIComponent(sessionId) + '&limit=1', {
+        const response = await fetch(API_LOG + '?limit=' + UNREAD_FETCH_LIMIT, {
           headers: { accept: 'application/json' },
         })
         const data = await response.json()
-        const first = Array.isArray(data?.records) ? data.records[0] : undefined
-        newest = first === undefined ? '' : String(first.id ?? first.time ?? '')
+        records = Array.isArray(data?.records) ? data.records : []
       } catch (error) {
         console.warn(LOG, '读取审批记录以判断是否自动打开时间线失败', error)
         return
       }
+      unreadStore.note(records)
+      if (runtimeStore.autoOpenFor(cwd) !== true) return
+      // 记录按时间倒序、合并了所有工作区：当前会话那条不一定是第一条，往前找
+      const mine = records.find(record => record?.sessionId === sessionId)
+      const newest = mine === undefined ? '' : recordKey(mine)
       const seen = approvalWatch.seen.get(sessionId)
       if (seen === newest) return
       approvalWatch.seen.set(sessionId, newest)
-      // seen 不存在 = 本轮页面会话第一次看到这个会话：这是历史记录，只记基线不打开
-      if (seen === undefined || newest === '') return
+      // 只认「刚发生」的审批：切会话 / 刷新页面翻到的历史记录只记基线，不弹面板（2026-09-20 用户口径）
+      if (newest === '' || !isFreshRecord(mine?.time)) return
       maybeAutoOpenTimeline(sessionId)
+    }
+
+    /** 记录时间戳是否落在「刚发生」窗口内；缺失 / 非法 / 偏差过大的时间戳一律按不新鲜处理。 */
+    function isFreshRecord(time) {
+      if (typeof time !== 'string' || time === '') return false
+      const at = Date.parse(time)
+      if (!Number.isFinite(at)) return false
+      return Math.abs(Date.now() - at) <= AUTO_OPEN_FRESH_MS
     }
 
     /**
@@ -2645,6 +2724,27 @@ window.__ModuleLoader__.load({
               && react.createElement('div', { className: 'ap-note' }, error !== '' ? error : policyStore.error))))
     }
 
+    /**
+     * 右侧栏「审批时间线」的 chip：图标 + 标题 + 未读角标。
+     *
+     * 官方只允许在**标题席位**里做「会变的标题」（tab 类型的 title(address) 在 tab 打开时就被记进
+     * 布局，之后不再变——读 dsh-client-ui-sidebar-right 的 README 确认），所以角标只能挂在这里。
+     * 它正是「自动展开不动」的两种情况的提示：审批发生在别的会话、右侧栏展开着停在别的工具上。
+     */
+    function TimelineTabTitle() {
+      const [, bump] = react.useState(0)
+      react.useEffect(() => unreadStore.subscribe(() => bump(value => value + 1)), [])
+      return react.createElement('span', { className: 'ap-tabTitle' },
+        react.createElement(LogGlyph, { size: 16 }),
+        react.createElement('span', { className: 'ap-tabLabel' }, t.timelineTab),
+        unreadStore.count > 0
+          ? react.createElement('span', {
+            className: 'ap-tabBadge',
+            title: t.unreadTitle,
+          }, String(unreadStore.count))
+          : null)
+    }
+
     /** 右侧栏「审批时间线」：倒序记录，展开即可把某条记录升级/降级成规则。 */
     function ApprovalTimelinePanel(props) {
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
@@ -2656,6 +2756,8 @@ window.__ModuleLoader__.load({
       // 面板都在渲染了，它就确实显示着。
       react.useEffect(() => {
         mountState.timelineShown = visible
+        // 显示在眼前 = 这些记录你已经看到了：未读角标清零
+        if (visible) unreadStore.clear()
         return () => { mountState.timelineShown = false }
       }, [visible])
       const [state, setState] = react.useState({ records: [], error: '', loaded: false })
@@ -2847,9 +2949,7 @@ window.__ModuleLoader__.load({
             own(raw.slots.inject('sidebar.right.pane.tab.title', () => raw.slots.register({
               name: 'sidebar.right.pane.tab.title',
               key: SIDEBAR_ID,
-            }, () => react.createElement('span', { className: 'ap-tabTitle' },
-              react.createElement(LogGlyph, { size: 16 }),
-              react.createElement('span', { className: 'ap-tabLabel' }, t.timelineTab)))))
+            }, () => react.createElement(TimelineTabTitle))))
             beacon('sidebar-registered')
           } catch (error) {
             beacon('sidebar-error', String(error?.message ?? error))

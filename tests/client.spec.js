@@ -823,7 +823,9 @@ describe('客户端半加载与注册', () => {
     expect(await rootType(react, card.component)).toBe('li')
     // 右侧栏标题：图标 + 文案，两者缺一 chip 就与内置插件不一致
     const tabTitle = slot(slotRegistrations, 'sidebar.right.pane.tab.title', 'dsh-auto-pass')
-    const titleTree = evaluate(tabTitle.component({}))
+    const titleRendered = await renderStable(react, tabTitle.component, {})
+    cleanups.push(...titleRendered.cleanups)
+    const titleTree = titleRendered.tree
     expect(titleTree.type).toBe('span')
     expect(titleTree.children.some(child => child?.type === 'svg')).toBe(true)
     expect(JSON.stringify(titleTree)).toContain('审批时间线')
@@ -2214,8 +2216,11 @@ describe('升级/降级的查重文案', () => {
 describe('审批触发后自动打开右侧栏时间线', () => {
   /** 与客户端半的 POLL_MS 对齐：观察器每 3 秒看一次当前会话的最新记录。 */
   const POLL = 3_000
+  /** 夹具时间戳：staleAt = 10 分钟前（历史记录）；freshAt = 刚发生（2026-09-20 起按新鲜度判）。 */
+  const staleAt = () => new Date(Date.now() - 10 * 60_000).toISOString()
+  const freshAt = () => new Date().toISOString()
 
-  it('首次观测只记基线；侧栏收起才自动展开；已显示或停在其他工具上都不抢焦点', async () => {
+  it('历史记录只记基线；刚发生的审批才自动展开；已显示或停在其他工具上都不抢焦点', async () => {
     vi.useFakeTimers()
     waitTick = () => vi.advanceTimersByTimeAsync(0)
     try {
@@ -2226,8 +2231,8 @@ describe('审批触发后自动打开右侧栏时间线', () => {
         throw new Error('unexpected require: ' + specifier)
       })
       const { ctx, slotRegistrations, openTabs, sidebar } = harness()
-      /** 当前 /log 的返回：观察器只看第一条记录的 id。 */
-      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN }]
+      /** 当前 /log 的返回：观察器只看当前会话那条记录的 id 与时间。 */
+      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN, time: staleAt() }]
       logResponder = () => records
       moduleExports.apply(ctx)
       /** 跑一轮定时器 + 排空微任务队列：观察器是 async 的（fetch → json → …），不等它走完就会误判。 */
@@ -2236,13 +2241,13 @@ describe('审批触发后自动打开右侧栏时间线', () => {
         for (let index = 0; index < 12; index += 1) await Promise.resolve()
       }
 
-      // 第一次观测：会话里本来就有历史记录（页面刚刷新）——只记基线，不该把时间线弹开
+      // 第一次观测：会话里那批是历史记录（页面刚刷新，10 分钟前）——只记基线，不该把时间线弹开
       await tick(POLL)
       expect(openTabs).toEqual([])
 
-      // 触发了一次审批（最新记录的 id 变了）+ 右侧栏收起着 → 自动展开
+      // 刚发生了一次审批（最新记录的 id 变了、时间就在当下）+ 右侧栏收起着 → 自动展开
       // （真实 openTab 会把侧栏展开，替身照做，后面的用例才和真机同一形态）
-      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN }, ...records]
+      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
       await tick(POLL)
       expect(openTabs).toEqual(['dsh-auto-pass-log'])
       expect(sidebar.expanded).toBe(true)
@@ -2253,20 +2258,20 @@ describe('审批触发后自动打开右侧栏时间线', () => {
         sessionId: SESSION_KNOWN,
         useTabInfo: () => ({ tab: { visible: true } }),
       })
-      records = [{ id: 'record-newer', sessionId: SESSION_KNOWN }, ...records]
+      records = [{ id: 'record-newer', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
       await tick(POLL)
       expect(openTabs).toEqual(['dsh-auto-pass-log'])
 
       // 用户切到别的侧边工具（时间线面板卸载，但侧栏整体仍然展开着）：新审批绝不把他切回来
       // —— 这正是 2026-09-18 修掉的「主动聚焦」（宿主 openTab 会 focusTab 回时间线）
       for (const cleanup of rendered.cleanups) cleanup()
-      records = [{ id: 'record-switched', sessionId: SESSION_KNOWN }, ...records]
+      records = [{ id: 'record-switched', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
       await tick(POLL)
       expect(openTabs).toEqual(['dsh-auto-pass-log'])
 
       // 用户自己把侧栏整栏收起（没在用侧栏）→ 下一次审批重新自动展开
       sidebar.expanded = false
-      records = [{ id: 'record-latest', sessionId: SESSION_KNOWN }, ...records]
+      records = [{ id: 'record-latest', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
       await tick(POLL)
       expect(openTabs).toEqual(['dsh-auto-pass-log', 'dsh-auto-pass-log'])
     } finally {
@@ -2287,7 +2292,7 @@ describe('审批触发后自动打开右侧栏时间线', () => {
         throw new Error('unexpected require: ' + specifier)
       })
       const { ctx, openTabs, sidebar } = harness({ legacySidebar: true })
-      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN }]
+      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN, time: staleAt() }]
       logResponder = () => records
       moduleExports.apply(ctx)
       const tick = async (ms) => {
@@ -2297,12 +2302,12 @@ describe('审批触发后自动打开右侧栏时间线', () => {
 
       await tick(POLL)
       expect(openTabs).toEqual([])
-      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN }, ...records]
+      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
       await tick(POLL)
       expect(openTabs).toEqual(['dsh-auto-pass-log'])
       // 侧栏展开、时间线面板已卸载：拿不到状态就照旧尽力打开
       sidebar.expanded = true
-      records = [{ id: 'record-switched', sessionId: SESSION_KNOWN }, ...records]
+      records = [{ id: 'record-switched', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
       await tick(POLL)
       expect(openTabs).toEqual(['dsh-auto-pass-log', 'dsh-auto-pass-log'])
     } finally {
@@ -2325,7 +2330,7 @@ describe('审批触发后自动打开右侧栏时间线', () => {
       const { ctx, openTabs, sidebar } = harness()
       // 该项目在策略文件里存过 prefs.autoOpenTimeline=false（全局那份仍是 true）
       workspaceAutoOpen = { [WORKSPACE_CWD]: false }
-      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN }]
+      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN, time: staleAt() }]
       logResponder = () => records
       moduleExports.apply(ctx)
       const tick = async (ms) => {
@@ -2338,9 +2343,121 @@ describe('审批触发后自动打开右侧栏时间线', () => {
       expect(configRequests.some(item => item.method === 'GET' && item.cwd === WORKSPACE_CWD)).toBe(true)
       expect(sidebar.expanded).toBe(false)
       // 新审批来了：全局开着、本工作区关着 → 不动用户的侧栏
-      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN }, ...records]
+      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
       await tick(POLL)
       expect(openTabs).toEqual([])
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
+  })
+
+  it('首次看到的记录只要是「刚发生」的，照样展开（按新鲜度判，不看是不是第一次看到这个会话）', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, openTabs } = harness()
+      // 刚切到（或刚刷新到）这个会话，而最新那条审批是几秒前发生的
+      logResponder = () => [{ id: 'record-just-now', sessionId: SESSION_KNOWN, time: freshAt() }]
+      moduleExports.apply(ctx)
+      const tick = async (ms) => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log'])
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
+  })
+
+  it('不新鲜的记录一律不弹：这个会话之前看过也一样（只有「刚发生」才展开）', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, openTabs } = harness()
+      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN, time: staleAt() }]
+      logResponder = () => records
+      moduleExports.apply(ctx)
+      const tick = async (ms) => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+      await tick(POLL)
+      expect(openTabs).toEqual([])
+      // 记录换了（例如页面被挂起很久、回来才补看到），但它已经不新鲜 → 依然不弹
+      records = [{ id: 'record-stale-2', sessionId: SESSION_KNOWN, time: staleAt() }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual([])
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
+  })
+
+  it('未读角标：别的会话的新审批也计数，时间线一显示在眼前就清零', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, slotRegistrations } = harness()
+      let records = [{ id: 'history-1', sessionId: SESSION_KNOWN, time: staleAt() }]
+      logResponder = () => records
+      moduleExports.apply(ctx)
+      const tick = async (ms) => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+      const title = slot(slotRegistrations, 'sidebar.right.pane.tab.title', 'dsh-auto-pass')
+      /** 标题席位里现在渲染出来的角标节点（没有就是空数组）。 */
+      const badges = async () => findNodes((await renderStable(react, title.component, {})).tree,
+        node => node?.props?.className === 'ap-tabBadge')
+
+      // 第一次观测：刷新页面时堆着的历史记录不算未读
+      await tick(POLL)
+      expect(await badges()).toEqual([])
+
+      // 别的会话来了两条新审批：自动展开按口径不动（不是当前会话），角标照旧提示
+      records = [
+        { id: 'other-1', sessionId: 'session-other', time: freshAt() },
+        { id: 'other-2', sessionId: 'session-other', time: freshAt() },
+        ...records,
+      ]
+      await tick(POLL)
+      const shown = await badges()
+      expect(shown.length).toBe(1)
+      expect(shown[0].children[0]).toBe('2')
+
+      // 时间线显示在眼前 = 你已经看过了 → 清零
+      const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+      const rendered = await renderStable(react, pane.component, {
+        sessionId: SESSION_KNOWN,
+        useTabInfo: () => ({ tab: { visible: true } }),
+      })
+      await tick(0)
+      expect(await badges()).toEqual([])
+      for (const cleanup of rendered.cleanups) cleanup()
     } finally {
       logResponder = null
       waitTick = defaultWaitTick
@@ -2369,7 +2486,7 @@ describe('「自动打开审批时间线」按工作区区分（2026-09-18 用�
     expect(scopedWrite.cwd).toBe(WORKSPACE_CWD)
     expect(scopedWrite.body).toEqual({ autoOpenTimeline: false, cwd: WORKSPACE_CWD })
     // 面板里那句说明是「本工作区」版（设置页那份是所有工作区的默认值）
-    expect(JSON.stringify(panel.tree)).toContain('本工作区：触发审批且右侧栏整栏收起时自动展开时间线')
+    expect(JSON.stringify(panel.tree)).toContain('本工作区：有刚发生的审批且右侧栏整栏收起时自动展开时间线')
 
     // 设置页卡片：没有工作区上下文 → 读写全局那份（所有工作区的默认值）
     const card = slot(slotRegistrations, 'settings.plugin.item', 'dsh-auto-pass')
