@@ -308,7 +308,7 @@ window.__ModuleLoader__.load({
         autoOpenTitle: '自动打开审批时间线',
         autoOpenHint: '有刚发生的审批（1 分钟内）时自动展开审批时间线；切会话 / 刷新后翻到的历史记录不弹，已显示、或时间线 tab 还开着而右侧栏停在其他工具上时也不打扰（手动关掉时间线 tab 后，下一次审批会把它重新打开）——其余情况由 tab 上的未读角标提示（这里是所有工作区的默认值）',
         autoOpenHintWorkspace: '本工作区：有刚发生的审批时会自动展开时间线（右侧栏收起、或你手动关掉了时间线 tab，都算「该展开」）；历史记录、已显示、以及时间线 tab 还开着而停在别的工具上，都不打扰——由 tab 上的未读角标提示',
-        unreadTitle: '有未读的审批记录（打开时间线即清除）',
+        unreadTitle: '有未读的审批记录（打开时间线、或在界面里任意操作即清除）',
         askReasonTitle: '拒绝后追问理由',
         askReasonHint: '你拒绝一次审批后，插件问一句拒绝理由并注入模型上下文（默认选项就是本次的模型审批意见）',
         saveFailed: '保存失败',
@@ -485,7 +485,7 @@ window.__ModuleLoader__.load({
         autoOpenTitle: 'Open the approval timeline automatically',
         autoOpenHint: 'Expand the approval timeline when an approval just happened (within a minute); records found after switching sessions or reloading never pop, and it stays put while the timeline is visible or the sidebar is on another tool with our tab still open (closing the timeline tab yourself means the next approval reopens it) — everything else shows as the unread badge on the tab (this is the default for every workspace)',
         autoOpenHintWorkspace: 'This workspace: a just-happened approval expands the timeline when the sidebar is collapsed or when you have closed the timeline tab yourself; history, a visible timeline, and another tool being on screen while our tab is still open are left alone and reported by the tab badge instead',
-        unreadTitle: 'Unread approval records (cleared when you open the timeline)',
+        unreadTitle: 'Unread approval records (cleared once you open the timeline or touch the UI)',
         askReasonTitle: 'Ask for a rejection reason',
         askReasonHint: 'After you reject an approval, the plugin asks for a reason and injects it into the model context (the model review note is the default answer)',
         saveFailed: 'Save failed',
@@ -2760,14 +2760,16 @@ window.__ModuleLoader__.load({
       const [, bump] = react.useState(0)
       react.useEffect(() => unreadStore.subscribe(() => bump(value => value + 1)), [])
       return react.createElement('span', { className: 'ap-tabTitle' },
-        react.createElement(LogGlyph, { size: 16 }),
-        react.createElement('span', { className: 'ap-tabLabel' }, t.timelineTab),
+        // 角标放在**最前面**（用户 2026-09-20）：chip 里第一眼就要看到「有几条没看」，
+        // 图标与标题跟在它后面
         unreadStore.count > 0
           ? react.createElement('span', {
             className: 'ap-tabBadge',
             title: t.unreadTitle,
           }, String(unreadStore.count))
-          : null)
+          : null,
+        react.createElement(LogGlyph, { size: 16 }),
+        react.createElement('span', { className: 'ap-tabLabel' }, t.timelineTab))
     }
 
     /** 右侧栏「审批时间线」：倒序记录，展开即可把某条记录升级/降级成规则。 */
@@ -2784,6 +2786,22 @@ window.__ModuleLoader__.load({
         // 显示在眼前 = 这些记录你已经看到了：未读角标清零
         if (visible) unreadStore.clear()
         return () => { mountState.timelineShown = false }
+      }, [visible])
+      /**
+       * 时间线**已经打开**时，任意操作（点一下、聚焦、滚动、滚轮、敲键盘）都算「你看过了」→ 清角标
+       * （用户 2026-09-20 要求）。只在可见时装监听：tab 没显示在眼前时角标必须留着，那才是它的用处。
+       * 必须用捕获阶段——scroll 不冒泡，只有捕获才能收到内层滚动容器（.ap-list）的滚动事件；
+       * 单测环境没有 document，跳过这一段（组件自身的 onScroll 等入口照样能触发）。
+       */
+      react.useEffect(() => {
+        if (!visible) return undefined
+        if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined
+        const clear = () => unreadStore.clear()
+        const events = ['scroll', 'pointerdown', 'focusin', 'keydown', 'wheel', 'touchstart']
+        for (const name of events) document.addEventListener(name, clear, true)
+        return () => {
+          for (const name of events) document.removeEventListener(name, clear, true)
+        }
       }, [visible])
       const [state, setState] = react.useState({ records: [], error: '', loaded: false })
       const [openId, setOpenId] = react.useState('')
@@ -2851,7 +2869,16 @@ window.__ModuleLoader__.load({
       const keyOf = record => String(record.id ?? record.time)
       // 升级/降级成功后同时刷新记录与策略快照：记录上会回写「已应用」，设置面板同步见到新规则
       const refresh = () => { void load(); void policyStore.load() }
-      return react.createElement('div', { className: 'ap-root' },
+      /** 面板内的任意交互 = 你看过了（与上面 document 级监听同一个目的，单测从这里驱动）。 */
+      const seen = () => unreadStore.clear()
+      return react.createElement('div', {
+        className: 'ap-root',
+        onScroll: seen,
+        onPointerDown: seen,
+        onFocus: seen,
+        onKeyDown: seen,
+        onWheel: seen,
+      },
         react.createElement('div', { className: 'ap-head' },
           react.createElement('div', { className: 'ap-grow' },
             react.createElement('div', { className: 'ap-title' }, t.title),

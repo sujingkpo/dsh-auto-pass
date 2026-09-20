@@ -2467,6 +2467,61 @@ describe('审批触发后自动打开右侧栏时间线', () => {
     }
   })
 
+  it('已经打开时：面板开着来的新记录先亮角标，随意操作（点一下）即清除', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, slotRegistrations } = harness()
+      let records = [{ id: 'history-1', sessionId: SESSION_KNOWN, time: staleAt() }]
+      logResponder = () => records
+      moduleExports.apply(ctx)
+      const tick = async (ms) => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+      const title = slot(slotRegistrations, 'sidebar.right.pane.tab.title', 'dsh-auto-pass')
+      const badges = async () => findNodes((await renderStable(react, title.component, {})).tree,
+        node => node?.props?.className === 'ap-tabBadge')
+      const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
+
+      // 时间线**已经打开**（面板挂载 + tab 可见）
+      const rendered = await renderStable(react, pane.component, {
+        sessionId: SESSION_KNOWN,
+        useTabInfo: () => ({ tab: { visible: true } }),
+      })
+      await tick(POLL)
+      expect(await badges()).toEqual([])
+
+      // 面板开着的时候来了新记录（别的会话）：先亮角标提醒
+      records = [{ id: 'other-1', sessionId: 'session-other', time: freshAt() }, ...records]
+      await tick(POLL)
+      expect((await badges()).length).toBe(1)
+
+      // 在界面上随意操作一下（这里点面板里的任意位置；聚焦 / 滚动 / 滚轮 / 键盘同一条路）→ 清除
+      const root = findNodes(rendered.tree, node => node?.props?.className === 'ap-root')[0]
+      expect(typeof root.props.onPointerDown).toBe('function')
+      root.props.onPointerDown()
+      await tick(0)
+      expect(await badges()).toEqual([])
+
+      // 再滚动一次也应该是清的（幂等，不会因为没东西可清就报错）
+      root.props.onScroll()
+      await tick(0)
+      expect(await badges()).toEqual([])
+      for (const cleanup of rendered.cleanups) cleanup()
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
+  })
+
   it('未读角标：别的会话的新审批也计数，时间线一显示在眼前就清零', async () => {
     vi.useFakeTimers()
     waitTick = () => vi.advanceTimersByTimeAsync(0)
@@ -2504,6 +2559,11 @@ describe('审批触发后自动打开右侧栏时间线', () => {
       const shown = await badges()
       expect(shown.length).toBe(1)
       expect(shown[0].children[0]).toBe('2')
+      // 角标在 chip 的**最前面**（用户 2026-09-20）：第一个孩子就是它，图标/标题跟在后面
+      const chip = (await renderStable(react, title.component, {})).tree
+      expect(chip.children[0].props.className).toBe('ap-tabBadge')
+      expect(chip.children[0].children[0]).toBe('2')
+      expect(chip.children[1].type).toBe('svg')
 
       // 时间线显示在眼前 = 你已经看过了 → 清零
       const pane = slot(slotRegistrations, 'sidebar.right.pane.tab', 'dsh-auto-pass')
