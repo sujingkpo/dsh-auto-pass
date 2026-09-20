@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-pass",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Model-reviewed Auto Approve permission preset: only review-passed actions are auto-approved, everything else is handed back to the user, with an approval-log panel",
   "type": "module",
   "main": "src/index.js",
