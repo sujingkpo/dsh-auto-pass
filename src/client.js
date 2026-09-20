@@ -306,8 +306,8 @@ window.__ModuleLoader__.load({
         denyDirectTitle: '黑名单直接拒绝',
         denyDirectHint: '命中黑名单时直接把这次调用判为拒绝（工具调用失败），不再弹人工审批卡',
         autoOpenTitle: '自动打开审批时间线',
-        autoOpenHint: '有刚发生的审批（1 分钟内）时自动展开审批时间线；切会话 / 刷新后翻到的历史记录不弹，已显示、或右侧栏正停在其他工具上时也不打扰——这两种情况改由 tab 上的未读角标提示（这里是所有工作区的默认值）',
-        autoOpenHintWorkspace: '本工作区：有刚发生的审批且右侧栏整栏收起时自动展开时间线；历史记录、已显示、或停在其他工具上都不打扰，改由 tab 上的未读角标提示',
+        autoOpenHint: '有刚发生的审批（1 分钟内）时自动展开审批时间线；切会话 / 刷新后翻到的历史记录不弹，已显示、或时间线 tab 还开着而右侧栏停在其他工具上时也不打扰（手动关掉时间线 tab 后，下一次审批会把它重新打开）——其余情况由 tab 上的未读角标提示（这里是所有工作区的默认值）',
+        autoOpenHintWorkspace: '本工作区：有刚发生的审批时会自动展开时间线（右侧栏收起、或你手动关掉了时间线 tab，都算「该展开」）；历史记录、已显示、以及时间线 tab 还开着而停在别的工具上，都不打扰——由 tab 上的未读角标提示',
         unreadTitle: '有未读的审批记录（打开时间线即清除）',
         askReasonTitle: '拒绝后追问理由',
         askReasonHint: '你拒绝一次审批后，插件问一句拒绝理由并注入模型上下文（默认选项就是本次的模型审批意见）',
@@ -483,8 +483,8 @@ window.__ModuleLoader__.load({
         denyDirectTitle: 'Reject on denylist',
         denyDirectHint: 'A denylist hit fails the tool call outright instead of opening a human approval card',
         autoOpenTitle: 'Open the approval timeline automatically',
-        autoOpenHint: 'Expand the approval timeline when an approval just happened (within a minute); records found after switching sessions or reloading never pop, and it stays put while the timeline is visible or the sidebar is on another tool — those cases show as the unread badge on the tab (this is the default for every workspace)',
-        autoOpenHintWorkspace: 'This workspace: expand the approval timeline for a just-happened approval while the sidebar is collapsed; history, an already visible timeline, or another tool on screen are left alone and reported by the tab badge instead',
+        autoOpenHint: 'Expand the approval timeline when an approval just happened (within a minute); records found after switching sessions or reloading never pop, and it stays put while the timeline is visible or the sidebar is on another tool with our tab still open (closing the timeline tab yourself means the next approval reopens it) — everything else shows as the unread badge on the tab (this is the default for every workspace)',
+        autoOpenHintWorkspace: 'This workspace: a just-happened approval expands the timeline when the sidebar is collapsed or when you have closed the timeline tab yourself; history, a visible timeline, and another tool being on screen while our tab is still open are left alone and reported by the tab badge instead',
         unreadTitle: 'Unread approval records (cleared when you open the timeline)',
         askReasonTitle: 'Ask for a rejection reason',
         askReasonHint: 'After you reject an approval, the plugin asks for a reason and injects it into the model context (the model review note is the default answer)',
@@ -1108,6 +1108,28 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 我们的审批时间线 tab 是否**还在侧栏里**（开过、没被关掉）。
+     *
+     * 只用来区分两种「侧栏展开着」：停在别的侧边工具上（我们的 tab 还在，只是没显示）与**用户手动
+     * 把时间线 tab 关掉了**（侧栏里已经没有它）。官方 closeTab 只在「它是唯一 docked tab」时才顺便
+     * 把整栏收起来，所以关掉 ours 之后侧栏往往仍然展开着（常见：还留着引导页 tab）——那种状态必须
+     * 允许重新打开，否则一旦手动关过一次就再也见不到时间线了（2026-09-20 用户报的场景）。
+     * @returns {boolean|undefined} 布局里有没有我们这种 tab；读不到布局（老宿主没有 mounted）时 undefined
+     */
+    function timelineTabOpen() {
+      try {
+        const service = typeof clientCtx?.get === 'function' ? clientCtx.get('sidebarRight') : undefined
+        if (service === undefined || typeof service.mounted !== 'function') return undefined
+        const layout = service.mounted()?.layout
+        if (layout === undefined || layout.tabs === undefined) return undefined
+        return Object.values(layout.tabs).some(tab => tab?.kind === SIDEBAR_KIND)
+      } catch (error) {
+        console.warn(LOG, '读取右侧栏 tab 布局失败', error)
+        return undefined
+      }
+    }
+
+    /**
      * 触发审批后自动展开右侧栏的「审批时间线」。
      *
      * 判定规则（用户 2026-09-18 修订）：时间线已经显示在眼前时什么都不做；**侧栏展开着却停在
@@ -1126,8 +1148,11 @@ window.__ModuleLoader__.load({
       if (mountState.timelineShown === true) return
       // 侧栏展开着 = 用户正在用侧栏里的别的东西（时间线没显示已经由上一行保证了）：
       // 这时宿主 openTab 会把他的 tab 切回时间线，正是 2026-09-18 要修掉的「主动聚焦」。
-      // 状态未知（老宿主没有 isExpanded）时保持旧行为，尽力打开。
-      if (sidebarExpanded() === true) return
+      // **但「我们的 tab 已经被手动关掉」不算这种情况**：侧栏里已经没有时间线了，用户 2026-09-20
+      // 要求照旧重新打开（官方 closeTab 只在它是唯一 docked tab 时才顺手收起整栏——读源码确认——
+      // 所以关掉之后侧栏常常还是展开的，老口径会就此永久不再打开）。
+      // 状态未知（老宿主没有 isExpanded / mounted）时保持旧行为，尽力打开。
+      if (sidebarExpanded() === true && timelineTabOpen() !== false) return
       /** 开一次时间线；服务不可用或抛错时返回 false（调用方只重试一次）。 */
       const attempt = () => {
         try {

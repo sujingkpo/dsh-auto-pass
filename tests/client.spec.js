@@ -423,12 +423,24 @@ function harness(options = {}) {
   // 「整栏是否展开」——收起才允许自动展开，展开着（= 用户停在其他侧边工具上）不许抢。
   // 真实 openTab 内部会 planSetExpanded(true)（读 dsh-client-ui-sidebar-right 源码确认），替身照做。
   const openTabs = []
-  const sidebar = { expanded: false }
+  const sidebar = {
+    expanded: false,
+    /** 侧栏里的 tab 列表（{id,kind}）：用例用它模拟「用户手动把我们的 tab 关掉」（真机 closeTab 之后布局里就没有它了）。 */
+    tabs: [],
+  }
+  /** 真机 openTab 还会把 tab 加进布局并把整栏展开（读源码确认），替身照做——后面「关掉 tab」的用例靠它。 */
+  const openRightTab = kind => {
+    openTabs.push(kind)
+    sidebar.expanded = true
+    if (!sidebar.tabs.some(tab => tab.kind === kind)) sidebar.tabs.push({ id: 'tab-' + kind, kind })
+  }
   const sidebarRight = options.legacySidebar === true
-    ? { openTab: kind => { openTabs.push(kind); sidebar.expanded = true } }
+    ? { openTab: openRightTab }
     : {
-      openTab: kind => { openTabs.push(kind); sidebar.expanded = true },
+      openTab: openRightTab,
       isExpanded: () => sidebar.expanded,
+      // 「我们的 tab 还在不在侧栏里」只能从 mounted().layout.tabs 看（官方服务的读法）
+      mounted: () => ({ layout: { tabs: Object.fromEntries(sidebar.tabs.map(tab => [tab.id, tab])) } }),
     }
   const ctx = {
     get: name => (name === 'slots' ? slots
@@ -2411,6 +2423,50 @@ describe('审批触发后自动打开右侧栏时间线', () => {
     }
   })
 
+  it('手动把时间线 tab 关掉（侧栏仍展开着）后，下一次审批照样重新打开', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, openTabs, sidebar } = harness()
+      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN, time: staleAt() }]
+      logResponder = () => records
+      moduleExports.apply(ctx)
+      const tick = async (ms) => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+
+      await tick(POLL) // 基线
+      records = [{ id: 'record-first', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log'])
+      expect(sidebar.expanded).toBe(true)
+      expect(sidebar.tabs.map(tab => tab.kind)).toContain('dsh-auto-pass-log')
+
+      // 用户在侧栏里手动关掉时间线 tab：布局里没有我们了，但侧栏**没有**收起（还留着别的 tab，
+      // 官方 closeTab 只在「它是唯一 docked tab」时才顺手收起整栏）
+      sidebar.tabs = [{ id: 'tab-guide', kind: 'guide' }]
+      records = [{ id: 'record-second', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log', 'dsh-auto-pass-log'])
+
+      // 对照：我们的 tab 还在侧栏里、只是停在别的工具上 → 依旧不抢焦点（2026-09-18 口径不变）
+      records = [{ id: 'record-third', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log', 'dsh-auto-pass-log'])
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
+  })
+
   it('未读角标：别的会话的新审批也计数，时间线一显示在眼前就清零', async () => {
     vi.useFakeTimers()
     waitTick = () => vi.advanceTimersByTimeAsync(0)
@@ -2486,7 +2542,7 @@ describe('「自动打开审批时间线」按工作区区分（2026-09-18 用�
     expect(scopedWrite.cwd).toBe(WORKSPACE_CWD)
     expect(scopedWrite.body).toEqual({ autoOpenTimeline: false, cwd: WORKSPACE_CWD })
     // 面板里那句说明是「本工作区」版（设置页那份是所有工作区的默认值）
-    expect(JSON.stringify(panel.tree)).toContain('本工作区：有刚发生的审批且右侧栏整栏收起时自动展开时间线')
+    expect(JSON.stringify(panel.tree)).toContain('本工作区：有刚发生的审批时会自动展开时间线')
 
     // 设置页卡片：没有工作区上下文 → 读写全局那份（所有工作区的默认值）
     const card = slot(slotRegistrations, 'settings.plugin.item', 'dsh-auto-pass')
