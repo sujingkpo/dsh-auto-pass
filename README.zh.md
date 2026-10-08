@@ -44,7 +44,7 @@ flowchart TD
 
 - 只有会话**当前**权限档位是 `自动审批` 时，插件才接管这次审批请求；其他权限档位继续使用 DSH 原有审批链。插件抢在人工审批应答器之前接管，因此不依赖 bundles 顺序（上面那张权限预设表的覆盖仍然要求本 bundle 装在 `dsh-web-app` 之后）。
 - 每次审查就是**一次普通的模型调用**，`timeoutMs`（默认 90 秒）覆盖这一次调用（含流式读取）。审查模型没有子 Agent、没有工具、读不了文件，也看不到会话历史，所以它无从调查，只能凭给到的信息判断。
-- 提示词是两段 JSON：① 归一化后的动作（工具名、命令/路径、cwd、是否申请提权）；② 极简证据（你最后一条**直接**用户消息 + 最近一次 `ask_user_question` 的回答，各自截断到 `maxEvidenceChars`，默认 400 字）。只有这两者能构成授权；其余东西根本不在提示词里。
+- 提示词是两段 JSON：① 归一化后的动作（工具名、命令/路径、cwd、是否申请提权）；② 极简证据（你最后一条**直接**用户消息 + 最近一次 `ask_user_question` 的回答，**默认整段原文**——`maxEvidenceChars` 为 0 即不截断，写正数才会按该字数裁剪）。只有这两者能构成授权；其余东西根本不在提示词里。
 - 审查的口径是「**无害的动作不必打扰你**」：范围明确、没有破坏性、可逆、与你的请求一致 → 放行；**请求提权（`sandbox_permissions`）本身不是拒绝理由**——受限沙箱下跑测试这类命令本来就靠提权才能起子进程，所以 `pnpm test` 带 `danger-full-access` 也应当自动放行。仍然一律拒绝的只有：删除/覆盖、外发与强推、读凭据与密钥、sudo / 改系统或注册表 / 命令本身要写工作区之外、来路不明的代码、关闭安全设施。
 - 回复只强制要求 `outcome`，且必须是**一行 JSON**（外面包一层 Markdown 代码围栏也能容忍）。简写 `{"outcome":"allow"}` 默认表示 low 风险、unknown 授权；deny 缺少其他字段时默认表示 high 风险、unknown 授权。完整结果还可以包含 `risk_level`、`user_authorization`、`rationale`，以及可选的 `rule` 建议。插件**只会降级、绝不升级**：critical 风险一定变成拒绝，用户授权低于 medium 的 high 风险也一定变成拒绝。输出不合法、动作拿不到或过长、没有可用的审查模型路由、超时以及任何基础设施失败，都**不会**变成自动拒绝，而是把请求交回用户。
 - 模型拒绝不会被重新审查，也**不会**变成自动拒绝：插件调用下一个审批应答器，让请求继续走 DSH 原生审批链，由用户决定。插件自动给出的结论只有两种：审查通过时的 `allowed-once`，以及**设置里打开「黑名单直接拒绝」后**命中黑名单时的 `rejected`（默认关闭 = 黑名单也只转人工）。转人工时审查意见还会写进审批请求的 `reason`，审批卡首行就能看到为什么转人工。
@@ -100,7 +100,7 @@ dsh plugin --profile web add link:/path/to/dsh-auto-pass
     reviewerModel: deepseek-v4-flash
     reviewerReasoningEffort: high
     timeoutMs: 90000
-    maxEvidenceChars: 400
+    maxEvidenceChars: 0
     maxActionChars: 16000
     maxOutputTokens: 2048
     logFile: ''
@@ -114,7 +114,7 @@ dsh plugin --profile web add link:/path/to/dsh-auto-pass
 - `reviewerProvider` / `reviewerModel` —— 用哪个提供方的哪个模型做审查，**必须成对写**（一端有值、另一端空会直接报错；两列都留空 = 跟随当前会话，等同于省略）；两个都不写就用父会话当前的 provider/model，连路由都拿不到时这次审批直接转人工。两者都能在「审批设置」的**审查模型**卡里改。
 - `reviewerReasoningEffort` —— 传给审查模型的推理档（例如 `high`）；必须是字符串，**空串或省略都表示用模型自己的默认档**（面板里清空就是这个语义）。
 - `timeoutMs` —— 单次审查的总时限（毫秒，默认 90000），覆盖这一次模型调用（含流式读取）；超时即转人工。面板的**审查模型**卡里也能改（正整数）。
-- `maxEvidenceChars` —— 喂给审查模型的证据（你最后一条直接消息、最近一次 `ask_user_question` 的回答）**各自**截断到多少字，默认 400。
+- `maxEvidenceChars` —— 喂给审查模型的证据（你最后一条直接消息、最近一次 `ask_user_question` 的回答）**各自**最多多少字；**默认 0 = 不截断**（整段原文进提示词），只有写正数才裁剪到该字数。
 - `maxActionChars` —— 归一化后动作 JSON 的字符上限（默认 16000）；超限**不调用模型**、直接转人工。
 - `maxOutputTokens` —— 单次审查回复的 token 上限（默认 2048），面板的**审查模型**卡里也能改（正整数）。
 - `logFile` —— 审批记录文件；**留空**＝按工作区分文件（`$DSH_HOME/dsh-auto-pass/records/<工作区>.json`），显式给路径＝退回单文件模式（所有工作区写同一个文件，调试用）。

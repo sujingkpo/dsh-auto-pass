@@ -26,6 +26,8 @@
  * @modify 2026-10-08 对齐宿主新 settings 模型（SettingsForms）：模块顶层导出带 .volatile() 的 Config
  *   （宿主写回只认 volatile 字段，且已没有 register/get）；界面偏好改从插件 config 的 volatile 引用
  *   实时读，写走 settings.update 落进 profile patch
+ * @modify 2026-10-08 传给审查模型的内容不再截断：maxEvidenceChars 默认 0 = 证据整段原文进提示词
+ *   （你最后一条直接消息、最近一次人工回答），只有显式写正数才裁剪；校验相应放宽为「0 或正整数」
  */
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -85,8 +87,9 @@ const LLM_MODULE = '@deepseek-ai/dsh-llm'
 const DEFAULTS = Object.freeze({
   language: 'auto',
   timeoutMs: 90_000,
-  // 单轮审查：只带「动作 + 用户最后一条消息（截断）+ 最近一次人工回答（截断）」
-  maxEvidenceChars: 400,
+  // 单轮审查：只带「动作 + 用户最后一条消息 + 最近一次人工回答」
+  // 0 = 证据不截断（原文进提示词；用户 2026-10-08 要求「传给模型的内容不再截断」），正数才裁剪
+  maxEvidenceChars: 0,
   maxActionChars: 16_000,
   maxOutputTokens: 2_048,
   // 审批记录文件：留空 = 按工作区分文件（$DSH_HOME/dsh-auto-pass/records/<slug>.json）；
@@ -1385,13 +1388,16 @@ export function resolveConfig(config = {}, warn = message => console.warn(messag
     'maxRecords',
     'autoApproveAfter',
     'autoDenyAfter',
-    'maxEvidenceChars',
     'maxActionChars',
     'maxOutputTokens',
   ]) {
     if (!Number.isSafeInteger(resolved[key]) || resolved[key] <= 0) {
       throw new Error(`dsh-auto-pass: ${key} 必须是正整数`)
     }
+  }
+  // 证据上限是唯一允许 0 的键：0 = 不截断（原本就要求正整数，默认 400 会砍掉授权证据）
+  if (!Number.isSafeInteger(resolved.maxEvidenceChars) || resolved.maxEvidenceChars < 0) {
+    throw new Error('dsh-auto-pass: maxEvidenceChars 必须是 0（不截断）或正整数')
   }
   // 五个界面偏好按**引用**读：宿主 settings 写回后 loader 会原位更新 volatile 引用
   // （cordis loader 的 _commitVolatile），把它们烤进快照会把「刚保存的值」定格成旧值。
@@ -2421,12 +2427,14 @@ function textOfContent(content) {
 
 /**
  * 极简证据：只取「用户最后一条消息」与「最近一次 ask_user_question 的人工回答」，
- * 各自截断 —— 判断授权与否最有用、也最便宜的两块信息。
+ * 判断授权与否最有用、也最便宜的两块信息。
  * @param {object} request 审批请求
- * @param {number} maxChars 每段最大字符数
+ * @param {number} maxChars 每段最大字符数；0（默认）或非法值 = 不截断，原文进提示词
  * @returns {object} 证据对象（可能为空对象）
  */
 function buildEvidence(request, maxChars) {
+  // 只有显式给正数才裁剪：默认整段原文交给审查模型，避免授权依据被砍在中间
+  const clip = text => (Number.isSafeInteger(maxChars) && maxChars > 0 ? truncateText(text, maxChars) : text)
   const session = request.agent?.session
   const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : []
   const toolNames = new Map()
@@ -2458,8 +2466,8 @@ function buildEvidence(request, maxChars) {
     }
   }
   return {
-    ...(lastUserMessage === undefined ? {} : { last_user_message: truncateText(lastUserMessage, maxChars) }),
-    ...(lastAnswer === undefined ? {} : { last_human_answer: truncateText(lastAnswer, maxChars) }),
+    ...(lastUserMessage === undefined ? {} : { last_user_message: clip(lastUserMessage) }),
+    ...(lastAnswer === undefined ? {} : { last_human_answer: clip(lastAnswer) }),
   }
 }
 

@@ -4,6 +4,7 @@
  * @author simon300000
  * @date 2026-08-14
  * @modify 2026-09-15 适配 dsh-auto-pass：deny 与审查失败改为调用 next() 转人工
+ * @modify 2026-10-08 证据默认不截断（maxEvidenceChars=0）：默认整段原文进提示词，正数仍截断，负数报错
  */
 import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
@@ -897,14 +898,17 @@ describe('输入装配与配置', () => {
     expect(resolveConfig()).toMatchObject({
       language: 'auto',
       timeoutMs: 90_000,
-      maxEvidenceChars: 400,
+      maxEvidenceChars: 0,
       maxActionChars: 16_000,
       maxOutputTokens: 2_048,
     })
     // 单轮审查后不再需要转录/调查预算这些键；profile 里旧值原样传进来也不报错
     expect(resolveConfig({ maxTranscriptTokens: 1, maxInvestigationSteps: 4 }))
-      .toMatchObject({ maxEvidenceChars: 400 })
+      .toMatchObject({ maxEvidenceChars: 0 })
     expect(() => resolveConfig({ maxActionChars: 0 })).toThrow(/正整数/)
+    // 证据上限是唯一允许 0 的键（0 = 不截断）；负数与非整数仍然拦下
+    expect(() => resolveConfig({ maxEvidenceChars: -1 })).toThrow(/maxEvidenceChars/)
+    expect(() => resolveConfig({ maxEvidenceChars: 1.5 })).toThrow(/maxEvidenceChars/)
     expect(resolveConfig()).not.toHaveProperty('maxConsecutiveDenials')
     // 思考强度：空串/空白表示「用模型默认」（面板清空就是这个语义），写成别的类型仍然报错
     expect(resolveConfig({ reviewerReasoningEffort: ' ' }).reviewerReasoningEffort).toBe(' ')
@@ -1026,7 +1030,23 @@ describe('输入装配与配置', () => {
     expect(prompt.length).toBeLessThan(1_500)
   })
 
-  it('证据按 maxEvidenceChars 截断', () => {
+  it('证据默认不截断（maxEvidenceChars=0）：整段原文进提示词', () => {
+    const request = requestWith('auto-approve', {
+      sessionOverrides: { directUserText: 'x'.repeat(1_000) },
+    })
+    const prompt = buildReviewPrompt({
+      request,
+      action: exactAction(request),
+      signature: { toolName: 'bash', key: 'k', text: 't' },
+      config: resolveConfig(),
+      language: 'zh',
+    })
+    expect(prompt).toContain('x'.repeat(1_000))
+    expect(prompt).not.toContain('…')
+    expect(prompt.length).toBeGreaterThan(1_000)
+  })
+
+  it('显式给正数时证据仍然按 maxEvidenceChars 截断', () => {
     const request = requestWith('auto-approve', {
       sessionOverrides: { directUserText: 'x'.repeat(1_000) },
     })

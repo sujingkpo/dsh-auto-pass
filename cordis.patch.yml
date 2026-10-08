@@ -33,7 +33,8 @@
         reviewerReasoningEffort: high
         # 单轮审查（一次 llm.stream，不起子代理）的边界
         timeoutMs: 90000
-        maxEvidenceChars: 400
+        # 0 = 证据不截断：用户最后一条直接消息与最近一次人工回答原样进提示词；正数才按该字数裁剪
+        maxEvidenceChars: 0
         maxActionChars: 16000
         maxOutputTokens: 2048
         # 审批记录：按工作区分文件落盘；显式给 logFile 退回单文件模式（所有工作区同一个文件）
