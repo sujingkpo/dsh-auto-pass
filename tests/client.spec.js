@@ -440,7 +440,11 @@ async function loadClient() {
 /**
  * 造一个够客户端半用的假宿主：记录槽位注册、可提供右侧栏座位。
  * @param {object} [options] 选项
- * @param {boolean} [options.legacySidebar] 右侧栏服务不给 isExpanded（模拟老宿主）
+ * @param {boolean} [options.legacySidebar] 右侧栏服务不给 isExpanded / mounted / tabsIn（模拟老宿主）
+ * @param {'uiSession'|'legacy'|'none'} [options.sessionSource] 造哪一档「当前会话」来源（宿主 2.0.17 换过形状）：
+ *   uiSession（默认）＝新宿主（uiSession.current + mounted 快照 store + tabsIn）、
+ *   legacy ＝老宿主（会话列表快照上的 current + mounted() 函数）、
+ *   none ＝四级来源都读不到（观察器必须空转，不许猜一个会话出来）
  */
 function harness(options = {}) {
   const slotRegistrations = []
@@ -459,19 +463,31 @@ function harness(options = {}) {
       return () => {}
     },
   }
-  // 会话列表快照替身：时间线在「全部会话」下靠它把 sessionId 翻成会话名（与 DSH 左侧列表同一份投影）；
-  // current 是「当前会话」，审批观察器靠它决定看哪个会话的记录
-  // current 可变：用例用 sessions.current = 'session-other' 模拟「用户切到别的会话」
+  // 会话列表快照替身，**照宿主 2.0.17 的形状**——只有 {ids,byId,phase}，**没有 current**
+  //（「主列里那个会话」搬到了 uiSession.current 上，见 src/client.js 里 currentSessionId 的注释）；
+  // 用例仍旧用 `sessions.current = 'session-other'` 模拟切会话，替身把它投影成 uiSession 的绑定。
+  // options.sessionSource='legacy' 才造老宿主：快照上有 current，uiSession 不提供。
+  const sessionSource = options.sessionSource ?? 'uiSession'
   const sessions = {
     current: SESSION_KNOWN,
     list: {
       getSnapshot: () => ({
-        current: sessions.current,
+        ids: [SESSION_KNOWN, 'session-other'],
+        phase: 'ready',
         byId: {
-          [SESSION_KNOWN]: { displayTitle: '审批面板改造', cwd: 'D:\\work\\github\\dsh-auto' },
-          'session-other': { displayTitle: '别的会话', cwd: 'D:\\work\\github\\dsh-auto' },
+          [SESSION_KNOWN]: { id: SESSION_KNOWN, displayTitle: '审批面板改造', cwd: 'D:\\work\\github\\dsh-auto' },
+          'session-other': { id: 'session-other', displayTitle: '别的会话', cwd: 'D:\\work\\github\\dsh-auto' },
         },
+        // 老宿主才把「当前会话」放在列表快照上
+        ...(sessionSource === 'legacy' ? { current: sessions.current } : {}),
       }),
+    },
+  }
+  // 宿主 2.0.17 的「主列里那个会话」：binding source（getSnapshot() 与 .value 都给 {key}）
+  const uiSession = {
+    current: {
+      getSnapshot: () => ({ key: sessions.current }),
+      get value() { return { key: sessions.current } },
     },
   }
   // 右侧栏导航面替身：自动打开时间线就是调它的 openTab(kind)；isExpanded 模拟宿主
@@ -491,23 +507,32 @@ function harness(options = {}) {
   }
   const sidebarRight = options.legacySidebar === true
     ? { openTab: openRightTab }
-    : {
-      openTab: openRightTab,
-      isExpanded: () => sidebar.expanded,
-      // 「我们的 tab 还在不在侧栏里」只能从 mounted().layout.tabs 看（官方服务的读法）
-      mounted: () => ({ layout: { tabs: Object.fromEntries(sidebar.tabs.map(tab => [tab.id, tab])) } }),
-    }
+    : sessionSource === 'legacy'
+      // 老宿主：isExpanded + mounted() 函数（返回布局）；布局里有没有我们的 tab 只能从它看
+      ? {
+        openTab: openRightTab,
+        isExpanded: () => sidebar.expanded,
+        mounted: () => ({ layout: { tabs: Object.fromEntries(sidebar.tabs.map(tab => [tab.id, tab])) } }),
+      }
+      // 宿主 2.0.17：mounted 是快照 store（给「屏幕上那个会话」的 id），布局走公开面 tabsIn(sessionId)
+      : {
+        openTab: openRightTab,
+        isExpanded: () => sidebar.expanded,
+        mounted: { getSnapshot: () => (sessionSource === 'none' ? undefined : sessions.current) },
+        tabsIn: () => sidebar.tabs.slice(),
+      }
   const ctx = {
     get: name => (name === 'slots' ? slots
       : name === 'sessions' ? sessions
-        : name === 'sidebarRight' ? sidebarRight : undefined),
+        : name === 'uiSession' ? (sessionSource === 'uiSession' ? uiSession : undefined)
+          : name === 'sidebarRight' ? sidebarRight : undefined),
     inject: (names, callback) => {
       if (names.includes('sidebarRightTabs')) callback({ slots, sidebarRightTabs: sidebarTabs })
       return { dispose: () => {} }
     },
     effect: fn => fn(),
   }
-  return { ctx, slots, slotRegistrations, tabRegistrations, openTabs, sidebar, sessions }
+  return { ctx, slots, slotRegistrations, tabRegistrations, openTabs, sidebar, sessions, uiSession }
 }
 
 /**
@@ -840,11 +865,16 @@ describe('客户端半加载与注册', () => {
 
     // DSH 只给三个内置 id 图标，我们的档位靠注入的这条 CSS：几何全走 --ap-glyph-* 变量
     const css = domStub.styled.join('\n')
-    expect(css).toContain('.ap-presetGlyph{display:inline-flex;align-items:center;gap:var(--ap-glyph-gap,8px)}')
+    expect(css).toContain('.ap-presetGlyph{display:inline-flex;align-items:center;gap:var(--ap-glyph-gap,4px)}')
     expect(css).toContain('.ap-presetGlyph::before')
-    expect(css).toContain('width:var(--ap-glyph-box,16px)')
-    expect(css).toContain('-webkit-mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px)')
+    // 兜底值也必须跟 chip 的 14px 走：变量缺失时回落到 16px 就是 2026-10-08 那个「比别家图标大一圈」
+    expect(css).toContain('width:var(--ap-glyph-box,14px)')
+    expect(css).toContain('-webkit-mask-size:var(--ap-glyph-icon,14px) var(--ap-glyph-icon,14px)')
     expect(css).toContain('-webkit-mask-image:url("data:image/svg+xml;charset=utf-8,')
+    // 盾牌轮廓逐字照抄宿主内置的 FullAccessArtwork：内置图标在 14px 框里墨迹只占 ~80%，自绘的大盾牌
+    // （旧版是 91%×98% + 1.32 描边）看着就是比它们大一圈 —— 这条断言钉住「别再自绘更大的形状」
+    // （mask 的 data URI 是 encodeURIComponent 过的，断言里要写编码后的形状）
+    expect(css).toContain('M6.59624%202.14853C7.50155%201.80917%208.49914%201.80919%209.40444%202.14859L13.9245%203.84317')
     // chip（按钮带 aria-label）与输入框下拉的档位项各写一套变量；「自动审批面板」与带子元素的 span 都不该被打标记
     expect(domStub.marked).toEqual([
       {
@@ -856,10 +886,11 @@ describe('客户端半加载与注册', () => {
         text: '自动审批',
         classes: ['ap-presetGlyph'],
         vars: {
-          '--ap-glyph-box': '16px',
-          '--ap-glyph-icon': '16px',
-          '--ap-glyph-gap': '8px',
-          '--ap-glyph-color': 'var(--dsw-alias-label-tertiary,currentColor)',
+          // 菜单项照当前宿主 Menu.module.css 的 .itemIcon（14px）、.item 的 gap（6px）与图标色变量
+          '--ap-glyph-box': '14px',
+          '--ap-glyph-icon': '14px',
+          '--ap-glyph-gap': '6px',
+          '--ap-glyph-color': 'var(--dsw-alias-menu-icon,currentColor)',
         },
       },
     ])
@@ -2743,6 +2774,110 @@ describe('审批触发后自动打开右侧栏时间线', () => {
       sessions.current = 'session-other'
       await tick(POLL)
       expect(openTabs).toEqual(['dsh-auto-pass-log', 'dsh-auto-pass-log'])
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
+  })
+
+  it('宿主 2.0.17 的形状：列表快照没有 current 时靠 uiSession 认会话，照样自动展开', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, openTabs } = harness()
+      // 先钉住「这就是新宿主」：老写法读的列表快照 current 在这里恒为 undefined
+      //（2026-10-08 的病灶——观察器第一行就 return，自动展开与未读角标一起失效）
+      expect(ctx.get('sessions').list.getSnapshot().current).toBeUndefined()
+      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN, time: staleAt() }]
+      logResponder = () => records
+      moduleExports.apply(ctx)
+      const tick = async ms => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+
+      await tick(POLL)
+      expect(openTabs).toEqual([]) // 历史记录只记基线
+      // 「靠哪一级认出的会话」要上报一次：真机就是拿宿主日志里的 stage=session-source 取证
+      const beacons = globalThis.fetch.mock.calls.map(call => String(call[0]))
+      expect(beacons.some(url => url.includes('stage=session-source') && url.includes('uiSession%3D'))).toBe(true)
+
+      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log'])
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
+  })
+
+  it('回退链第三级：老宿主列表快照上的 current 仍然认（宿主升级不能把老版本一起打死）', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, openTabs } = harness({ sessionSource: 'legacy' })
+      expect(ctx.get('uiSession')).toBeUndefined()
+      expect(ctx.get('sessions').list.getSnapshot().current).toBe(SESSION_KNOWN)
+      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN, time: staleAt() }]
+      logResponder = () => records
+      moduleExports.apply(ctx)
+      const tick = async ms => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+
+      await tick(POLL)
+      expect(openTabs).toEqual([])
+      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual(['dsh-auto-pass-log'])
+    } finally {
+      logResponder = null
+      waitTick = defaultWaitTick
+      vi.useRealTimers()
+    }
+  })
+
+  it('四级来源全读不到时不猜会话：不展开、不抛错（自动展开宁可空转）', async () => {
+    vi.useFakeTimers()
+    waitTick = () => vi.advanceTimersByTimeAsync(0)
+    try {
+      const registration = await loadClient()
+      const react = fakeReact()
+      const moduleExports = registration.factory(specifier => {
+        if (specifier === 'react') return react
+        throw new Error('unexpected require: ' + specifier)
+      })
+      const { ctx, openTabs } = harness({ sessionSource: 'none' })
+      let records = [{ id: 'record-history', sessionId: SESSION_KNOWN, time: staleAt() }]
+      logResponder = () => records
+      moduleExports.apply(ctx)
+      const tick = async ms => {
+        await vi.advanceTimersByTimeAsync(ms)
+        for (let index = 0; index < 12; index += 1) await Promise.resolve()
+      }
+
+      await tick(POLL)
+      records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
+      await tick(POLL)
+      expect(openTabs).toEqual([])
+      // 失败也要留痕：宿主日志里 detail=none 说明「四级来源全读不到」，而不是功能静默失效
+      const beacons = globalThis.fetch.mock.calls.map(call => String(call[0]))
+      expect(beacons.some(url => url.includes('stage=session-source') && url.includes('detail=none'))).toBe(true)
     } finally {
       logResponder = null
       waitTick = defaultWaitTick

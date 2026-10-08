@@ -523,12 +523,16 @@ window.__ModuleLoader__.load({
     // 设置页补进去就成了「只有自动审批一行长着图标」，与同排不一致，所以那里一个都不补。
     const PRESET_ICON_LABEL = '自动审批'
     const PRESET_ICON_CLASS = 'ap-presetGlyph'
-    // 两套几何：chip 对齐内置 .triggerIcon svg（14px、跟文字同色），菜单项对齐内置 .itemIcon
-    // （16px、三级文字色、与 label 的间距 8px）。变体写成**内联自定义属性**（见 applyPresetIconVars），
-    // 不走「两个 class 比层叠」的路子 —— 上一版就是菜单态那条规则没生效，菜单里的图标一直是 chip 的 14px。
+    // 两套几何，**都照当前宿主（2.0.17）的 CSS 量**（2026-10-08 用户反馈「图标比别的档位大」，逐个核对了
+    // 宿主源码）：chip 对齐 PermissionSelect 的 .triggerIcon（svg 14px、gap 4px、色跟 .trigger 的
+    // label-secondary → currentColor）；菜单项对齐 Menu 的 .itemIcon（svg **14px**、色
+    // var(--dsw-alias-menu-icon)、与 label 的间距取 .item 的 **gap:6px**）。旧版记的
+    // 「菜单项 16px / 间距 8px / 三级文字色」是升级前那份宿主的量，已经过时——菜单里的图标因此偏大。
+    // 变体写成**内联自定义属性**（见 applyPresetIconVars），不走「两个 class 比层叠」的路子 ——
+    // 上一版就是菜单态那条规则没生效，菜单里的图标一直是 chip 的 14px。
     const PRESET_ICON_VARIANTS = Object.freeze({
       chip: Object.freeze({ box: '14px', icon: '14px', gap: '4px', color: 'currentColor' }),
-      menu: Object.freeze({ box: '16px', icon: '16px', gap: '8px', color: 'var(--dsw-alias-label-tertiary,currentColor)' }),
+      menu: Object.freeze({ box: '14px', icon: '14px', gap: '6px', color: 'var(--dsw-alias-menu-icon,currentColor)' }),
     })
     // 内联自定义属性名：写入（applyPresetIconVars）与撤销（unmarkPresetIcon）共用这一份，免得漏清一个
     const PRESET_ICON_VARS = Object.freeze({
@@ -537,10 +541,14 @@ window.__ModuleLoader__.load({
       gap: '--ap-glyph-gap',
       color: '--ap-glyph-color',
     })
+    // 几何**照抄宿主内置的 FullAccessArtwork**（盾牌轮廓逐字相同、viewBox 16、描边 1）：内置三个档位的
+    // 图标在 14px 框里墨迹只占 ~80%×86%，上一版自绘的盾牌却占了 ~91%×98%（描边还粗到 1.32），真机上
+    // 看着就是「比别家图标大一圈」（2026-10-08 用户反馈「字号调小一点，和其他类型的一样大小」）。
+    // 中间那个 A 跟着收进盾牌内圈（宽 2.9 / 高 4.1，描边 1.25），整枚图标因此与内置图标同尺寸同重量。
     const PRESET_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none">'
-      + '<path d="M8.20554 0.899994L14.7901 3.36857V7.01026C14.7901 12 11.0466 14.2103 8.20554 15.3C5.36446 14.2103 1.62012 12 1.62012 7.01026V3.36857L8.20554 0.899994Z" stroke="#fff" stroke-width="1.31831" stroke-linejoin="round"/>'
-      + '<path d="M6.45 10.45 8.2 5.7 9.95 10.45" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>'
-      + '<path d="M7.2 8.75h2" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>'
+      + '<path d="M6.59624 2.14853C7.50155 1.80917 8.49914 1.80919 9.40444 2.14859L13.9245 3.84317V7.11961C13.9245 11.6089 10.5565 13.5975 8.00035 14.5779C5.44423 13.5975 2.07544 11.6089 2.07544 7.11961V3.84317L6.59624 2.14853Z" stroke="#fff" stroke-width="1" stroke-linejoin="round"/>'
+      + '<path d="M6.55 10.45 8 6.35 9.45 10.45" stroke="#fff" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/>'
+      + '<path d="M7.15 8.95h1.7" stroke="#fff" stroke-width="1.25" stroke-linecap="round"/>'
       + '</svg>'
     // mask 走 data URI：encodeURIComponent 会连 # 与引号一起编码，避免 CSS 解析歧义
     const PRESET_ICON_MASK = 'url("data:image/svg+xml;charset=utf-8,' + encodeURIComponent(PRESET_ICON_SVG) + '")'
@@ -914,9 +922,9 @@ window.__ModuleLoader__.load({
         // 档位名字前面的「盾牌 + A」：只挂在「本来就有图标位」的地方（输入框 chip 与它的下拉菜单；设置页的
         // 权限菜单是纯文字，一个都不挂），几何全部走 --ap-glyph-* 变量（chip 14/4/currentColor，菜单项 16/8/三级色），
         // 变量由 applyPresetIconVars 内联写在 span 上、unmarkPresetIcon 负责清掉；mask 用 longhand，避免简写与变量混在一起出歧义
-        `.${PRESET_ICON_CLASS}{display:inline-flex;align-items:center;gap:var(--ap-glyph-gap,8px)}`,
+        `.${PRESET_ICON_CLASS}{display:inline-flex;align-items:center;gap:var(--ap-glyph-gap,4px)}`,
         // 图标本体：尺寸全走 --ap-glyph-* 变量；用 flex 的 align-items:center 对齐，和内置 itemIcon / triggerIcon 同一套机制（之前用 vertical-align 手调，真机上差了 2px）
-        `.${PRESET_ICON_CLASS}::before{content:"";flex:none;width:var(--ap-glyph-box,16px);height:var(--ap-glyph-box,16px);background-color:var(--ap-glyph-color,currentColor);-webkit-mask-image:${PRESET_ICON_MASK};mask-image:${PRESET_ICON_MASK};-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-position:center;mask-position:center;-webkit-mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px);mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px)}`,
+        `.${PRESET_ICON_CLASS}::before{content:"";flex:none;width:var(--ap-glyph-box,14px);height:var(--ap-glyph-box,14px);background-color:var(--ap-glyph-color,currentColor);-webkit-mask-image:${PRESET_ICON_MASK};mask-image:${PRESET_ICON_MASK};-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-position:center;mask-position:center;-webkit-mask-size:var(--ap-glyph-icon,14px) var(--ap-glyph-icon,14px);mask-size:var(--ap-glyph-icon,14px) var(--ap-glyph-icon,14px)}`,
         // 审批卡首行：DSH 把 pending.reason 放进一个纯文本 div，默认 white-space 会把我
         // 们写入的换行折叠成空格；这里打开换行，让「原有信息 / 空行 / 模型审批意见」分行。
         // 选择器只认官方卡片的 data-approval-key 属性（稳定），不依赖它的哈希类名。
@@ -1074,7 +1082,7 @@ window.__ModuleLoader__.load({
      * sessionId / workspace 记上一次观测的会话与工作区——变了就重读一次界面偏好（自动打开时间线按
      * 工作区区分，用户 2026-09-18）。
      */
-    const approvalWatch = { seen: new Map(), timer: undefined, sessionId: undefined, workspace: undefined }
+    const approvalWatch = { seen: new Map(), timer: undefined, sessionId: undefined, workspace: undefined, sessionSource: '' }
 
     /** 记录的身份：id 优先、退回时间戳（宿主写的 id 是 uuid）。 */
     function recordKey(record) {
@@ -1192,16 +1200,91 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** 当前会话 id：来自宿主 sessions 服务的列表快照（拿不到返回 undefined）。 */
-    function currentSessionId() {
-      try {
-        const snapshot = clientCtx?.get?.('sessions')?.list?.getSnapshot?.()
-        const current = snapshot?.current
-        return typeof current === 'string' && current !== '' ? current : undefined
-      } catch (error) {
-        console.warn(LOG, '读取当前会话失败', error)
+    /** 上一次 currentSessionId() 是从哪一级拿到会话的（none = 四级都读不到）；信标据此取证。 */
+    let sessionSource = 'none'
+
+    /** 只认非空字符串的会话 id：宿主各级服务给的可能是 undefined / 空串 / 别的类型。 */
+    function sessionIdOf(value) {
+      return typeof value === 'string' && value !== '' ? value : undefined
+    }
+
+    /**
+     * 「当前会话」的四级来源（顺序即优先级），见 {@link currentSessionId}。
+     * 每项返回原始值，归一化（只认非空字符串）由调用方统一做；抛错由调用方兜住并继续往下一级。
+     */
+    const SESSION_ID_SOURCES = [
+      // ① 宿主 2.0.17+：uiSession 的主视图绑定（binding source：getSnapshot() 与 .value 都给 {key}）
+      ['uiSession', () => {
+        const current = clientCtx?.get?.('uiSession')?.current
+        if (current === undefined || current === null) return undefined
+        const binding = typeof current.getSnapshot === 'function' ? current.getSnapshot() : current.value
+        return binding?.key
+      }],
+      // ② 宿主 2.0.17+：sidebarRight.mounted 是快照 store（老宿主是函数，返回布局、没有会话 id 那一层）
+      ['sidebarRight', () => {
+        const mounted = clientCtx?.get?.('sidebarRight')?.mounted
+        if (mounted === undefined || mounted === null) return undefined
+        if (typeof mounted.getSnapshot === 'function') return mounted.getSnapshot()
+        return typeof mounted === 'function' ? mounted()?.sessionId : undefined
+      }],
+      // ③ 老宿主：会话列表快照上的 current（新宿主那份快照只有 ids/byId/phase/projectionsBySession）
+      ['sessions.current', () => clientCtx?.get?.('sessions')?.list?.getSnapshot?.()?.current],
+      // ④ 兜底：byId 里 retainedBy.mainView > 0 的那条（与宿主 publishMain() 同一个判据）
+      ['sessions.mainView', () => {
+        const rows = clientCtx?.get?.('sessions')?.list?.getSnapshot?.()?.byId
+        if (rows === null || typeof rows !== 'object') return undefined
+        for (const row of Object.values(rows)) {
+          if ((row?.retainedBy?.mainView ?? 0) > 0) return row.id
+        }
         return undefined
+      }],
+    ]
+
+    /**
+     * 当前会话 id（自动展开与未读角标按它挑记录），**按宿主版本逐级回退**，见 SESSION_ID_SOURCES。
+     *
+     * 为什么必须回退：宿主 2.0.17（2026-09-29 升级）换了客户端服务的形状，**老写法
+     * `sessions.list.getSnapshot().current` 在新宿主上恒为 undefined**——那份快照现在只有
+     * `{ids,byId,phase,projectionsBySession}`（dsh-api-session-controller 的 projectList() 写死这几个键），
+     * 「主列里那个会话」搬到了 dsh-client-ui-session 的 `uiSession.current` 绑定上（publishMain()
+     * 按 `byId[].retainedBy.mainView` 挑，读宿主源码确认）。拿不到会话的后果不是「少个提示」：
+     * watchApprovals() 会在第一行 return，**自动展开与未读角标一起失效**（2026-10-08 用户报
+     * 「更新后不自动打开审批列表了」的根因）。
+     * 全读不到时返回 undefined——观察器宁可空转，也不许把会话猜成别人（那会让角标与自动展开张冠李戴）。
+     * @returns {string|undefined} 当前会话 id
+     */
+    function currentSessionId() {
+      for (const [name, read] of SESSION_ID_SOURCES) {
+        let value
+        try {
+          value = read()
+        } catch (error) {
+          console.warn(LOG, '读取当前会话失败（' + name + '）', error)
+          continue
+        }
+        const id = sessionIdOf(value)
+        if (id !== undefined) {
+          sessionSource = name
+          return id
+        }
       }
+      sessionSource = 'none'
+      return undefined
+    }
+
+    /**
+     * 「从哪一级认出的当前会话」只在**变化时**上报一次：宿主日志里
+     * `client beacon stage=session-source detail=uiSession=session-xxxx` 就是「自动展开认到了哪个会话、
+     * 靠哪一级认出来的」的直接证据；`detail=none` = 四级来源全读不到（2026-10-08 那次坏掉时的病征，
+     * **失败也要上报**：安静地什么都不做是最难查的形态）。轮询 3 秒一次，必须节流。
+     * @param {string|undefined} sessionId 这一轮认到的会话（undefined = 没认出来）
+     * @returns {void}
+     */
+    function beaconSessionSource(sessionId) {
+      const detail = sessionId === undefined ? sessionSource : sessionSource + '=' + sessionId
+      if (approvalWatch.sessionSource === detail) return
+      approvalWatch.sessionSource = detail
+      beacon('session-source', detail)
     }
 
     /**
@@ -1218,6 +1301,7 @@ window.__ModuleLoader__.load({
     async function watchApprovals() {
       if (mountState.sidebar === undefined) return
       const sessionId = currentSessionId()
+      beaconSessionSource(sessionId)
       if (sessionId === undefined) return
       // 换了会话/工作区就重读一次界面偏好：这个开关是按会话存的，用上一个会话的值会判错。
       // previousSession 同时用来识别「刚切进来」——切换判定只在那一刻做一次。
@@ -1293,12 +1377,22 @@ window.__ModuleLoader__.load({
      * 把时间线 tab 关掉了**（侧栏里已经没有它）。官方 closeTab 只在「它是唯一 docked tab」时才顺便
      * 把整栏收起来，所以关掉 ours 之后侧栏往往仍然展开着（常见：还留着引导页 tab）——那种状态必须
      * 允许重新打开，否则一旦手动关过一次就再也见不到时间线了（2026-09-20 用户报的场景）。
-     * @returns {boolean|undefined} 布局里有没有我们这种 tab；读不到布局（老宿主没有 mounted）时 undefined
+     *
+     * 两个宿主版本两种读法：① 新宿主用 `sidebarRight.tabsIn(sessionId)`（公开面，给该会话已提交的 tab
+     * 记录）；② 老宿主用 `mounted()` 返回的 `{layout}`——**新宿主的 `mounted` 是快照 store、不是函数**
+     * （2026-09-29 宿主升级踩到），会被①挡在前面、不会走错。都读不到时返回 undefined = 状态未知。
+     * @param {string} sessionId 当前会话（tabsIn 按会话取布局）
+     * @returns {boolean|undefined} 布局里有没有我们这种 tab；读不到布局时 undefined
      */
-    function timelineTabOpen() {
+    function timelineTabOpen(sessionId) {
       try {
         const service = typeof clientCtx?.get === 'function' ? clientCtx.get('sidebarRight') : undefined
-        if (service === undefined || typeof service.mounted !== 'function') return undefined
+        if (service === undefined || service === null) return undefined
+        if (typeof service.tabsIn === 'function' && typeof sessionId === 'string' && sessionId !== '') {
+          const tabs = service.tabsIn(sessionId)
+          if (Array.isArray(tabs)) return tabs.some(tab => tab?.kind === SIDEBAR_KIND)
+        }
+        if (typeof service.mounted !== 'function') return undefined
         const layout = service.mounted()?.layout
         if (layout === undefined || layout.tabs === undefined) return undefined
         return Object.values(layout.tabs).some(tab => tab?.kind === SIDEBAR_KIND)
@@ -1331,7 +1425,7 @@ window.__ModuleLoader__.load({
       // 要求照旧重新打开（官方 closeTab 只在它是唯一 docked tab 时才顺手收起整栏——读源码确认——
       // 所以关掉之后侧栏常常还是展开的，老口径会就此永久不再打开）。
       // 状态未知（老宿主没有 isExpanded / mounted）时保持旧行为，尽力打开。
-      if (sidebarExpanded() === true && timelineTabOpen() !== false) return
+      if (sidebarExpanded() === true && timelineTabOpen(sessionId) !== false) return
       /** 开一次时间线；服务不可用或抛错时返回 false（调用方只重试一次）。 */
       const attempt = () => {
         try {
