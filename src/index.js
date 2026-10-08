@@ -23,9 +23,15 @@
  *   session{sessionId,autoOpenTimeline,scoped}；POST 带 session + cwd 时写进该工作区项目策略文件的
  *   prefs.autoOpenTimelineSessions[sessionId]。会话级写不成（没有 cwd）**直接 400**，绝不静默写全局——
  *   那会改掉所有会话的默认值。工作区那层保留（回执里照给 workspace 段）但不再参与判定
+ * @modify 2026-10-08 对齐宿主新 settings 模型（SettingsForms）：模块顶层导出带 .volatile() 的 Config
+ *   （宿主写回只认 volatile 字段，且已没有 register/get）；界面偏好改从插件 config 的 volatile 引用
+ *   实时读，写走 settings.update 落进 profile patch
  */
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, join } from 'node:path'
 import {
   createRecordStore,
   DEFAULT_MAX_RECORDS,
@@ -115,6 +121,8 @@ export const RECORD_LOG_PATH = '/api/dsh-auto-pass/log'
 /** 客户端半启动信标：把「走到哪一步」写进宿主日志，用于定位「看不到面板」类问题。 */
 export const RECORD_BEACON_PATH = '/api/dsh-auto-pass/beacon'
 export const RECORD_CONFIG_PATH = '/api/dsh-auto-pass/config'
+/** 面板的模型候选：宿主模型目录（provider → models，含每个模型的思考强度）。 */
+export const MODELS_PATH = '/api/dsh-auto-pass/models'
 /** 白名单/黑名单与阈值的读写入口（供「审批设置」面板使用）。 */
 export const POLICY_PATH = '/api/dsh-auto-pass/policy'
 /** 由一条审批记录一键升级/降级：规则文本由 Reviewer 模型产出，缺省回落到精确签名。 */
@@ -131,8 +139,176 @@ export const RULE_DRAFT_PATH = '/api/dsh-auto-pass/rule/draft'
 export const RULE_REVERT_PATH = '/api/dsh-auto-pass/rule/revert'
 /** 时间轴可选的放置位置；auto 表示优先右侧栏座位、没有座位时退回对话标签页。 */
 export const PLACEMENTS = Object.freeze(['auto', 'tab', 'sidebar', 'all'])
-/** 设置命名空间：宿主 settings 注册与浏览器端设置卡片靠这个名字对齐。 */
+/**
+ * 可由设置界面写回的配置字段 -> 读回时的类型（写回只认标了 `.volatile()` 的字段，见
+ * buildSettingsConfig）。前五个是界面/行为偏好；后五个是审查模型配置（用户 2026-10-08
+ * 要求把模型配置搬进「审批设置」面板）：路由成对、思考强度、审查超时与输出上限。
+ */
+export const SETTING_KINDS = Object.freeze({
+  placement: 'placement',
+  notice: 'boolean',
+  denyDirect: 'boolean',
+  autoOpenTimeline: 'boolean',
+  askRejectReason: 'boolean',
+  // 路由：空串 = 跟随当前会话（与「未设置」等价，见 routePairProblem）
+  reviewerProvider: 'route',
+  reviewerModel: 'route',
+  // 思考强度：空串 = 用模型/provider 自己的默认值
+  reviewerReasoningEffort: 'optionalString',
+  // 调用参数：正整数（写回会被拦下，读回时坏值回落默认）
+  timeoutMs: 'positiveInt',
+  maxOutputTokens: 'positiveInt',
+})
+/** 全部可写字段（宿主 settings 的 volatile 白名单，顺序 = 面板顺序）。 */
+export const VOLATILE_SETTINGS = Object.freeze(Object.keys(SETTING_KINDS))
+
+/**
+ * 构建宿主 settings 用的 Config schema（模块顶层同步构建，见下面的解析）。
+ * 界面偏好与调用参数带 schema 默认值；路由与思考强度**不带默认值**——没写过就是 undefined，
+ * 面板显示为空 = 跟随当前会话 / 用模型默认。`.volatile()` 是写回的必要条件（宿主
+ * SettingsForms.write 先取 volatileForm，取不到就报 Plugin entry "…" has no volatile fields）。
+ * @param {object} z schemastery 模块（函数体，带 object / string / boolean / number / union）
+ * @returns {object} schemastery schema
+ */
+export function buildSettingsConfig(z) {
+  return z.object({
+    placement: z.union([...PLACEMENTS]).default(DEFAULTS.placement).volatile(),
+    notice: z.boolean().default(DEFAULTS.notice).volatile(),
+    denyDirect: z.boolean().default(DEFAULTS.denyDirect).volatile(),
+    autoOpenTimeline: z.boolean().default(DEFAULTS.autoOpenTimeline).volatile(),
+    askRejectReason: z.boolean().default(DEFAULTS.askRejectReason).volatile(),
+    reviewerProvider: z.string().volatile(),
+    reviewerModel: z.string().volatile(),
+    reviewerReasoningEffort: z.string().volatile(),
+    timeoutMs: z.number().step(1).min(1).default(DEFAULTS.timeoutMs).volatile(),
+    maxOutputTokens: z.number().step(1).min(1).default(DEFAULTS.maxOutputTokens).volatile(),
+  })
+}
+
+/**
+ * 宿主 settings 服务在模块顶层同步读 `entry.fiber.runtime.Config` 判断「这一行可不可配置」：
+ * 没有这份 schema，`settings.update('dsh-auto-pass', …)` 直接抛
+ * No configurable plugin entry "dsh-auto-pass"（2026-10-08 真机踩到）——用户看到的现象是
+ * 「审批设置」里拨开关 → 保存失败。而 `.volatile()` 是 schemastery ≥3.18.4 才有的 API，
+ * 仓库里那份（link 安装时插件自己解析到的）是 3.18.2，所以这里按候选顺序找一份**带
+ * .volatile() 的 schemastery**，优先宿主自带副本（与宿主的 settings 服务同源）。
+ * 都找不到就 Config = undefined（不是 null：宿主 schema() 只排除 undefined）：插件照常
+ * 加载与审批，只是设置写回不可用——绝不因为拿不到 schema 让整个插件起不来。
+ */
+
+/** require 的起点候选：仓库自己 -> Desktop 宿主 <resources>/app -> dsh CLI 宿主。 */
+function schemasteryProbes() {
+  const probes = []
+  const override = process.env.DSH_AUTO_PASS_SCHEMASTERY
+  if (typeof override === 'string' && override !== '') probes.push(override)
+  probes.push(import.meta.url)
+  // Electron 宿主（DSH Desktop）：宿主自己的 package.json 就在 <resources>/app 下
+  if (typeof process.resourcesPath === 'string' && process.resourcesPath !== '') {
+    probes.push(join(process.resourcesPath, 'app', 'package.json'))
+  }
+  // 非 Electron / 打包差异时按可执行文件位置兜底
+  if (typeof process.execPath === 'string' && process.execPath !== '') {
+    probes.push(join(dirname(process.execPath), 'resources', 'app', 'package.json'))
+  }
+  // 宿主进程自己的入口脚本（Desktop 是 utilityProcess 跑 lib/host-process-entry.js）：
+  // 从它的目录往上就能解析到宿主 node_modules 里的 schemastery，最稳的一条
+  const entry = process.argv[1]
+  if (typeof entry === 'string' && entry !== '' && isAbsolute(entry) && /\.(?:js|mjs|cjs)$/.test(entry)) {
+    probes.push(entry)
+  }
+  // dsh CLI 宿主：跟随它的全局前缀找自带的 @deepseek-ai/dsh（对齐 dsh-smart-title 的做法）
+  for (const prefix of [process.env.DSH_GLOBAL_PREFIX, join(homedir(), '.local')]) {
+    if (typeof prefix === 'string' && prefix !== '') {
+      probes.push(join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'package.json'))
+    }
+  }
+  return probes
+}
+
+/**
+ * 这份 schemastery 支持 `.volatile()` 吗（3.18.4 起才有）。
+ * @param {*} schema schemastery 模块
+ * @returns {boolean} 支持返回 true
+ */
+export function supportsVolatile(schema) {
+  try {
+    return typeof schema?.object === 'function' && typeof schema.boolean().volatile === 'function'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 依次尝试候选起点，返回第一份支持 .volatile() 的 schemastery。
+ * @returns {{schema: object, source: string}|undefined} 拿不到时 undefined
+ */
+export function loadSchemastery(probes = schemasteryProbes()) {
+  for (const base of probes) {
+    try {
+      const module = createRequire(base)('@deepseek-ai/schemastery')
+      const resolved = module?.default ?? module
+      if (supportsVolatile(resolved)) return { schema: resolved, source: base }
+    } catch {
+      // 这个候选不可用（路径不存在 / 版本太老 / 入口解析失败）：试下一个
+    }
+  }
+  return undefined
+}
+
+const SCHEMA_SOURCE = loadSchemastery()
+/** 宿主 settings 用的 Config；解析不到可用 schemastery 时 undefined（宿主按「不可配置」处理）。 */
+export const Config = SCHEMA_SOURCE === undefined ? undefined : buildSettingsConfig(SCHEMA_SOURCE.schema)
+
+/**
+ * 解包 volatile 引用：宿主 resolveConfig 之后，标了 .volatile() 的字段是 cosmokit 造的引用对象
+ * （Object.freeze({ get, [write] })），取值要 get() 出来；普通值原样返回。
+ * @param {*} value 原始节点
+ * @returns {*} 真实值
+ */
+export function plainSettingValue(value) {
+  return value !== null && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value
+}
+
+/**
+ * 递归解包一份配置里的所有 volatile 引用（对象与数组都进）。
+ * @param {*} config 原始配置
+ * @returns {*} 全是普通值的配置
+ */
+export function plainSettings(config) {
+  if (Array.isArray(config)) return config.map(plainSettings)
+  if (config === null || typeof config !== 'object') return config
+  if (typeof config.get === 'function') return plainSettings(config.get())
+  return Object.fromEntries(Object.entries(config).map(([key, value]) => [key, plainSettings(value)]))
+}
+
+/**
+ * 一个界面偏好的生效值：volatile 引用实时取值（用户改完立刻生效），类型不对或缺失时
+ * 回落到 DEFAULTS——这是「设置里写坏了也不影响审批」的那层兜底。
+ * @param {object} config apply 拿到的插件配置（保留 volatile 引用）
+ * @param {string} key 偏好键
+ * @returns {string|boolean} 生效值
+ */
+function effectiveSettingValue(config, key) {
+  const value = plainSettingValue(config?.[key])
+  switch (SETTING_KINDS[key]) {
+    case 'placement':
+      return PLACEMENTS.includes(value) ? value : DEFAULTS.placement
+    case 'boolean':
+      return typeof value === 'boolean' ? value : DEFAULTS[key]
+    case 'positiveInt':
+      // 数字类配置（timeoutMs / maxOutputTokens）：坏值（0、负、字符串）一律回落默认
+      return Number.isSafeInteger(value) && value > 0 ? value : DEFAULTS[key]
+    default:
+      // route / optionalString：空串就是「未设置」，面板据此显示为空
+      return typeof value === 'string' ? value : ''
+  }
+}
+
+/** 设置命名空间 = profile 里本插件行的 id：宿主 settings 的读写都按它定位条目。 */
 export const SETTINGS_NAMESPACE = 'dsh-auto-pass'
+/** 缺 Config 时写回失败的统一解释前缀（宿主原文 No configurable plugin entry 看不懂）。 */
+const SETTINGS_SCHEMA_HINT = '本插件当前不可配置（宿主 settings 要求模块顶层导出带 .volatile() 的 Config，'
+  + '需要 schemastery ≥3.18.4）：'
 /**
  * 会话消息 source 的 kind：会话格式 v4 要求它是「生产者自有」的，裸 `plugin` 会在**写入侧**被拒 ——
  * `format v4 message requires a producer-owned source kind`（2026-10-08 真机踩到）。被拒的事件会留在
@@ -209,11 +385,11 @@ export function apply(ctx, config) {
     warn: message => ctx.logger.warn(message),
   })
   ctx.on('approval/request', createAutoApprovalHandler(ctx, resolved, records, policies), { prepend: true })
-  installSettings(ctx)
+  reportSettingsSupport(ctx)
   installRecordRoute(ctx, records, resolved, policies)
   installClientGraphProbe(ctx)
   ctx.logger.info('dsh-auto-pass: 审批记录已就绪 ' + (records.dir === undefined ? 'file=' + String(records.file) : 'dir=' + records.dir) + ' maxRecords=' + String(records.limit)
-    + ' placement=' + effectivePlacement(ctx, resolved)
+    + ' placement=' + effectivePlacement(resolved)
     + ' autoApproveAfter=' + String(policies.threshold('allow'))
     + ' autoDenyAfter=' + String(policies.threshold('deny'))
     + ' policy=' + String(policies.globalFile)
@@ -221,84 +397,53 @@ export function apply(ctx, config) {
 }
 
 /**
- * 注册设置命名空间。设置页只为**宿主侧注册过的**命名空间渲染插件卡片，
- * 所以这张卡片能否出现取决于这里。settings 服务缺失时静默跳过。
+ * 报告设置链路的接线状态（一行 info，缺 schema 时再加一条 warn）。
+ * 排查「审批设置里保存失败」先看这两行：config=missing 说明宿主 settings 没法把本行当作
+ * 可配置条目（写回必被拒），write=false 说明连设置服务都没有。
  */
-function installSettings(ctx) {
-  if (typeof ctx.inject !== 'function') return
-  ctx.inject(['settings'], settingsCtx => {
-    // schemastery 只在注册设置时需要：用动态 import 把它变成软依赖，
-    // 解析失败时只是没有设置页卡片，审批主链路照常工作。
-    void import('@deepseek-ai/schemastery').then(module => {
-      const z = module.default ?? module
-      // 五个键都是「用户偏好」：settings.get() 返回带 schema 默认值的解析结果，
-      // 所以设置页没写过的键也能拿到 DEFAULTS 里那套默认行为。
-      const schema = z.object({
-        placement: z.union([...PLACEMENTS]).default('all'),
-        notice: z.boolean().default(DEFAULTS.notice),
-        denyDirect: z.boolean().default(DEFAULTS.denyDirect),
-        autoOpenTimeline: z.boolean().default(DEFAULTS.autoOpenTimeline),
-        askRejectReason: z.boolean().default(DEFAULTS.askRejectReason),
-      })
-      settingsCtx.settings.register(SETTINGS_NAMESPACE, schema)
-    }).catch(error => {
-      ctx.logger.warn('dsh-auto-pass: 注册设置命名空间失败：' + errorMessage(error))
-    })
-  })
-}
-
-/** 生效的放置位置：设置页的值优先，其次插件 config 的值。 */
-function effectivePlacement(ctx, config) {
-  const value = readSetting(ctx, 'placement')
-  return PLACEMENTS.includes(value) ? value : config.placement
-}
-
-/**
- * 读一处设置页偏好。设置命名空间没注册（没有 settings 服务、schemastery 缺失）时返回 undefined，
- * 调用方一律回落到插件 config 的值——设置读不到只影响界面偏好，绝不影响审批结论。
- * @param {object} ctx 宿主上下文
- * @param {string} key 设置键（placement / notice / denyDirect）
- * @returns {*} 设置值；读不到时 undefined
- */
-function readSetting(ctx, key) {
+function reportSettingsSupport(ctx) {
   const settings = typeof ctx.get === 'function' ? ctx.get('settings') : undefined
-  if (settings === undefined || typeof settings.get !== 'function') return undefined
-  try {
-    return settings.get(SETTINGS_NAMESPACE)?.[key]
-  } catch (error) {
-    ctx.logger.warn('dsh-auto-pass: 读取设置 ' + key + ' 失败，回退到插件配置：' + errorMessage(error))
-    return undefined
+  const writable = settings !== undefined && typeof settings.update === 'function'
+  ctx.logger.info('dsh-auto-pass: settings wiring config=' + (Config === undefined ? 'missing' : 'ok')
+    + ' schemaSource=' + String(SCHEMA_SOURCE?.source ?? 'none')
+    + ' write=' + String(writable))
+  if (Config === undefined) {
+    ctx.logger.warn('dsh-auto-pass: 没有可用的 schemastery（需要 ≥3.18.4 的 .volatile()），'
+      + '宿主 settings 不会把本行当作可配置条目，「审批设置」里的保存会失败：'
+      + '请升级 DSH 宿主，或让插件解析到宿主自带的 schemastery 副本。')
   }
 }
 
+/** 生效的放置位置：值就是插件 config 里那个 volatile 字段（实时读，见 resolveConfig）。 */
+function effectivePlacement(config) {
+  return PLACEMENTS.includes(config.placement) ? config.placement : DEFAULTS.placement
+}
+
 /**
- * 布尔型界面与行为开关：设置页的值 -> 插件 config 的值 -> DEFAULTS。
- * 只认真正的 boolean，读到别的类型（写坏的设置文件 / 字符串 "false"）一律往下一层回落，
- * 避免「config 里写成字符串 → 开关静默失效」。设置读不到只影响界面偏好，绝不改变审批结论。
- * @param {object} ctx 宿主上下文
- * @param {object} config 插件配置
- * @param {string} key 开关名（notice / denyDirect）
+ * 布尔型界面与行为开关：插件 config -> DEFAULTS。
+ * 只认真正的 boolean，读到别的类型（写坏的配置文件 / 字符串 "false"）一律回落到默认值，
+ * 避免「config 里写成字符串 → 开关静默失效」。界面偏好读不到绝不影响审批结论。
+ * @param {object} config 插件配置（resolveConfig 的产物，volatile 字段实时读）
+ * @param {string} key 开关名（notice / denyDirect / autoOpenTimeline / askRejectReason）
  * @returns {boolean} 生效值
  */
-function effectiveFlag(ctx, config, key) {
-  const fromSettings = readSetting(ctx, key)
-  if (typeof fromSettings === 'boolean') return fromSettings
+function effectiveFlag(config, key) {
   return typeof config[key] === 'boolean' ? config[key] : DEFAULTS[key]
 }
 
-/** 是否把审批结果注入模型上下文（设置页开关优先，其次插件 config，最后默认开）。 */
-function effectiveNotice(ctx, config) {
-  return effectiveFlag(ctx, config, 'notice')
+/** 是否把审批结果注入模型上下文（插件 config 优先，最后默认开）。 */
+function effectiveNotice(config) {
+  return effectiveFlag(config, 'notice')
 }
 
-/** 命中黑名单时是否直接拒绝（设置页开关优先，其次插件 config，最后默认关）。 */
-function effectiveDenyDirect(ctx, config) {
-  return effectiveFlag(ctx, config, 'denyDirect')
+/** 命中黑名单时是否直接拒绝（插件 config 优先，最后默认关）。 */
+function effectiveDenyDirect(config) {
+  return effectiveFlag(config, 'denyDirect')
 }
 
-/** 人工拒绝后是否追问一句拒绝理由（设置页开关优先，其次插件 config，最后默认开）。 */
-function effectiveAskRejectReason(ctx, config) {
-  return effectiveFlag(ctx, config, 'askRejectReason')
+/** 人工拒绝后是否追问一句拒绝理由（插件 config 优先，最后默认开）。 */
+function effectiveAskRejectReason(config) {
+  return effectiveFlag(config, 'askRejectReason')
 }
 
 /**
@@ -363,7 +508,7 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
     const url = new URL(req.url ?? '/', 'http://dsh.local')
     const pathname = url.pathname.replace(/\/+$/, '')
     if (pathname !== RECORD_LOG_PATH && pathname !== RECORD_CONFIG_PATH && pathname !== RECORD_BEACON_PATH
-      && pathname !== POLICY_PATH && pathname !== RULE_PATH && pathname !== RULE_DRAFT_PATH
+      && pathname !== MODELS_PATH && pathname !== POLICY_PATH && pathname !== RULE_PATH && pathname !== RULE_DRAFT_PATH
       && pathname !== RULE_REVERT_PATH) {
       writeJson(404, { ok: false, error: 'not found' })
       return
@@ -391,6 +536,14 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
       // 全部界面偏好一次给全：placement 决定面板挂哪，notice / denyDirect 是两个行为开关。
       // 带 ?cwd= 时额外给出**本工作区**的生效值（自动打开时间线这个开关按工作区区分）
       writeJson(200, configSnapshot(ctx, config, policies, records, requestedCwd(url.searchParams.get('cwd')), requestedSession(url.searchParams.get('session'))))
+      return
+    }
+    if (pathname === MODELS_PATH) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        writeJson(405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      await serveModelsRequest(ctx, writeJson)
       return
     }
     if (pathname === POLICY_PATH) {
@@ -431,9 +584,12 @@ async function serveRecordRequest(req, res, records, config, ctx, policies = noo
   }
 }
 
+/** 路由/强度这类短字符串配置的长度上限（provider 与 model 的写法都很短，超长必是脏值）。 */
+const MAX_ROUTE_CHARS = 200
+
 /**
- * 可写的界面偏好：键 -> { ok(value) 校验, label(value) 错误说明 }。
- * 只有出现在这里的键才允许经 HTTP 写进设置命名空间，其余一律拒绝。
+ * 可写的配置字段：键 -> { ok(value) 校验, label 错误说明 }。
+ * 只有出现在这里的键才允许经 HTTP 写进本插件行的 config，其余一律拒绝。
  */
 const CONFIG_SETTINGS = Object.freeze({
   placement: {
@@ -444,6 +600,27 @@ const CONFIG_SETTINGS = Object.freeze({
   denyDirect: { ok: value => typeof value === 'boolean', label: 'denyDirect must be a boolean' },
   autoOpenTimeline: { ok: value => typeof value === 'boolean', label: 'autoOpenTimeline must be a boolean' },
   askRejectReason: { ok: value => typeof value === 'boolean', label: 'askRejectReason must be a boolean' },
+  // 审查模型路由：面板里的「清空」写空串（= 跟随当前会话），成对规则在合并后再校验一次
+  reviewerProvider: {
+    ok: value => typeof value === 'string' && value.length <= MAX_ROUTE_CHARS,
+    label: 'reviewerProvider must be a string (at most ' + MAX_ROUTE_CHARS + ' chars)',
+  },
+  reviewerModel: {
+    ok: value => typeof value === 'string' && value.length <= MAX_ROUTE_CHARS,
+    label: 'reviewerModel must be a string (at most ' + MAX_ROUTE_CHARS + ' chars)',
+  },
+  reviewerReasoningEffort: {
+    ok: value => typeof value === 'string' && value.length <= MAX_ROUTE_CHARS,
+    label: 'reviewerReasoningEffort must be a string (at most ' + MAX_ROUTE_CHARS + ' chars; empty uses the model default)',
+  },
+  timeoutMs: {
+    ok: value => Number.isSafeInteger(value) && value > 0,
+    label: 'timeoutMs must be a positive integer',
+  },
+  maxOutputTokens: {
+    ok: value => Number.isSafeInteger(value) && value > 0,
+    label: 'maxOutputTokens must be a positive integer',
+  },
 })
 
 /** 请求里带的工作区目录（`?cwd=` 或请求体的 cwd）的长度上限：只用来定位项目策略文件。 */
@@ -478,13 +655,15 @@ function requestedSession(value) {
  * 自动打开审批时间线**按会话区分**（用户 2026-09-20；此前按工作区，2026-09-18）：session.scoped 表示
  * 这个会话在项目策略文件里单独存过值，autoOpenTimeline 已经是「会话覆盖 → 全局设置 → config → 默认」
  * 之后的生效值，客户端据此决定是否自动展开时间线。workspace 段仍在回执里（老字段照给，不参与判定）。
+ * 另有 model 段：审查模型的 provider / model / 思考强度 / 超时 / 输出上限（前三个空串表示
+ * 「跟随当前会话 / 用模型默认」，面板据此显示空）。
  * @param cwd 请求带的工作区目录（没有就只给全局那份）
  * @param sessionId 请求带的会话 id（没有就不给 session 段）
  * @returns {object} 回执体
  */
 function configSnapshot(ctx, config, policies, records, cwd, sessionId) {
   const settings = typeof ctx.get === 'function' ? ctx.get('settings') : undefined
-  const autoOpenTimeline = effectiveFlag(ctx, config, 'autoOpenTimeline')
+  const autoOpenTimeline = effectiveFlag(config, 'autoOpenTimeline')
   const scopedValue = cwd === undefined ? undefined : policies.pref(cwd, 'autoOpenTimeline')
   const sessionValue = cwd === undefined || sessionId === undefined
     ? undefined
@@ -492,11 +671,19 @@ function configSnapshot(ctx, config, policies, records, cwd, sessionId) {
   return {
     ok: true,
     settings: {
-      placement: effectivePlacement(ctx, config),
-      notice: effectiveNotice(ctx, config),
-      denyDirect: effectiveDenyDirect(ctx, config),
+      placement: effectivePlacement(config),
+      notice: effectiveNotice(config),
+      denyDirect: effectiveDenyDirect(config),
       autoOpenTimeline,
-      askRejectReason: effectiveAskRejectReason(ctx, config),
+      askRejectReason: effectiveAskRejectReason(config),
+    },
+    // 审查模型配置：路由空串 = 跟随当前会话，强度空串 = 用模型默认
+    model: {
+      reviewerProvider: config.reviewerProvider,
+      reviewerModel: config.reviewerModel,
+      reviewerReasoningEffort: config.reviewerReasoningEffort,
+      timeoutMs: config.timeoutMs,
+      maxOutputTokens: config.maxOutputTokens,
     },
     ...(sessionId === undefined ? {} : {
       session: {
@@ -521,9 +708,11 @@ function configSnapshot(ctx, config, policies, records, cwd, sessionId) {
 }
 
 /**
- * 写入界面偏好：请求体里的白名单键逐个校验后（placement / notice / denyDirect /
- * autoOpenTimeline / askRejectReason）合并写进设置命名空间（settings.update 是 patch 语义，
- * 未提到的键保持原值）。**`autoOpenTimeline` 例外**，它分三层：
+ * 写入界面偏好与审查模型配置：请求体里的白名单键逐个校验后（placement / notice / denyDirect /
+ * autoOpenTimeline / askRejectReason / reviewerProvider / reviewerModel /
+ * reviewerReasoningEffort / timeoutMs / maxOutputTokens）合并写进本插件行的 config
+ * （settings.update 是 patch 语义，未提到的键保持原值）。路由两个键还有一条成对规则：
+ * 要么都给，要么都写空串（= 跟随当前会话），半套直接 400。**`autoOpenTimeline` 例外**，它分三层：
  * ① 带 `session` + cwd → 写该会话那份（`prefs.autoOpenTimelineSessions[sessionId]`，2026-09-20 起
  *    这是主路径）；带 session 却没 cwd → **400 cwd-required**（不能把「本会话」写成全局，那会改掉
  *    所有会话的值）；
@@ -549,6 +738,18 @@ async function updateConfig(req, ctx, writeJson, config, policies, records) {
   if (Object.keys(patch).length === 0) {
     writeJson(400, { ok: false, error: 'unknown setting' })
     return
+  }
+  // 路由成对规则按**合并后**的值判一次：面板一次提交 provider + model，这里兜住任何半套请求
+  // （半套配置会让插件下次加载直接抛错；都写空串则 = 跟随当前会话）
+  if (patch.reviewerProvider !== undefined || patch.reviewerModel !== undefined) {
+    const pairProblem = routePairProblem(
+      patch.reviewerProvider ?? config.reviewerProvider,
+      patch.reviewerModel ?? config.reviewerModel,
+    )
+    if (pairProblem !== undefined) {
+      writeJson(400, { ok: false, error: pairProblem, code: 'route-pair' })
+      return
+    }
   }
   const cwd = requestedCwd(body.cwd)
   const sessionId = requestedSession(body.session)
@@ -583,7 +784,15 @@ async function updateConfig(req, ctx, writeJson, config, policies, records) {
       writeJson(503, { ok: false, error: 'settings unavailable' })
       return
     }
-    await settings.update(SETTINGS_NAMESPACE, patch)
+    // 宿主当前 settings 模型：这几个偏好就是本插件行的 config，写回落进 profile patch
+    // （cordis.patch.yml 里 `- id: dsh-auto-pass` 那行的 config），重启不丢。
+    // 前提是模块顶层导出了带 .volatile() 的 Config，否则宿主抛
+    // `No configurable plugin entry "dsh-auto-pass"`——把那种情况翻译成看得懂的提示。
+    try {
+      await settings.update(SETTINGS_NAMESPACE, patch)
+    } catch (error) {
+      throw new Error(Config === undefined ? SETTINGS_SCHEMA_HINT + errorMessage(error) : errorMessage(error))
+    }
   }
   // 回执与 GET 同形状：客户端拿到就能直接套用（含本工作区 / 本会话的生效值）
   writeJson(200, configSnapshot(ctx, config, policies, records, cwd, sessionId))
@@ -602,6 +811,45 @@ async function readJsonBody(req) {
     return JSON.parse((await readBody(req)) || '{}')
   } catch (error) {
     return undefined
+  }
+}
+
+/**
+ * 归一化宿主模型目录：只留候选用得上的字段（provider / model / 思考强度），过滤脏值。
+ * @param {object} catalog 宿主 `sessionController.modelCatalog()` 的结果
+ * @returns {Array<{id: string, name: string, models: Array}>} 分组候选
+ */
+export function normalizeModelCatalog(catalog) {
+  const groups = Array.isArray(catalog?.groups) ? catalog.groups : []
+  return groups.map(group => ({
+    id: String(group?.id ?? ''),
+    name: String(group?.name ?? group?.id ?? ''),
+    models: (Array.isArray(group?.models) ? group.models : []).map(model => ({
+      id: String(model?.id ?? ''),
+      name: String(model?.name ?? model?.id ?? ''),
+      efforts: (Array.isArray(model?.reasoning?.efforts) ? model.reasoning.efforts : [])
+        .map(effort => ({ id: String(effort?.id ?? ''), name: String(effort?.name ?? effort?.id ?? '') }))
+        .filter(effort => effort.id !== ''),
+    })).filter(model => model.id !== ''),
+  })).filter(group => group.id !== '')
+}
+
+/**
+ * 面板的模型候选：把宿主模型目录回给浏览器（与宿主 composer 的模型选择器同一份数据，
+ * 来自宿主的 `sessionController` 服务）。拿不到目录只回 503，面板退回纯手填——
+ * 候选缺失绝不影响保存与审批。
+ */
+async function serveModelsRequest(ctx, writeJson) {
+  const controller = typeof ctx.get === 'function' ? ctx.get('sessionController') : undefined
+  if (controller === undefined || typeof controller.modelCatalog !== 'function') {
+    writeJson(503, { ok: false, error: 'model catalog unavailable' })
+    return
+  }
+  try {
+    writeJson(200, { ok: true, groups: normalizeModelCatalog(await controller.modelCatalog()) })
+  } catch (error) {
+    ctx.logger.warn('dsh-auto-pass: 读取宿主模型目录失败：' + errorMessage(error))
+    writeJson(500, { ok: false, error: errorMessage(error) })
   }
 }
 
@@ -1080,24 +1328,48 @@ export function defaultRuleOf(signature) {
   return exactRuleOf(signature)
 }
 
+/** 路由字段「有没有值」：空串与未设置等价（面板里的「清空」= 跟随当前会话）。 */
+export function isSetRouteValue(value) {
+  return typeof value === 'string' && value.trim() !== ''
+}
+
+/**
+ * 审查路由的成对规则：provider / model 要么都有值，要么都空（= 跟随当前会话）。
+ * 写回时也用它按**合并后**的值判一次，避免写成半套——半套配置会让插件下次加载直接抛错。
+ * @param {*} provider 提供方
+ * @param {*} model 模型
+ * @returns {string|undefined} 违反时返回错误说明
+ */
+export function routePairProblem(provider, model) {
+  if (isSetRouteValue(provider) !== isSetRouteValue(model)) {
+    return 'reviewerProvider 和 reviewerModel 必须同时设置（都留空表示跟随当前会话）'
+  }
+  return undefined
+}
+
+/** 审查用的思考强度：空串表示用模型/provider 默认，不能把空串传给宿主。 */
+export function effectiveReviewEffort(config) {
+  const value = plainSettingValue(config?.reviewerReasoningEffort)
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+}
+
 /** 对 loader 或测试传入的配置做运行时边界校验。 */
 export function resolveConfig(config = {}, warn = message => console.warn(message)) {
-  let resolved = { ...DEFAULTS, ...config }
+  const source = config !== null && typeof config === 'object' ? config : {}
+  let resolved = { ...DEFAULTS, ...plainSettings(source) }
   if (!LANGUAGES.includes(resolved.language)) {
     warn(`dsh-auto-pass: language=${String(resolved.language)} 无效，已回退为 auto`)
     resolved = { ...resolved, language: 'auto' }
   }
-  const hasProvider = resolved.reviewerProvider !== undefined
-  const hasModel = resolved.reviewerModel !== undefined
-  if (hasProvider !== hasModel) {
-    throw new Error('dsh-auto-pass: reviewerProvider 和 reviewerModel 必须同时设置')
+  // 路由成对规则：空串与未设置等价（面板清空 = 跟随当前会话），但**半套**必须拦下
+  const routeProblem = routePairProblem(resolved.reviewerProvider, resolved.reviewerModel)
+  if (routeProblem !== undefined) {
+    throw new Error('dsh-auto-pass: ' + routeProblem)
   }
-  if (hasProvider && (resolved.reviewerProvider.trim() === '' || resolved.reviewerModel.trim() === '')) {
-    throw new Error('dsh-auto-pass: 审查模型的提供方和模型名称不能为空')
-  }
-  if (resolved.reviewerReasoningEffort !== undefined
-    && (typeof resolved.reviewerReasoningEffort !== 'string' || resolved.reviewerReasoningEffort.trim() === '')) {
-    throw new Error('dsh-auto-pass: reviewerReasoningEffort 必须是非空字符串')
+  // 思考强度：允许空串（= 用模型/provider 默认），写成别的类型仍然报错
+  if (resolved.reviewerReasoningEffort !== undefined && resolved.reviewerReasoningEffort !== null
+    && typeof resolved.reviewerReasoningEffort !== 'string') {
+    throw new Error('dsh-auto-pass: reviewerReasoningEffort 必须是字符串（空串表示用模型默认）')
   }
   if (typeof resolved.logFile !== 'string') {
     throw new Error('dsh-auto-pass: logFile 必须是字符串（空字符串表示使用默认路径）')
@@ -1120,6 +1392,15 @@ export function resolveConfig(config = {}, warn = message => console.warn(messag
     if (!Number.isSafeInteger(resolved[key]) || resolved[key] <= 0) {
       throw new Error(`dsh-auto-pass: ${key} 必须是正整数`)
     }
+  }
+  // 五个界面偏好按**引用**读：宿主 settings 写回后 loader 会原位更新 volatile 引用
+  // （cordis loader 的 _commitVolatile），把它们烤进快照会把「刚保存的值」定格成旧值。
+  for (const key of VOLATILE_SETTINGS) {
+    Object.defineProperty(resolved, key, {
+      enumerable: true,
+      configurable: true,
+      get: () => effectiveSettingValue(source, key),
+    })
   }
   return Object.freeze(resolved)
 }
@@ -1277,12 +1558,12 @@ function isHanCharacter(codePoint) {
  */
 export function createAutoApprovalHandler(ctx, config, records = noopRecordStore, policies = noopPolicyStore) {
   return async (request, next) => {
-    // 设置页的行为开关必须在**每次审批时**读取：① 用户在设置里一改就立刻生效，不需要重启；
-    // ② 绝不能提到 handler 外面求值——那是插件加载期，settings 服务往往还没就绪
-    // （`installSettings` 在 `apply()` 里排在本 handler 创建之后），开关会静默退回默认值。
-    const noticeEnabled = effectiveNotice(ctx, config)
-    const denyDirect = effectiveDenyDirect(ctx, config)
-    const askRejectReason = effectiveAskRejectReason(ctx, config)
+    // 行为开关必须在**每次审批时**读取：① 用户在面板里一改就立刻生效，不需要重启；
+    // ② 绝不能提到 handler 外面求值——那会把值定格成创建那一刻的快照（volatile 引用本身
+    // 会原位更新，但快照不会），开关会静默退回旧值。
+    const noticeEnabled = effectiveNotice(config)
+    const denyDirect = effectiveDenyDirect(config)
+    const askRejectReason = effectiveAskRejectReason(config)
     if (selectedPermissionPreset(request.agent.session) !== 'auto-approve') {
       return next()
     }
@@ -1429,7 +1710,7 @@ export function createAutoApprovalHandler(ctx, config, records = noopRecordStore
         system: reviewSystems[language],
         prompt,
         maxTokens: config.maxOutputTokens,
-        reasoningEffort: config.reviewerReasoningEffort,
+        reasoningEffort: effectiveReviewEffort(config),
         sessionId: request.agent.session.id,
         purpose: REVIEW_PURPOSE,
         signal,
@@ -1628,7 +1909,7 @@ async function optimizeRule(ctx, options) {
       system: ruleTemplate,
       prompt: buildRulePrompt({ signature, list, records, kind, draft }),
       maxTokens: config.maxOutputTokens,
-      reasoningEffort: config.reviewerReasoningEffort,
+      reasoningEffort: effectiveReviewEffort(config),
       sessionId: request.sessionId ?? request.agent?.session?.id,
       purpose: RULE_PURPOSE,
       signal,
@@ -2022,8 +2303,9 @@ function actionOf(request, data, extra = {}) {
 }
 
 function resolveRoute(request, config) {
-  if (config.reviewerProvider !== undefined && config.reviewerModel !== undefined) {
-    return { provider: config.reviewerProvider, model: config.reviewerModel }
+  // 面板里把路由清空就是「跟随当前会话」：空串与未设置同义
+  if (isSetRouteValue(config.reviewerProvider) && isSetRouteValue(config.reviewerModel)) {
+    return { provider: config.reviewerProvider.trim(), model: config.reviewerModel.trim() }
   }
   // 单轮调用可能只有记录（没有在册 Agent，例如重启后从时间线手动升级）：全部可选读
   const session = request.agent?.session

@@ -65,6 +65,8 @@ window.__ModuleLoader__.load({
     const LOG = '[dsh-auto-pass]'
     /** 宿主接口。 */
     const API_CONFIG = '/api/dsh-auto-pass/config'
+    /** 模型候选：宿主模型目录（provider → models，含每个模型的思考强度）。 */
+    const API_MODELS = '/api/dsh-auto-pass/models'
     const API_LOG = '/api/dsh-auto-pass/log'
     const API_POLICY = '/api/dsh-auto-pass/policy'
     const API_RULE = '/api/dsh-auto-pass/rule'
@@ -331,6 +333,26 @@ window.__ModuleLoader__.load({
         placementSidebar: '只保留时间线',
         placementAll: '两处都显示',
         panelCardDesc: '面板显示在哪里，以及四个行为开关：是否把审批结果注入模型上下文、命中黑名单是否直接拒绝、侧栏收起时是否自动展开审批时间线（已显示或停在其他工具上时不打扰）、人工拒绝后是否追问一句拒绝理由。',
+        modelTitle: '审查模型',
+        modelDesc: '自动审查用哪个模型、以及调用参数。provider 与模型都留空 = 跟随当前会话；候选来自宿主的模型目录，也可以直接填写。',
+        modelProvider: '提供方',
+        modelProviderHint: '留空 = 跟随当前会话',
+        modelName: '模型',
+        modelEffort: '思考强度',
+        modelEffortHint: '留空 = 用模型默认',
+        modelTimeout: '审查超时（毫秒）',
+        modelTimeoutHint: '单轮审查的总时限',
+        modelMaxTokens: '输出上限（tokens）',
+        modelMaxTokensHint: '审查回复的最大长度',
+        modelPlaceholder: '点开输入框看候选，或直接填写',
+        modelClear: '清空',
+        modelClearHint: '路由两列都留空 = 跟随当前会话；思考强度留空 = 用模型默认',
+        modelSave: '保存模型配置',
+        modelSaved: '模型配置已保存',
+        modelNumbersInvalid: '审查超时与输出上限必须是正整数',
+        catalogLoading: '正在读取宿主模型目录…',
+        catalogEmpty: '宿主模型目录里没有候选（仍可直接填写）',
+        catalogUnavailable: '宿主没有提供模型目录，候选不可用（仍可直接填写）',
       },
       en: {
         timelineTab: 'Approval timeline',
@@ -508,6 +530,26 @@ window.__ModuleLoader__.load({
         placementSidebar: 'Timeline only',
         placementAll: 'Both',
         panelCardDesc: 'Where the panels live, plus four behaviour switches: inject approval results into the context, reject on a denylist hit, expand the approval timeline automatically while the sidebar is collapsed (it stays put when the timeline shows or another tool is on screen), and ask for a rejection reason after you reject one.',
+        modelTitle: 'Review model',
+        modelDesc: 'Which model reviews approvals, and the call parameters. Leave both provider and model empty to follow the current session; candidates come from the host model directory and you can always type a value.',
+        modelProvider: 'Provider',
+        modelProviderHint: 'Empty follows the current session',
+        modelName: 'Model',
+        modelEffort: 'Reasoning effort',
+        modelEffortHint: 'Empty uses the model default',
+        modelTimeout: 'Review timeout (ms)',
+        modelTimeoutHint: 'Total budget for one review call',
+        modelMaxTokens: 'Output limit (tokens)',
+        modelMaxTokensHint: 'Maximum length of the review reply',
+        modelPlaceholder: 'Focus the input for candidates, or type a value',
+        modelClear: 'Clear',
+        modelClearHint: 'Empty route fields follow the current session; empty effort uses the model default',
+        modelSave: 'Save model settings',
+        modelSaved: 'Model settings saved',
+        modelNumbersInvalid: 'The review timeout and output limit must be positive integers',
+        catalogLoading: 'Reading the host model directory…',
+        catalogEmpty: 'The host model directory has no candidates (you can still type a value)',
+        catalogUnavailable: 'The host exposes no model directory; candidates are unavailable (you can still type a value)',
       },
     }
     const t = COPY[ZH ? 'zh' : 'en']
@@ -907,6 +949,13 @@ window.__ModuleLoader__.load({
         '.ap-ruleEditor{display:flex;flex-wrap:wrap;align-items:center;gap:6px;width:100%;min-width:0}',
         '.ap-ruleEditorRow{flex:1}',
         '.ap-inputWide{width:auto;flex:1;min-width:10em}',
+        // 数字输入（审查超时 / 输出上限）：比通用 ap-input 宽，六位数也看得全
+        '.ap-inputNum{width:8em;flex:none}',
+        // 候选输入（审查模型的提供方 / 模型 / 思考强度）：可搜候选 + 可手填，候选列在输入框下方
+        '.ap-combo{display:flex;flex:1;min-width:0;gap:6px;align-items:center}',
+        '.ap-comboMenu{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-3);max-height:180px;overflow:auto;display:flex;flex-direction:column;min-width:0}',
+        '.ap-comboMenu button{appearance:none;border:0;background:0 0;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:18px;padding:4px 8px;text-align:left;cursor:pointer;overflow-wrap:anywhere}',
+        '.ap-comboMenu button:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}',
         '.ap-row2{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
         // 开关：轨道 + 滑块。状态由原生 checkbox 承载（无障碍与键盘可用），轨道随 :checked 变色。
         // 选择器用「input + track」的兄弟关系，不依赖 label 包裹。
@@ -966,6 +1015,15 @@ window.__ModuleLoader__.load({
       autoOpenScoped: false,
       // 人工拒绝后追问一句拒绝理由（默认开）
       askRejectReason: true,
+      // 审查模型配置（面板可写）：路由空串 = 跟随当前会话，思考强度空串 = 用模型默认。
+      // 默认值与服务端 DEFAULTS 对齐（拿不到宿主回执时就是这个）
+      model: {
+        reviewerProvider: '',
+        reviewerModel: '',
+        reviewerReasoningEffort: '',
+        timeoutMs: 90_000,
+        maxOutputTokens: 2_048,
+      },
       writable: false,
       listeners: new Set(),
       subscribe(listener) {
@@ -999,6 +1057,21 @@ window.__ModuleLoader__.load({
         if (typeof settings.denyDirect === 'boolean') this.denyDirect = settings.denyDirect
         if (typeof settings.autoOpenTimeline === 'boolean') this.autoOpenTimeline = settings.autoOpenTimeline
         if (typeof settings.askRejectReason === 'boolean') this.askRejectReason = settings.askRejectReason
+        // 审查模型配置：老宿主回执没有 model 段，缺失的键保持原值
+        const model = payload.model !== null && typeof payload.model === 'object' ? payload.model : undefined
+        if (model !== undefined) {
+          this.model = {
+            reviewerProvider: typeof model.reviewerProvider === 'string' ? model.reviewerProvider : this.model.reviewerProvider,
+            reviewerModel: typeof model.reviewerModel === 'string' ? model.reviewerModel : this.model.reviewerModel,
+            reviewerReasoningEffort: typeof model.reviewerReasoningEffort === 'string'
+              ? model.reviewerReasoningEffort
+              : this.model.reviewerReasoningEffort,
+            timeoutMs: Number.isSafeInteger(model.timeoutMs) && model.timeoutMs > 0 ? model.timeoutMs : this.model.timeoutMs,
+            maxOutputTokens: Number.isSafeInteger(model.maxOutputTokens) && model.maxOutputTokens > 0
+              ? model.maxOutputTokens
+              : this.model.maxOutputTokens,
+          }
+        }
         const session = payload.session
         if (session !== null && typeof session === 'object' && typeof session.sessionId === 'string' && session.sessionId !== '') {
           this.sessionId = session.sessionId
@@ -1062,6 +1135,122 @@ window.__ModuleLoader__.load({
       },
       subscribe(listener) {
         return runtimeStore.subscribe(listener)
+      },
+    }
+
+    /**
+     * 归一化目录分组：插件路由（`{id,name,models:[{id,name,efforts}]}`）与客户端 remote
+     * （`{id,name,models:[{id,name,reasoning:{efforts}}]}`）两条路共用一个口径。
+     * @param {Array} groups 原始分组
+     * @returns {Array} 过滤掉空 id 的候选
+     */
+    function catalogGroups(groups) {
+      return (Array.isArray(groups) ? groups : []).map(group => ({
+        id: String(group?.id ?? ''),
+        name: String(group?.name ?? group?.id ?? ''),
+        models: (Array.isArray(group?.models) ? group.models : [])
+          .map(model => {
+            // 两条路的思考强度位置不同：host 路由给 model.efforts，remote 给 model.reasoning.efforts
+            const rawEfforts = model?.reasoning?.efforts ?? model?.efforts
+            return {
+              id: String(model?.id ?? ''),
+              name: String(model?.name ?? model?.id ?? ''),
+              efforts: (Array.isArray(rawEfforts) ? rawEfforts : [])
+                .map(effort => ({ id: String(effort?.id ?? ''), name: String(effort?.name ?? effort?.id ?? '') }))
+                .filter(effort => effort.id !== ''),
+            }
+          })
+          .filter(model => model.id !== ''),
+      })).filter(group => group.id !== '')
+    }
+
+    /**
+     * 宿主模型目录（provider → models）：面板候选的来源。走客户端 remote 面
+     * （`ctx.remote.session.modelCatalog()`，与宿主 composer 的模型选择器同一份数据）。
+     * 拿不到目录只是没有候选——面板仍可手填；失败如实提示，不影响审批主链路。
+     */
+    const modelCatalogStore = {
+      status: 'idle',
+      error: '',
+      groups: [],
+      listeners: new Set(),
+      subscribe(listener) {
+        this.listeners.add(listener)
+        return () => { this.listeners.delete(listener) }
+      },
+      emit() {
+        for (const listener of [...this.listeners]) listener()
+      },
+      /**
+       * 宿主客户端 remote 的 session 命名空间（模型目录在它上面）。服务没注入或取不到时
+       * 返回 undefined —— 候选不可用而已，不影响手填与审批主链路。
+       * @returns {object|undefined} remote.session 命名空间
+       */
+      namespace() {
+        try {
+          const viaService = typeof clientCtx?.get === 'function' ? clientCtx.get('remote') : undefined
+          return (viaService ?? clientCtx?.remote)?.session
+        } catch (error) {
+          return undefined
+        }
+      },
+      /** provider 候选（{id, name}）。 */
+      providers() {
+        return this.groups.map(group => ({ id: group.id, name: group.name }))
+      },
+      /** 某个 provider 下的模型候选。 */
+      modelsOf(provider) {
+        return this.groups.find(group => group.id === provider)?.models ?? []
+      },
+      /** 某个 provider+model 的思考强度候选：目录里没有就是空数组（只能手填）。 */
+      effortsOf(provider, model) {
+        return this.modelsOf(provider).find(entry => entry.id === model)?.efforts ?? []
+      },
+      /**
+       * 读一次宿主模型目录并归一化成候选。**只在卡片挂载时读一次**（目录不常变）。
+       * 首选插件自己的路由（宿主 `sessionController.modelCatalog()`，与 composer 的模型选择器
+       * 同一份数据）——它不依赖客户端 remote 面是否注入；那条路拿不到再用 remote 面兜底，
+       * 两条都不行就退回纯手填并如实提示。
+       */
+      async load() {
+        if (this.status === 'loading') return
+        this.status = 'loading'
+        this.emit()
+        const problems = []
+        try {
+          const response = await fetch(API_MODELS, { headers: { accept: 'application/json' } })
+          const data = await response.json()
+          if (data?.ok === true) {
+            this.groups = catalogGroups(data.groups)
+            this.status = 'ready'
+            this.error = ''
+            this.emit()
+            return
+          }
+          problems.push(String(data?.error ?? 'model catalog unavailable'))
+        } catch (cause) {
+          problems.push(String(cause?.message ?? cause))
+        }
+        const namespace = this.namespace()
+        if (namespace !== undefined && typeof namespace.modelCatalog === 'function') {
+          try {
+            const response = await namespace.modelCatalog()
+            if (response?.ok === true) {
+              this.groups = catalogGroups(response.value?.groups)
+              this.status = 'ready'
+              this.error = ''
+              this.emit()
+              return
+            }
+            problems.push(String(response?.error?.message ?? 'model catalog unavailable'))
+          } catch (cause) {
+            problems.push(String(cause?.message ?? cause))
+          }
+        }
+        this.groups = []
+        this.status = 'failed'
+        this.error = problems.length === 0 ? t.catalogUnavailable : t.catalogUnavailable + '（' + problems[0] + '）'
+        this.emit()
       },
     }
 
@@ -2883,6 +3072,170 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 一行「可搜候选 + 可手填 + 可清空」的输入：焦点在输入框上时在下面列出候选（点一下填进去），
+     * 也可以直接输入目录里没有的值。清空由调用方处理——路由两列必须一起清（半套会被宿主拒绝）。
+     * @param props.label 行标签 / props.value 当前值 / props.options 候选 [{id,name}]
+     * @param props.hint 说明 / props.placeholder 占位 / props.onChange 值变化 / props.onClear 清空
+     */
+    function ComboField({ label, value, options, hint, placeholder, onChange, onClear }) {
+      const [open, setOpen] = react.useState(false)
+      const keyword = String(value ?? '').trim().toLowerCase()
+      const list = options ?? []
+      // 空关键字 = 列出全部候选（方便「不知道有哪些」时直接挑），最多 12 条
+      const shown = list.filter(option => keyword === ''
+        || option.id.toLowerCase().includes(keyword)
+        || String(option.name ?? '').toLowerCase().includes(keyword)).slice(0, 12)
+      return react.createElement('div', { className: 'ap-col' },
+        react.createElement('div', { className: 'ap-row2' },
+          react.createElement('span', { className: 'ap-fieldKey' }, label),
+          react.createElement('div', { className: 'ap-combo' },
+            react.createElement('input', {
+              className: 'ap-input ap-inputWide',
+              value: value ?? '',
+              placeholder,
+              'aria-label': label,
+              onFocus: () => setOpen(true),
+              onBlur: () => setOpen(false),
+              onChange: event => { setOpen(true); onChange(event.target.value) },
+            }),
+            react.createElement('button', { type: 'button', className: 'ap-btn', onClick: onClear }, t.modelClear)),
+          hint === undefined ? null : react.createElement('span', { className: 'ap-note' }, hint)),
+        open && shown.length > 0 && react.createElement('div', { className: 'ap-comboMenu' },
+          shown.map(option => react.createElement('button', {
+            key: option.id,
+            type: 'button',
+            // 按下时不让输入框失焦：否则点击还没到 onClick，候选列表就先被 onBlur 收起来了
+            onMouseDown: event => event.preventDefault(),
+            onClick: () => { onChange(option.id); setOpen(false) },
+          }, option.name === undefined || option.name === '' || option.name === option.id
+            ? option.id
+            : option.id + ' · ' + option.name))),
+        open && list.length > 0 && shown.length === 0 && react.createElement('div', { className: 'ap-note' }, t.catalogEmpty))
+    }
+
+    /**
+     * 「审查模型」卡片：提供方 / 模型 / 思考强度 / 审查超时 / 输出上限。
+     * 写回走 /config（宿主落进本插件行的 config，所有会话生效）；路由两列要么都给、要么都空
+     * （都空 = 跟随当前会话），所以「清空」一次清两列，提交时也总是成对提交。
+     * @param props.tag 宿主标签（对话区面板传 'section'）
+     */
+    function ReviewModelCard({ tag }) {
+      const [, bump] = react.useState(0)
+      const [draft, setDraft] = react.useState(undefined)
+      const [saved, setSaved] = react.useState(false)
+      const [error, setError] = react.useState('')
+      react.useEffect(() => runtimeStore.subscribe(() => bump(value => value + 1)), [])
+      react.useEffect(() => {
+        void modelCatalogStore.load()
+        return modelCatalogStore.subscribe(() => bump(value => value + 1))
+      }, [])
+
+      const stored = runtimeStore.model
+      const valueOf = key => draft?.[key] ?? String(stored[key] ?? '')
+      const set = (key, value) => {
+        setSaved(false)
+        setError('')
+        setDraft(previous => ({ ...(previous ?? {}), [key]: value }))
+      }
+      /** 清空路由两列 = 跟随当前会话（只清一列会写成半套，宿主会 400）。 */
+      const clearRoute = () => {
+        setSaved(false)
+        setError('')
+        setDraft(previous => ({ ...(previous ?? {}), reviewerProvider: '', reviewerModel: '' }))
+      }
+      const save = () => {
+        setError('')
+        setSaved(false)
+        const timeoutMs = Number.parseInt(valueOf('timeoutMs'), 10)
+        const maxOutputTokens = Number.parseInt(valueOf('maxOutputTokens'), 10)
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0
+          || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
+          setError(t.modelNumbersInvalid)
+          return
+        }
+        const patch = {
+          reviewerProvider: valueOf('reviewerProvider').trim(),
+          reviewerModel: valueOf('reviewerModel').trim(),
+          reviewerReasoningEffort: valueOf('reviewerReasoningEffort').trim(),
+          timeoutMs,
+          maxOutputTokens,
+        }
+        runtimeStore.save(patch).then(() => {
+          setSaved(true)
+          setDraft(undefined)
+        }).catch(cause => {
+          console.warn(LOG, '保存审查模型配置失败', cause)
+          setError(t.saveFailed + '：' + String(cause?.message ?? cause))
+        })
+      }
+
+      const provider = valueOf('reviewerProvider').trim()
+      const model = valueOf('reviewerModel').trim()
+      const catalogNote = modelCatalogStore.status === 'failed'
+        ? modelCatalogStore.error
+        : modelCatalogStore.status === 'loading'
+          ? t.catalogLoading
+          : modelCatalogStore.status === 'ready' && modelCatalogStore.groups.length === 0
+            ? t.catalogEmpty
+            : t.modelClearHint
+      return card(tag ?? 'section', t.modelTitle, t.modelDesc, react.createElement('div', { className: 'ap-col' },
+        react.createElement(ComboField, {
+          label: t.modelProvider,
+          value: valueOf('reviewerProvider'),
+          options: modelCatalogStore.providers(),
+          hint: t.modelProviderHint,
+          placeholder: t.modelPlaceholder,
+          onChange: value => set('reviewerProvider', value),
+          onClear: clearRoute,
+        }),
+        react.createElement(ComboField, {
+          label: t.modelName,
+          value: valueOf('reviewerModel'),
+          options: modelCatalogStore.modelsOf(provider),
+          hint: t.modelProviderHint,
+          placeholder: t.modelPlaceholder,
+          onChange: value => set('reviewerModel', value),
+          onClear: clearRoute,
+        }),
+        react.createElement(ComboField, {
+          label: t.modelEffort,
+          value: valueOf('reviewerReasoningEffort'),
+          options: modelCatalogStore.effortsOf(provider, model),
+          hint: t.modelEffortHint,
+          placeholder: t.modelPlaceholder,
+          onChange: value => set('reviewerReasoningEffort', value),
+          onClear: () => set('reviewerReasoningEffort', ''),
+        }),
+        react.createElement('div', { className: 'ap-row2' },
+          react.createElement('span', { className: 'ap-fieldKey' }, t.modelTimeout),
+          react.createElement('input', {
+            className: 'ap-input ap-inputNum',
+            type: 'number',
+            min: '1',
+            value: valueOf('timeoutMs'),
+            'aria-label': t.modelTimeout,
+            onChange: event => set('timeoutMs', event.target.value),
+          }),
+          react.createElement('span', { className: 'ap-note' }, t.modelTimeoutHint)),
+        react.createElement('div', { className: 'ap-row2' },
+          react.createElement('span', { className: 'ap-fieldKey' }, t.modelMaxTokens),
+          react.createElement('input', {
+            className: 'ap-input ap-inputNum',
+            type: 'number',
+            min: '1',
+            value: valueOf('maxOutputTokens'),
+            'aria-label': t.modelMaxTokens,
+            onChange: event => set('maxOutputTokens', event.target.value),
+          }),
+          react.createElement('span', { className: 'ap-note' }, t.modelMaxTokensHint)),
+        react.createElement('div', { className: 'ap-row2' },
+          react.createElement('button', { type: 'button', className: 'ap-btn ap-btnPrimary', onClick: save }, t.modelSave),
+          saved && react.createElement('span', { className: 'ap-note' }, t.modelSaved)),
+        react.createElement('div', { className: 'ap-note' }, catalogNote),
+        error !== '' && react.createElement('div', { className: 'ap-note ap-warn' }, error)))
+    }
+
+    /**
      * 设置卡片：面板显示在哪里（写宿主设置命名空间、即时重挂）+ 三个行为开关
      * （注入审批结果到上下文 / 黑名单直接拒绝 / 自动打开审批时间线）。
      * 设置页（容器是 ul，所以必须是 li）与「审批设置」面板共用同一套内容。
@@ -3025,6 +3378,8 @@ window.__ModuleLoader__.load({
               ]),
             // 面板里知道当前工作区与会话：自动打开时间线这个开关按会话读/写（设置页那份是全局默认）
             react.createElement(SettingsCard, { tag: 'section', scope: 'workspace', cwd, sessionId }),
+            // 审查模型（全局配置：写回插件行的 config，所有会话生效）
+            react.createElement(ReviewModelCard, { tag: 'section' }),
             editNote !== '' && react.createElement('div', { className: 'ap-note' }, editNote),
             (error !== '' || policyStore.error !== '')
               && react.createElement('div', { className: 'ap-note' }, error !== '' ? error : policyStore.error))))
@@ -3370,7 +3725,9 @@ window.__ModuleLoader__.load({
       console.log(LOG, 'client loaded, placement=' + placementStore.value)
     }
 
-    exports.inject = ['slots']
+    // remote 由 @deepseek-ai/dsh-api-remotes 提供（包级 dsh.client.inject 里已列为依赖），
+    // 面板的模型候选走它（remote.session.modelCatalog）；官方设置页插件也是这么声明的。
+    exports.inject = ['slots', 'remote']
     exports.apply = apply
     return module.exports
   },

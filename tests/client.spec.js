@@ -212,6 +212,23 @@ let workspaceAutoOpen = {}
  */
 let sessionAutoOpen = {}
 
+/**
+ * /config 回执里的 model 段（审查模型配置）：用例按需覆盖，默认都是「跟随当前会话 / 模型默认」。
+ * 放在这里是为了不改变其它用例看到的回执形状。
+ */
+/** 模型候选路由（GET /models）的回执：用例按需覆盖；默认空目录。 */
+let modelCatalogGroups = []
+/** 目录路由的接管（返回 payload 的函数）；不给就按 modelCatalogGroups 回执。 */
+let modelsResponder = null
+
+let modelConfig = {
+  reviewerProvider: '',
+  reviewerModel: '',
+  reviewerReasoningEffort: '',
+  timeoutMs: 90_000,
+  maxOutputTokens: 2_048,
+}
+
 /** 观察器用例里那个当前会话的工作区（harness 的 sessions 快照里的 cwd）。 */
 const WORKSPACE_CWD = 'D:\\work\\github\\dsh-auto'
 
@@ -223,6 +240,7 @@ function configPayload(cwd, sessionId) {
   return {
     ok: true,
     settings: { placement: 'all', notice: true, denyDirect: false, autoOpenTimeline: globalAuto, askRejectReason: true },
+    model: modelConfig,
     ...(sessionId === undefined ? {} : {
       session: {
         sessionId,
@@ -397,6 +415,13 @@ function installBrowserStubs() {
         : { ok: true, restored: [] }
       return { json: async () => payload }
     }
+    // 模型候选（GET /models）：面板的「审查模型」卡从这里拿 provider / 模型 / 思考强度
+    if (target.includes('/models')) {
+      const payload = typeof modelsResponder === 'function'
+        ? modelsResponder(target)
+        : { ok: true, groups: modelCatalogGroups }
+      return { json: async () => payload }
+    }
     // 时间线的升级/降级 POST /rule：用例可以接管回执，验证「已更新 / 已被覆盖 / 已合并」三种文案
     if (target.includes('/rule')) {
       const payload = typeof ruleResponder === 'function' ? ruleResponder(target) : { ok: true }
@@ -418,6 +443,18 @@ function installBrowserStubs() {
         // 带 session 的写的是「本会话」那份（宿主写进该工作区策略文件的 prefs.autoOpenTimelineSessions）
         if (typeof body.session === 'string' && body.session !== '') sessionAutoOpen[body.session] = body.autoOpenTimeline
         else workspaceAutoOpen[cwd] = body.autoOpenTimeline
+      }
+      // 审查模型配置：真宿主把写入落进插件行 config 后回执就是新值（替身照做，便于断言「保存后面板立刻显示新值」）
+      if (body !== undefined && (typeof body.reviewerProvider === 'string' || typeof body.reviewerModel === 'string'
+        || Number.isSafeInteger(body.timeoutMs))) {
+        modelConfig = {
+          ...modelConfig,
+          ...(typeof body.reviewerProvider === 'string' ? { reviewerProvider: body.reviewerProvider } : {}),
+          ...(typeof body.reviewerModel === 'string' ? { reviewerModel: body.reviewerModel } : {}),
+          ...(typeof body.reviewerReasoningEffort === 'string' ? { reviewerReasoningEffort: body.reviewerReasoningEffort } : {}),
+          ...(Number.isSafeInteger(body.timeoutMs) ? { timeoutMs: body.timeoutMs } : {}),
+          ...(Number.isSafeInteger(body.maxOutputTokens) ? { maxOutputTokens: body.maxOutputTokens } : {}),
+        }
       }
       configRequests.push({ method: options?.method ?? 'GET', cwd, session: sessionId, body })
       return { json: async () => configPayload(cwd, sessionId) }
@@ -522,6 +559,8 @@ function harness(options = {}) {
         tabsIn: () => sidebar.tabs.slice(),
       }
   const ctx = {
+    // 宿主客户端 remote 面（审查模型的候选来自 ctx.remote.session.modelCatalog()）
+    remote: options.remote,
     get: name => (name === 'slots' ? slots
       : name === 'sessions' ? sessions
         : name === 'uiSession' ? (sessionSource === 'uiSession' ? uiSession : undefined)
@@ -820,7 +859,8 @@ describe('客户端半加载与注册', () => {
       if (specifier === 'react') return fakeReact()
       throw new Error('unexpected require: ' + specifier)
     })
-    expect(moduleExports.inject).toEqual(['slots'])
+    // remote：面板的模型候选来自 remote.session.modelCatalog（与官方设置页插件同样的声明）
+    expect(moduleExports.inject).toEqual(['slots', 'remote'])
     expect(typeof moduleExports.apply).toBe('function')
   })
 
@@ -2919,6 +2959,172 @@ describe('「自动打开审批时间线」按会话区分（2026-09-20 用户�
     expect(globalWrite.session).toBeUndefined()
     expect(globalWrite.body).toEqual({ autoOpenTimeline: false })
     expect(JSON.stringify(settings.tree)).toContain('这里是所有会话的默认值')
+  })
+})
+
+describe('审查模型配置（审批设置面板）', () => {
+  /** 这一轮发给宿主 /config 的请求体。 */
+  function configBodies() {
+    return globalThis.fetch.mock.calls
+      .filter(args => typeof args[1]?.body === 'string' && String(args[0]).split('?')[0].endsWith('/config'))
+      .map(args => JSON.parse(args[1].body))
+  }
+
+  /** 加载客户端 bundle 并挂载「审批设置」面板。 */
+  async function mountPanel(options = {}) {
+    const registration = await loadClient()
+    const react = fakeReact()
+    // 每次 factory 调用都给一份新的模块实例（模型目录 store 是模块级状态）
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return react
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const built = harness(options)
+    moduleExports.apply(built.ctx)
+    return { react, view: slot(built.slotRegistrations, 'conversation.view', 'dsh-auto-pass') }
+  }
+
+  it('回执里的 model 段直接显示；保存时五个字段一起写回（改超时也成对提交）', async () => {
+    modelConfig = {
+      reviewerProvider: 'commandcode',
+      reviewerModel: 'deepseek/deepseek-v4.1-flash',
+      reviewerReasoningEffort: 'high',
+      timeoutMs: 90_000,
+      maxOutputTokens: 4_096,
+    }
+    const { react, view } = await mountPanel()
+
+    let saved = false
+    const rendered = await renderStable(react, view.component, { sessionId: SESSION_KNOWN }, steps(
+      fillInput('审查超时（毫秒）', '1500'),
+      clickButton('保存模型配置'),
+      () => { saved = true; return true },
+    ))
+    expect(saved).toBe(true)
+
+    const inputValue = label => findNodes(rendered.tree,
+      node => node?.type === 'input' && node?.props?.['aria-label'] === label)[0]?.props?.value
+    expect(inputValue('提供方')).toBe('commandcode')
+    expect(inputValue('模型')).toBe('deepseek/deepseek-v4.1-flash')
+    expect(inputValue('思考强度')).toBe('high')
+    expect(inputValue('审查超时（毫秒）')).toBe('1500')
+    expect(inputValue('输出上限（tokens）')).toBe('4096')
+    expect(JSON.stringify(rendered.tree)).toContain('模型配置已保存')
+
+    const posts = configBodies()
+    expect(posts).toHaveLength(1)
+    expect(posts[0]).toEqual({
+      reviewerProvider: 'commandcode',
+      reviewerModel: 'deepseek/deepseek-v4.1-flash',
+      reviewerReasoningEffort: 'high',
+      timeoutMs: 1500,
+      maxOutputTokens: 4_096,
+    })
+  })
+
+  it('清空路由一次清两列：留空 = 跟随当前会话（不提交半套）', async () => {
+    modelConfig = {
+      reviewerProvider: 'commandcode',
+      reviewerModel: 'deepseek/deepseek-v4.1-flash',
+      reviewerReasoningEffort: 'high',
+      timeoutMs: 90_000,
+      maxOutputTokens: 2_048,
+    }
+    const { react, view } = await mountPanel()
+
+    await renderStable(react, view.component, { sessionId: SESSION_KNOWN }, steps(
+      tree => {
+        const clears = findNodes(tree, node => node?.type === 'button' && node?.children?.[0] === '清空')
+        if (clears.length === 0) return false
+        // 第一行是「提供方」：点它把路由两列一起清掉
+        clears[0].props.onClick()
+        return true
+      },
+      clickButton('保存模型配置'),
+    ))
+
+    expect(configBodies()[0]).toEqual({
+      reviewerProvider: '',
+      reviewerModel: '',
+      reviewerReasoningEffort: 'high',
+      timeoutMs: 90_000,
+      maxOutputTokens: 2_048,
+    })
+  })
+
+  /**
+   * 展开某一行的候选并点第一条：聚焦输入框列出候选，再点与 prefix 匹配的那条。
+   * @param label 行标签（aria-label） / prefix 候选文本前缀
+   */
+  const openMenu = (label, prefix) => [
+    tree => {
+      const input = findNodes(tree, node => node?.type === 'input' && node?.props?.['aria-label'] === label)[0]
+      if (input === undefined) return false
+      input.props.onFocus()
+      return true
+    },
+    tree => {
+      const item = findNodes(tree, node => node?.type === 'button'
+        && String(node?.children?.[0] ?? '').startsWith(prefix))[0]
+      if (item === undefined) return false
+      item.props.onClick()
+      return true
+    },
+  ]
+
+  it('候选首选插件自己的目录路由（GET /models）：点候选即填入', async () => {
+    modelConfig = { reviewerProvider: '', reviewerModel: '', reviewerReasoningEffort: '', timeoutMs: 90_000, maxOutputTokens: 2_048 }
+    modelCatalogGroups = [{
+      id: 'commandcode',
+      name: 'Command Code',
+      models: [{ id: 'deepseek/deepseek-v4.1-flash', name: 'v4.1 flash', efforts: [{ id: 'high', name: 'High' }] }],
+    }]
+    const { react, view } = await mountPanel()
+
+    const rendered = await renderStable(react, view.component, { sessionId: SESSION_KNOWN }, steps(
+      ...openMenu('提供方', 'commandcode'),
+      // 模型候选跟着选中的 provider 过滤：只列它名下的模型
+      ...openMenu('模型', 'deepseek/deepseek-v4.1-flash'),
+    ))
+    const inputValue = label => findNodes(rendered.tree,
+      node => node?.type === 'input' && node?.props?.['aria-label'] === label)[0]?.props?.value
+    expect(inputValue('提供方')).toBe('commandcode')
+    expect(inputValue('模型')).toBe('deepseek/deepseek-v4.1-flash')
+  })
+
+  it('目录路由拿不到时退回客户端 remote 面；两条都没有则如实提示但仍可手填', async () => {
+    modelConfig = { reviewerProvider: '', reviewerModel: '', reviewerReasoningEffort: '', timeoutMs: 90_000, maxOutputTokens: 2_048 }
+    modelCatalogGroups = []
+    modelsResponder = () => ({ ok: false, error: 'model catalog unavailable' })
+    const remote = {
+      session: {
+        modelCatalog: async () => ({
+          ok: true,
+          value: {
+            groups: [{
+              id: 'commandcode',
+              name: 'Command Code',
+              models: [{
+                id: 'deepseek/deepseek-v4.1-flash',
+                name: 'v4.1 flash',
+                reasoning: { efforts: [{ id: 'high', name: 'High' }] },
+              }],
+            }],
+          },
+        }),
+      },
+    }
+    const { react, view } = await mountPanel({ remote })
+    const rendered = await renderStable(react, view.component, { sessionId: SESSION_KNOWN }, steps(...openMenu('提供方', 'commandcode')))
+    const provider = findNodes(rendered.tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '提供方')[0]
+    expect(provider.props.value).toBe('commandcode')
+
+    // 两条路都不通：提示说清楚，输入框照旧能填（候选缺失不影响保存）
+    const empty = await mountPanel()
+    const plain = await renderStable(empty.react, empty.view.component, { sessionId: SESSION_KNOWN })
+    expect(JSON.stringify(plain.tree)).toContain('候选不可用')
+    expect(findNodes(plain.tree, node => node?.type === 'input' && node?.props?.['aria-label'] === '提供方').length).toBe(1)
+    modelsResponder = null
   })
 })
 

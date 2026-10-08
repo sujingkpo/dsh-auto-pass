@@ -8,7 +8,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { apply } from '../src/index.js'
+import { apply, Config } from '../src/index.js'
 import {
   createRecordStore,
   defaultLogFile,
@@ -57,7 +57,8 @@ function fakeContext(options = {}) {
         return () => {}
       },
       effect: fn => fn(),
-      get: name => (name === 'settings' ? settings : undefined),
+      // sessionController：模型目录（面板候选）走它；用例可按需注入替身
+      get: name => (name === 'settings' ? settings : name === 'sessionController' ? options.sessionController : undefined),
       inject: (names, callback) => {
         if (names.includes('webServer')) {
           callback({
@@ -65,22 +66,17 @@ function fakeContext(options = {}) {
             webServer: { register: registration => { routes.push(registration); return () => {} } },
           })
         }
-        if (names.includes('settings')) {
-          callback({ effect: fn => fn(), settings: settings ?? { register: () => {} } })
-        }
         return { dispose: () => {} }
       },
     },
   }
 }
 
-/** 造一个假的设置服务：记录 update 调用，get 返回给定文档。 */
-function fakeSettings(document = {}) {
+/** 造一个假的设置服务：宿主现在的写入面只有 update（写回本插件行的 config）。 */
+function fakeSettings() {
   const updates = []
   return {
     updates,
-    register: vi.fn(),
-    get: () => document,
     update: async (namespace, partial) => {
       updates.push([namespace, partial])
       return { ok: true }
@@ -286,7 +282,7 @@ describe('审批记录路由', () => {
 
     const config = fakeHttp('GET', '/api/dsh-auto-pass/config')
     routes[0].handler(config.req, config.res)
-    // 界面偏好统一放在 settings 里：placement 决定面板挂哪，notice / denyDirect 是两个行为开关
+    // 界面偏好就是插件 config 里的 volatile 字段：placement 决定面板挂哪，notice / denyDirect 是行为开关
     expect(JSON.parse(config.state.body)).toMatchObject({
       ok: true,
       settings: { placement: 'sidebar', notice: true, denyDirect: false, autoOpenTimeline: true },
@@ -294,18 +290,18 @@ describe('审批记录路由', () => {
     })
   })
 
-  it('设置命名空间有值时优先用它，并声明可写', async () => {
-    const settings = fakeSettings({ placement: 'tab' })
+  it('插件 config 的值直接进快照，有可写设置服务时声明可写', async () => {
+    const settings = fakeSettings()
     const { ctx, routes } = fakeContext({ settings })
-    apply(ctx, { logFile: tempFile(), placement: 'all' })
+    apply(ctx, { logFile: tempFile(), placement: 'tab' })
 
     const config = fakeHttp('GET', '/api/dsh-auto-pass/config')
     await routes[0].handler(config.req, config.res)
     expect(JSON.parse(config.state.body)).toMatchObject({ ok: true, settings: { placement: 'tab' }, writable: true })
   })
 
-  it('POST 写入设置命名空间，非法值 400，没有设置服务时 503', async () => {
-    const settings = fakeSettings({})
+  it('POST 写回本插件行的 config（宿主 settings.update），非法值 400，没有设置服务时 503', async () => {
+    const settings = fakeSettings()
     const { ctx, routes } = fakeContext({ settings })
     apply(ctx, { logFile: tempFile(), placement: 'all' })
 
@@ -329,6 +325,85 @@ describe('审批记录路由', () => {
     const refused = fakeHttp('POST', '/api/dsh-auto-pass/config', JSON.stringify({ placement: 'tab' }))
     await noService.routes[0].handler(refused.req, refused.res)
     expect(refused.state.code).toBe(503)
+  })
+
+  it('写回失败把宿主原文带回客户端；缺可配置 schema 时补一句能看懂的说明', async () => {
+    // 宿主 settings 在模块顶层读 entry.fiber.runtime.Config：缺了它，update 抛的就是这句
+    // （2026-10-08 真机：审批设置里保存失败，提示 No configurable plugin entry "dsh-auto-pass"）
+    const settings = {
+      updates: [],
+      update: async () => { throw new Error('No configurable plugin entry "dsh-auto-pass"') },
+    }
+    const { ctx, routes } = fakeContext({ settings })
+    apply(ctx, { logFile: tempFile() })
+
+    const saved = fakeHttp('POST', '/api/dsh-auto-pass/config', JSON.stringify({ placement: 'sidebar' }))
+    await routes[0].handler(saved.req, saved.res)
+    expect(saved.state.code).toBe(500)
+    const body = JSON.parse(saved.state.body)
+    expect(body.ok).toBe(false)
+    expect(body.error).toContain('No configurable plugin entry')
+    // 本进程解析不到可用 schemastery（Config === undefined）时，错误前面要加上解释
+    expect(body.error.startsWith('本插件当前不可配置') === (Config === undefined)).toBe(true)
+  })
+
+  it('模型候选：回给浏览器的是宿主模型目录（provider → models，含思考强度），脏值被过滤', async () => {
+    const sessionController = {
+      modelCatalog: async () => ({
+        default: { provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' },
+        routableProviders: ['commandcode'],
+        groups: [
+          {
+            id: 'commandcode',
+            name: 'Command Code',
+            models: [
+              { id: 'deepseek/deepseek-v4.1-flash', name: 'v4.1 flash', reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }] } },
+              { id: '', name: '脏数据' },
+            ],
+          },
+          { id: '', name: '', models: [] },
+        ],
+      }),
+    }
+    const { ctx, routes } = fakeContext({ sessionController })
+    apply(ctx, { logFile: tempFile() })
+
+    const models = fakeHttp('GET', '/api/dsh-auto-pass/models')
+    await routes[0].handler(models.req, models.res)
+    expect(models.state.code).toBe(200)
+    expect(JSON.parse(models.state.body)).toEqual({
+      ok: true,
+      groups: [{
+        id: 'commandcode',
+        name: 'Command Code',
+        models: [{
+          id: 'deepseek/deepseek-v4.1-flash',
+          name: 'v4.1 flash',
+          efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }],
+        }],
+      }],
+    })
+
+    // 只读：POST 一律 405（候选是宿主目录，写不进去）
+    const post = fakeHttp('POST', '/api/dsh-auto-pass/models', '{}')
+    await routes[0].handler(post.req, post.res)
+    expect(post.state.code).toBe(405)
+  })
+
+  it('模型候选：宿主没有目录时 503、读目录抛错时 500（面板退回手填，不影响保存）', async () => {
+    const bare = fakeContext()
+    apply(bare.ctx, { logFile: tempFile() })
+    const missing = fakeHttp('GET', '/api/dsh-auto-pass/models')
+    await bare.routes[0].handler(missing.req, missing.res)
+    expect(missing.state.code).toBe(503)
+
+    const broken = fakeContext({ sessionController: { modelCatalog: async () => { throw new Error('catalog exploded') } } })
+    apply(broken.ctx, { logFile: tempFile() })
+    const failed = fakeHttp('GET', '/api/dsh-auto-pass/models')
+    await broken.routes[0].handler(failed.req, failed.res)
+    expect(failed.state.code).toBe(500)
+    expect(JSON.parse(failed.state.body).error).toContain('catalog exploded')
+    expect(broken.ctx.logger.warn).toHaveBeenCalledWith(expect.stringContaining('读取宿主模型目录失败'))
   })
 
   it('客户端信标写进宿主日志', async () => {

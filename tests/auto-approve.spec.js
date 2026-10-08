@@ -228,15 +228,31 @@ function contextWith(replies, options = {}) {
         ? { resolve: () => ({ mode: 'workspace-write' }) }
         : name === 'approval'
           ? { config: { policy: 'ask' }, overrideOf: () => undefined }
-          // 设置命名空间（options.settings 给了就当作宿主已注册，用来验证行为开关）
+          // 设置服务（options.settings 给了就当作宿主存在它）：界面偏好现在直接从插件 config 读
+          // （宿主把 .volatile() 字段解析成引用对象），这里只用来验证「可写」判定与写回路线
           : name === 'settings' && options.settings !== undefined
-            ? { get: () => options.settings }
+            ? options.settings
             // 人工追问通道（规则确认 / 拒绝理由追问）：给了就当作有人在应答
             : name === 'userQuestions' && options.userQuestions !== undefined
               ? options.userQuestions
               : undefined),
     logger: { info: vi.fn(), warn: vi.fn() },
   }
+}
+
+/**
+ * 造一个 volatile 引用：宿主 resolveConfig 会把标了 .volatile() 的字段解析成引用对象
+ * （cosmokit createVolatile 的形状：Object.freeze({ get, [write] })），这里用同形状的替身，
+ * 供「写回后不重启就生效」的用例翻转取值。
+ * @param {*} initial 初始值
+ * @returns {{get: Function, set: Function}} 引用
+ */
+function volatileRef(initial) {
+  let current = initial
+  return Object.freeze({
+    get: () => current,
+    set: value => { current = value },
+  })
 }
 
 const allow = Object.freeze({
@@ -417,8 +433,8 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     const offRequest = requestWith()
     const offQuestions = { ask: vi.fn() }
     await createAutoApprovalHandler(
-      contextWith(reviewerRun(deny), { settings: { notice: true, askRejectReason: false }, userQuestions: offQuestions }),
-      resolveConfig(),
+      contextWith(reviewerRun(deny), { userQuestions: offQuestions }),
+      resolveConfig({ notice: true, askRejectReason: false }),
     )(offRequest, vi.fn().mockResolvedValue('rejected'))
     await flush()
     expect(offQuestions.ask).not.toHaveBeenCalled()
@@ -432,8 +448,8 @@ describe('Auto Approve Reviewer 子 Agent', () => {
       }),
     }
     await createAutoApprovalHandler(
-      contextWith(reviewerRun(deny), { settings: { notice: false, askRejectReason: true }, userQuestions: quietQuestions }),
-      resolveConfig(),
+      contextWith(reviewerRun(deny), { userQuestions: quietQuestions }),
+      resolveConfig({ notice: false, askRejectReason: true }),
     )(quietRequest, vi.fn().mockResolvedValue('rejected'))
     await flush()
     expect(quietQuestions.ask).toHaveBeenCalledOnce()
@@ -554,8 +570,8 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     const userQuestions = { ask: vi.fn() }
     const records = { add: vi.fn(() => ({ id: 'record-1' })), update: vi.fn(), list: () => [], size: () => 0 }
     const outcome = await createAutoApprovalHandler(
-      contextWith([], { settings: { notice: true, denyDirect: true }, userQuestions }),
-      resolveConfig(),
+      contextWith([], { userQuestions }),
+      resolveConfig({ notice: true, denyDirect: true }),
       records,
       policies,
     )(request, vi.fn())
@@ -775,15 +791,15 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(request.agent.inject).not.toHaveBeenCalled()
   })
 
-  it('设置页的开关优先于插件 config：settings.notice 为 true 时照旧注入', async () => {
+  it('插件 config 里的 notice 为 true 时照旧注入（设置写回的就是这份 config）', async () => {
     const request = requestWith()
     const cfg = resolveConfig({
-      notice: false,
+      notice: true,
       reviewerProvider: 'reviewer',
       reviewerModel: 'safe-model',
     })
     const outcome = await createAutoApprovalHandler(
-      contextWith(reviewerRun(allow), { settings: { notice: true, denyDirect: false } }),
+      contextWith(reviewerRun(allow)),
       cfg,
     )(request, vi.fn())
 
@@ -803,8 +819,8 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     const records = { add: vi.fn(), list: () => [], size: () => 0 }
     const next = vi.fn().mockResolvedValue('allowed-once')
     const outcome = await createAutoApprovalHandler(
-      contextWith([], { settings: { notice: true, denyDirect: true } }),
-      resolveConfig(),
+      contextWith([]),
+      resolveConfig({ notice: true, denyDirect: true }),
       records,
       policies,
     )(request, next)
@@ -845,13 +861,11 @@ describe('Auto Approve Reviewer 子 Agent', () => {
       observe: () => ({ approvals: 0, denials: 0, suggestion: null }),
     }
     const records = { add: vi.fn(), list: () => [], size: () => 0 }
-    // 同一个 settings 对象：先在「关」的状态下建好 handler，再把开关翻成「开」。
-    // 回归点：旧实现把三个开关提到 handler 外面求值，那时 settings 还没就绪（`apply()` 里
-    // `installSettings` 排在 handler 创建之后），开关会静默退回默认值——这条用例必须看到
-    // 翻转立刻生效，且黑名单不再转人工。
-    const settings = { notice: true, denyDirect: false }
-    const handler = createAutoApprovalHandler(contextWith([], { settings }), resolveConfig(), records, policies)
-    settings.denyDirect = true
+    // 同一个 volatile 引用：先在「关」的状态下建好 handler，再让引用翻成「开」。
+    // 回归点：绝不能把开关提到 handler 外面求值成快照——翻转必须立刻生效，且黑名单不再转人工。
+    const denyDirect = volatileRef(false)
+    const handler = createAutoApprovalHandler(contextWith([]), resolveConfig({ notice: true, denyDirect }), records, policies)
+    denyDirect.set(true)
 
     const next = vi.fn().mockResolvedValue('rejected')
     expect(await handler(request, next)).toBe('rejected')
@@ -892,7 +906,17 @@ describe('输入装配与配置', () => {
       .toMatchObject({ maxEvidenceChars: 400 })
     expect(() => resolveConfig({ maxActionChars: 0 })).toThrow(/正整数/)
     expect(resolveConfig()).not.toHaveProperty('maxConsecutiveDenials')
-    expect(() => resolveConfig({ reviewerReasoningEffort: ' ' })).toThrow(/reviewerReasoningEffort/)
+    // 思考强度：空串/空白表示「用模型默认」（面板清空就是这个语义），写成别的类型仍然报错
+    expect(resolveConfig({ reviewerReasoningEffort: ' ' }).reviewerReasoningEffort).toBe(' ')
+    expect(() => resolveConfig({ reviewerReasoningEffort: 5 })).toThrow(/reviewerReasoningEffort/)
+    // 审查模型配置：默认未设置（路由空串 = 跟随当前会话），调用参数有默认值
+    expect(resolveConfig()).toMatchObject({
+      reviewerProvider: '',
+      reviewerModel: '',
+      reviewerReasoningEffort: '',
+      timeoutMs: 90_000,
+      maxOutputTokens: 2_048,
+    })
     const warn = vi.fn()
     expect(resolveConfig({ language: 'ja' }, warn).language).toBe('auto')
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/language=ja.*auto/))
