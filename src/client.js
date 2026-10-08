@@ -514,10 +514,13 @@ window.__ModuleLoader__.load({
 
     // ── 权限档位图标（盾牌 + A）──
     // DSH 客户端把档位图标硬编码给 read-only / workspace-write / danger-full-access 三个 id
-    // （ui-conversation 的 permissionGlyphs，注释原话 host-configured names outside the design set
-    // get none），宿主 presets.<id> 的 schema 也只有 {sandbox, approval, name, description}，
+    // （dsh-client-ui-permission-presets 的 permissionGlyphs，注释原话 host-configured names outside
+    // the design set get none），宿主 presets.<id> 的 schema 也只有 {sandbox, approval, name, description}，
     // 所以自建档位拿不到矢量图标。这里用「给档位名所在的 span 打标记 + ::before + mask」补上：
     // 不改 React 的 DOM 结构、不依赖 DSH 的哈希类名，颜色跟文字走（currentColor），与内置单色图标一致。
+    // **只补「本来就有图标位」的那两处（2026-10-08 用户要求）**：输入框那个 PermissionSelect 给内置三个
+    // 档位渲染了文字前的图标（span.itemIcon 里装 svg），设置页的 PermissionRow 四种档位却是纯文字 ——
+    // 设置页补进去就成了「只有自动审批一行长着图标」，与同排不一致，所以那里一个都不补。
     const PRESET_ICON_LABEL = '自动审批'
     const PRESET_ICON_CLASS = 'ap-presetGlyph'
     // 两套几何：chip 对齐内置 .triggerIcon svg（14px、跟文字同色），菜单项对齐内置 .itemIcon
@@ -526,6 +529,13 @@ window.__ModuleLoader__.load({
     const PRESET_ICON_VARIANTS = Object.freeze({
       chip: Object.freeze({ box: '14px', icon: '14px', gap: '4px', color: 'currentColor' }),
       menu: Object.freeze({ box: '16px', icon: '16px', gap: '8px', color: 'var(--dsw-alias-label-tertiary,currentColor)' }),
+    })
+    // 内联自定义属性名：写入（applyPresetIconVars）与撤销（unmarkPresetIcon）共用这一份，免得漏清一个
+    const PRESET_ICON_VARS = Object.freeze({
+      box: '--ap-glyph-box',
+      icon: '--ap-glyph-icon',
+      gap: '--ap-glyph-gap',
+      color: '--ap-glyph-color',
     })
     const PRESET_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none">'
       + '<path d="M8.20554 0.899994L14.7901 3.36857V7.01026C14.7901 12 11.0466 14.2103 8.20554 15.3C5.36446 14.2103 1.62012 12 1.62012 7.01026V3.36857L8.20554 0.899994Z" stroke="#fff" stroke-width="1.31831" stroke-linejoin="round"/>'
@@ -537,6 +547,8 @@ window.__ModuleLoader__.load({
 
     /**
      * 是否是承载档位名的元素：按文字精确匹配，不依赖 DSH 的哈希类名（客户端升级也不怕）。
+     * **不看有没有打过标记**：标记与撤销是同一遍重扫里的两步（见 mark），靠「有标记就跳过」判定的话，
+     * 切换档位后 React 复用的那个 span 永远撤不掉旧图标（2026-10-08 用户反馈的「图标带过去」）。
      * @param {*} node 待判定元素
      * @param {string} label 档位显示名
      * @returns {boolean} 命中则返回 true
@@ -547,8 +559,8 @@ window.__ModuleLoader__.load({
       if (typeof node.textContent !== 'string' || node.textContent.trim() !== label) { return false }
       // 只认「纯文字」span：里面有元素就不是档位名（例如我们自己面板里的文案）
       if (node.children !== undefined && node.children !== null && node.children.length > 0) { return false }
-      if (node.classList === undefined || typeof node.classList.contains !== 'function') { return false }
-      return node.classList.contains(PRESET_ICON_CLASS) === false
+      // 拿不到 classList 的元素挂不上标记，直接不当候选
+      return node.classList !== undefined && node.classList !== null && typeof node.classList.contains === 'function'
     }
 
     /**
@@ -574,14 +586,74 @@ window.__ModuleLoader__.load({
     function applyPresetIconVars(node, variant) {
       const spec = PRESET_ICON_VARIANTS[variant]
       if (node.style === undefined || node.style === null || typeof node.style.setProperty !== 'function') { return }
-      node.style.setProperty('--ap-glyph-box', spec.box)
-      node.style.setProperty('--ap-glyph-icon', spec.icon)
-      node.style.setProperty('--ap-glyph-gap', spec.gap)
-      node.style.setProperty('--ap-glyph-color', spec.color)
+      for (const key of Object.keys(PRESET_ICON_VARS)) {
+        node.style.setProperty(PRESET_ICON_VARS[key], spec[key])
+      }
     }
 
     /**
-     * 给权限档位名补图标：只在档位 chip 与下拉菜单项里找，DOM 变动时重扫（React 重建节点会丢标记）。
+     * 元素里是否含 svg（只看元素子节点，递归）：判断一个菜单里的行有没有设计图标用。
+     * @param {*} node 待检查元素
+     * @returns {boolean} 含 svg 则 true
+     */
+    function holdsSvg(node) {
+      const kids = node === null || node === undefined ? undefined : node.children
+      if (kids === undefined || kids === null) { return false }
+      for (let index = 0; index < kids.length; index += 1) {
+        const kid = kids[index]
+        if (kid === null || kid === undefined) { continue }
+        if (String(kid.tagName).toLowerCase() === 'svg') { return true }
+        if (holdsSvg(kid) === true) { return true }
+      }
+      return false
+    }
+
+    /**
+     * 这个档位名所在的菜单，行里是否自带设计图标（图标 span 在文字之前）。
+     * 输入框那个 PermissionSelect 给内置三个档位各渲染一个装着 svg 的 span.itemIcon，设置页的
+     * PermissionRow 四种档位只有纯文字 —— 只给前者补图标，设置页里才不会「一行有图标、三行没有」。
+     * 选中态的对勾 svg 是按钮的直接子节点、不裹在 span 里，所以不会被当成设计图标。
+     * @param {*} node 档位名所在的 span
+     * @returns {boolean} 该菜单里有行自带图标则 true
+     */
+    function menuCarriesIcons(node) {
+      const menu = typeof node.closest === 'function' ? node.closest('[role="menu"]') : null
+      if (menu === null || menu === undefined || typeof menu.querySelectorAll !== 'function') { return false }
+      for (const span of menu.querySelectorAll('button[role="menuitem"] > span')) {
+        if (holdsSvg(span) === true) { return true }
+      }
+      return false
+    }
+
+    /**
+     * 这个 span 现在该不该有图标：chip 一律补（内置图标位就是缺的），菜单项只在「同排本来就有图标」时补。
+     * @param {*} node 档位名所在的 span
+     * @returns {boolean} 该补则 true
+     */
+    function wantsPresetIcon(node) {
+      if (isPresetLabelNode(node, PRESET_ICON_LABEL) === false) { return false }
+      if (presetIconVariant(node) === 'chip') { return true }
+      return menuCarriesIcons(node)
+    }
+
+    /**
+     * 抹掉一次标记：去掉 class 与内联变量。切换档位时 React 复用同一个 span、只改写里面的文本，
+     * 不撤销的话「自动审批」的图标会跟着新档位留在 chip 上（2026-10-08 用户反馈）。
+     * @param {*} node 已打标记的 span
+     * @returns {void} 无返回值
+     */
+    function unmarkPresetIcon(node) {
+      if (node.classList !== undefined && node.classList !== null && typeof node.classList.remove === 'function') {
+        node.classList.remove(PRESET_ICON_CLASS)
+      }
+      const style = node.style
+      if (style === undefined || style === null || typeof style.removeProperty !== 'function') { return }
+      for (const name of Object.values(PRESET_ICON_VARS)) { style.removeProperty(name) }
+    }
+
+    /**
+     * 给权限档位名补图标：只在档位 chip 与「本来就有图标位」的下拉菜单里找，DOM 变动时重扫
+     * （React 重建节点会丢标记）；同一遍里把不再该有的标记撤掉（切换档位时同一个 span 的文本被改写）。
      * @returns {void} 无返回值；浏览器环境缺失（测试/SSR）时直接退出
      */
     function installPresetIcon() {
@@ -595,6 +667,8 @@ window.__ModuleLoader__.load({
         + 'button span,[aria-label*="' + PRESET_ICON_LABEL + '"] span'
       // 每处宿主只回报一次：把浏览器算出来的几何写进宿主日志，便于「看着不对」时直接核对
       const reported = new Set()
+      // 撤销也只在每种文本上回报一次：真机核对「切走档位后图标确实撤掉了」用
+      const cleared = new Set()
       /**
        * 回报一次该 span 的 ::before 实际几何（宽 / 右间距 / 图标色）。
        * @param {*} node 档位名所在的 span
@@ -615,15 +689,30 @@ window.__ModuleLoader__.load({
           // 计算样式拿不到只影响回报，不影响图标本身
         }
       }
-      /** 给尚未打标记的档位名加上图标类，并按所在宿主写入变体变量。 */
+      /** 撤销时回报一次（不含几何：这里的重点是「切走档位后标记确实被撤了」）。 */
+      const reportClear = (node) => {
+        const text = String(node.textContent === undefined ? '' : node.textContent).slice(0, 32)
+        if (cleared.has(text) === true) { return }
+        cleared.add(text)
+        beacon('preset-icon', 'clear text=' + text)
+      }
+      /**
+       * 重扫一遍：该补的补、该撤的撤。撤销这一遍不能省 —— 切换档位不是换节点，
+       * 而是把 chip 里那个 span 的文本改写成新档位名，旧的标记会原样留在上面。
+       */
       const mark = () => {
         for (const node of document.querySelectorAll(selector)) {
-          if (isPresetLabelNode(node, PRESET_ICON_LABEL) === false) { continue }
+          if (wantsPresetIcon(node) === false) { continue }
           const variant = presetIconVariant(node)
           // 先写变量再挂 class：class 一挂上规则就生效，不会出现「先按默认值渲染一帧」的闪烁
           applyPresetIconVars(node, variant)
-          node.classList.add(PRESET_ICON_CLASS)
+          if (node.classList.contains(PRESET_ICON_CLASS) === false) { node.classList.add(PRESET_ICON_CLASS) }
           report(node, variant)
+        }
+        for (const node of document.querySelectorAll('.' + PRESET_ICON_CLASS)) {
+          if (wantsPresetIcon(node) === true) { continue }
+          unmarkPresetIcon(node)
+          reportClear(node)
         }
       }
       /** 合并同一帧内的多次变动：会话流式渲染时 DOM 变动很密集，避免反复全量查询。 */
@@ -822,8 +911,9 @@ window.__ModuleLoader__.load({
         '.ap-switchInput:focus-visible+.ap-switchTrack{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}',
         '.ap-switchInput:disabled+.ap-switchTrack{opacity:.5}',
         '.ap-switchText{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;min-width:1.5em}',
-        // 档位名字前面的「盾牌 + A」：几何全部走 --ap-glyph-* 变量（chip 14/4/currentColor，菜单项 16/8/三级色），
-        // 变量由 applyPresetIconVars 内联写在 span 上；mask 用 longhand，避免简写与变量混在一起出歧义
+        // 档位名字前面的「盾牌 + A」：只挂在「本来就有图标位」的地方（输入框 chip 与它的下拉菜单；设置页的
+        // 权限菜单是纯文字，一个都不挂），几何全部走 --ap-glyph-* 变量（chip 14/4/currentColor，菜单项 16/8/三级色），
+        // 变量由 applyPresetIconVars 内联写在 span 上、unmarkPresetIcon 负责清掉；mask 用 longhand，避免简写与变量混在一起出歧义
         `.${PRESET_ICON_CLASS}{display:inline-flex;align-items:center;gap:var(--ap-glyph-gap,8px)}`,
         // 图标本体：尺寸全走 --ap-glyph-* 变量；用 flex 的 align-items:center 对齐，和内置 itemIcon / triggerIcon 同一套机制（之前用 vertical-align 手调，真机上差了 2px）
         `.${PRESET_ICON_CLASS}::before{content:"";flex:none;width:var(--ap-glyph-box,16px);height:var(--ap-glyph-box,16px);background-color:var(--ap-glyph-color,currentColor);-webkit-mask-image:${PRESET_ICON_MASK};mask-image:${PRESET_ICON_MASK};-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-position:center;mask-position:center;-webkit-mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px);mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px)}`,

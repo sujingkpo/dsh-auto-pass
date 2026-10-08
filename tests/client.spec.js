@@ -246,42 +246,65 @@ const defaultWaitTick = () => new Promise(resolve => setTimeout(resolve, 0))
 let waitTick = defaultWaitTick
 
 /**
- * 极简 document 替身：捕获注入的样式文本，并按「档位名 span」的四种形态造候选节点
- * （chip / 菜单项 / 名字更长 / 里面还有元素），用来验证图标只打在该打的那个上、且变量按宿主分两套。
- * @returns {{styled: string[], marked: object[], candidates: object[]}} 捕获到的数据
+ * 极简 document 替身：捕获注入的样式文本，并按「档位名 span」的几种形态造候选节点
+ * （chip / 自带图标的下拉菜单项 / 设置页那个纯文字菜单 / 名字更长 / 里面还有元素），
+ * 用来验证图标只打在该打的那几个上、变量按宿主分两套、切换档位后旧标记会被撤销。
+ * @returns {{styled: string[], marked: object[], candidates: object[], flush: Function}} 捕获到的数据
  */
 function installDocumentStub() {
   const styled = []
   const marked = []
+  const watchers = []
   /**
-   * 造一个 span 替身；classList / closest / style 只实现用到的部分。
+   * 造一个 span 替身；classList / closest / style / children 只实现用到的部分。
    * @param {string} text 文本
    * @param {object[]} children 子元素
    * @param {string|null} ariaLabel 所属 button 的 aria-label（chip 才有，菜单项为 null）
+   * @param {object|null} menu 所属菜单替身（菜单项才有，chip 为 null）
    */
-  const span = (text, children, ariaLabel) => {
+  const span = (text, children, ariaLabel, menu = null) => {
     const vars = {}
-    return {
+    const names = new Set()
+    const node = {
       tagName: 'SPAN',
       textContent: text,
       children,
-      closest: tag => (tag === 'button' ? { getAttribute: name => (name === 'aria-label' ? ariaLabel : null) } : null),
-      style: { setProperty: (name, value) => { vars[name] = value } },
       vars,
-      classList: {
-        names: new Set(),
-        contains(name) { return this.names.has(name) },
-        add(name) {
-          this.names.add(name)
-          // vars 存引用而不是快照：断言时读的是 mark() 跑完后的最终值
-          marked.push({ text, classes: [...this.names], vars })
-        },
+      names,
+      closest: tag => {
+        if (tag === 'button') return { getAttribute: name => (name === 'aria-label' ? ariaLabel : null) }
+        if (tag === '[role="menu"]') return menu
+        return null
       },
+      style: {
+        setProperty: (name, value) => { vars[name] = value },
+        removeProperty: name => { delete vars[name] },
+      },
+      classList: null,
     }
+    node.classList = {
+      contains: name => names.has(name),
+      add(name) {
+        names.add(name)
+        // vars 存引用而不是快照：断言时读的是 mark() 跑完后的最终值
+        marked.push({ text: node.textContent, classes: [...names], vars })
+      },
+      remove: name => { names.delete(name) },
+    }
+    return node
   }
+  /** 菜单里某个「图标 span」的替身：真机上 icon span 里装着档位图标的 svg。 */
+  const iconSpan = () => ({ tagName: 'SPAN', children: [{ tagName: 'svg' }] })
+  /** 菜单替身：iconSpans 是这个菜单里各行自带的设计图标（插件据此决定要不要给自建档位补图标）。 */
+  const menu = iconSpans => ({
+    querySelectorAll: selector => (selector === 'button[role="menuitem"] > span' ? iconSpans : []),
+  })
+  const composerMenu = menu([iconSpan()])
+  const settingsMenu = menu([])
   const candidates = [
     span('自动审批', [], '访问模式，当前：自动审批'),
-    span('自动审批', [], null),
+    span('自动审批', [], null, composerMenu),
+    span('自动审批', [], null, settingsMenu),
     span('自动审批面板', [], null),
     span('自动审批', [{}], null),
   ]
@@ -291,10 +314,17 @@ function installDocumentStub() {
     head: { appendChild: tag => styled.push(String(tag.textContent)) },
     documentElement: { appendChild: () => {} },
     body: {},
-    querySelectorAll: () => candidates,
+    querySelectorAll: selector => (selector === '.ap-presetGlyph'
+      ? candidates.filter(node => node.names.has('ap-presetGlyph'))
+      : candidates),
   }
-  globalThis.MutationObserver = class { observe() {} }
-  return { styled, marked, candidates }
+  globalThis.MutationObserver = class {
+    constructor(callback) { watchers.push(callback) }
+    observe() {}
+  }
+  /** 触发一次观察回调：真机上 DOM 变动后由 MutationObserver 调度重扫。 */
+  const flush = () => { for (const callback of watchers) callback() }
+  return { styled, marked, candidates, flush }
 }
 
 /** 安装最小浏览器替身：fetch 与 localStorage 都返回可控的假结果，避免噪声。 */
@@ -799,7 +829,7 @@ describe('客户端半加载与注册', () => {
     expect(typeof tabRegistrations[0].guide[0].icon).toBe('function')
   })
 
-  it('给权限档位名补「盾牌 + A」图标：只认纯文字且完全匹配的 span', async () => {
+  it('给权限档位名补「盾牌 + A」图标：只认纯文字且完全匹配的 span，且只补在本来就有图标位的菜单里', async () => {
     const registration = await loadClient()
     const moduleExports = registration.factory(specifier => {
       if (specifier === 'react') return fakeReact()
@@ -815,7 +845,7 @@ describe('客户端半加载与注册', () => {
     expect(css).toContain('width:var(--ap-glyph-box,16px)')
     expect(css).toContain('-webkit-mask-size:var(--ap-glyph-icon,16px) var(--ap-glyph-icon,16px)')
     expect(css).toContain('-webkit-mask-image:url("data:image/svg+xml;charset=utf-8,')
-    // chip（按钮带 aria-label）与菜单项各写一套变量；「自动审批面板」与带子元素的 span 都不该被打标记
+    // chip（按钮带 aria-label）与输入框下拉的档位项各写一套变量；「自动审批面板」与带子元素的 span 都不该被打标记
     expect(domStub.marked).toEqual([
       {
         text: '自动审批',
@@ -833,6 +863,33 @@ describe('客户端半加载与注册', () => {
         },
       },
     ])
+    // 设置页那个权限菜单（PermissionRow）四种档位全是纯文字，同排没有图标位 —— 一个都不该补
+    expect(domStub.candidates[2].names.has('ap-presetGlyph')).toBe(false)
+  })
+
+  it('切换档位后撤销旧图标：同一个 span 被改写文本时去掉标记与内联变量', async () => {
+    const registration = await loadClient()
+    const moduleExports = registration.factory(specifier => {
+      if (specifier === 'react') return fakeReact()
+      throw new Error('unexpected require: ' + specifier)
+    })
+    const { ctx } = harness()
+    moduleExports.apply(ctx)
+
+    const chip = domStub.candidates[0]
+    const item = domStub.candidates[1]
+    expect(chip.names.has('ap-presetGlyph')).toBe(true)
+    expect(chip.vars['--ap-glyph-box']).toBe('14px')
+    // 真机上切换档位不是换节点：React 复用 chip 里那个 span、只改写文本（所以观察 characterData）
+    chip.textContent = '完全权限'
+    domStub.flush()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(chip.names.has('ap-presetGlyph')).toBe(false)
+    expect(chip.vars).toEqual({})
+    // 输入框下拉里那一项还写着「自动审批」，标记不动；撤销也会在信标轨迹里留一行，真机据此核对
+    expect(item.names.has('ap-presetGlyph')).toBe(true)
+    const trail = JSON.parse(globalThis.localStorage.getItem('dsh-auto-pass:boot'))
+    expect(trail.some(entry => entry.includes('preset-icon(clear text=完全权限)'))).toBe(true)
   })
 
   it('三个面板都能渲染到稳定状态（抓到未定义标识符与异步渲染问题）', async () => {
