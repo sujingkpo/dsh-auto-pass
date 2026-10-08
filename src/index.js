@@ -133,6 +133,14 @@ export const RULE_REVERT_PATH = '/api/dsh-auto-pass/rule/revert'
 export const PLACEMENTS = Object.freeze(['auto', 'tab', 'sidebar', 'all'])
 /** 设置命名空间：宿主 settings 注册与浏览器端设置卡片靠这个名字对齐。 */
 export const SETTINGS_NAMESPACE = 'dsh-auto-pass'
+/**
+ * 会话消息 source 的 kind：会话格式 v4 要求它是「生产者自有」的，裸 `plugin` 会在**写入侧**被拒 ——
+ * `format v4 message requires a producer-owned source kind`（2026-10-08 真机踩到）。被拒的事件会留在
+ * 待写缓冲里，此后该会话每次 append 都重试同一批并失败，整条会话从此写不动（数据没坏，是写不进去）。
+ * v3→v4 迁移会把旧的两字段形状（kind 为裸 plugin、另带一个 plugin 字段的记录）折算成同一个串
+ * （dsh-session-format-v3-to-v4 的 producerKind：不在改名表里的插件 → `plugin:<包名>`），所以新老会话一致。
+ */
+export const PLUGIN_SOURCE_KIND = 'plugin:dsh-auto-pass'
 /** 单次响应最多返回的记录条数，避免侧边栏一次拉取过多数据。 */
 const MAX_RECORDS_PER_RESPONSE = 500
 
@@ -2043,7 +2051,7 @@ async function callModelOnce(ctx, options) {
   const assembler = new module.BlockAssembler()
   const messages = [module.createUserMessage({
     content: [{ type: 'text', text: options.prompt }],
-    source: { kind: 'plugin', plugin: 'dsh-auto-pass' },
+    source: { kind: PLUGIN_SOURCE_KIND },
   })]
   const stream = llm.stream({
     provider: options.route.provider,
@@ -2401,8 +2409,7 @@ function injectReviewNotice(ctx, request, options) {
       role: 'user',
       content: [{ type: 'text', text: truncateText(parts.join(' · '), MAX_NOTICE_LINE_CHARS) }],
       source: {
-        kind: 'plugin',
-        plugin: 'dsh-auto-pass',
+        kind: PLUGIN_SOURCE_KIND,
         form: 'notice',
         // 折叠标题与正文用同一个标签；状态词按最终结果给（已批准 / 已拒绝 / 已转人工审批）
         summary: tag + ' ' + (notice.rejected === true
@@ -2433,8 +2440,7 @@ function injectReasonNotice(ctx, request, options) {
       role: 'user',
       content: [{ type: 'text', text: truncateText(text, MAX_NOTICE_LINE_CHARS) }],
       source: {
-        kind: 'plugin',
-        plugin: 'dsh-auto-pass',
+        kind: PLUGIN_SOURCE_KIND,
         form: 'notice',
         summary: '[' + labels.tagHuman + '] ' + labels.summaryReason,
       },

@@ -5,6 +5,7 @@
  * @date 2026-08-14
  * @modify 2026-09-15 适配 dsh-auto-pass：deny 与审查失败改为调用 next() 转人工
  */
+import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 import {
   apply,
@@ -14,6 +15,7 @@ import {
   enforceHostPolicy,
   exactAction,
   exactRuleOf,
+  PLUGIN_SOURCE_KIND,
   parseAssessment,
   parseJsonReply,
   resolveConfig,
@@ -349,6 +351,10 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(notice.content[0].text).not.toContain('Reviewer 会话')
     // 折叠标题与正文用同一个标签
     expect(notice.source).toMatchObject({ form: 'notice', summary: '[自动] 自动审批：已批准' })
+    // 会话格式 v4：source.kind 必须是「生产者自有」的（裸 plugin 会被写入侧拒绝，整条会话从此写不动）
+    expect(ctx.llmCalls[0].messages[0].source).toEqual({ kind: PLUGIN_SOURCE_KIND })
+    expect(notice.source.kind).toBe(PLUGIN_SOURCE_KIND)
+    expect(notice.source).not.toHaveProperty('plugin')
   })
 
   it('模型 deny 时转交人工审批', async () => {
@@ -393,6 +399,9 @@ describe('Auto Approve Reviewer 子 Agent', () => {
     expect(injected[0].content[0].text).toContain('最终结果：已拒绝')
     expect(injected[1].content[0].text).toBe('[人工] 人工拒绝理由：提权范围超过运行测试所需。')
     expect(injected[1].source).toMatchObject({ form: 'notice', summary: '[人工] 自动审批：拒绝理由' })
+    for (const notice of injected) {
+      expect(notice.source.kind).toBe(PLUGIN_SOURCE_KIND)
+    }
     // 追问卡：agent 是父 Agent，第一项采用模型意见、最后一项是不留言
     const asked = userQuestions.ask.mock.calls[0][0]
     expect(asked.agent).toBe(request.agent)
@@ -1128,5 +1137,24 @@ describe('审查语言自动选择', () => {
     )(denied, deniedNext)).toBe('allowed-once')
     expect(deniedNext).toHaveBeenCalledOnce()
     expect(denied.agent.inject.mock.calls.at(-1)[0].content[0].text).toContain('Rationale: Out of scope.')
+  })
+})
+
+/**
+ * 会话消息来源必须带「生产者自有」的 kind：会话格式 v4 的写入侧会拒绝裸 plugin
+ * （`format v4 message requires a producer-owned source kind`），一次被拒的写入会留在待写缓冲里，
+ * 此后该会话每次 append 都重试同一批并失败 —— 数据没坏，是整条会话写不动（2026-10-08 真机踩到）。
+ * 运行时形状由上面的注入用例钉住，这里再扫一遍源码，防止以后新增的注入点又写回旧形状。
+ */
+describe('会话消息来源（session format v4）', () => {
+  it('source kind 是 plugin:<包名>（与 v3→v4 迁移折算出来的串一致）', () => {
+    expect(PLUGIN_SOURCE_KIND).toBe('plugin:dsh-auto-pass')
+  })
+
+  it('宿主半与客户端半源码里都没有裸 plugin 的 source 形状', () => {
+    for (const file of ['../src/index.js', '../src/client.js']) {
+      const source = readFileSync(new URL(file, import.meta.url), 'utf8')
+      expect(source.match(/kind:\s*['"]plugin['"]/g) ?? [], file).toEqual([])
+    }
   })
 })
