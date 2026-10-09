@@ -194,23 +194,10 @@ let clipboardWrites = []
 let policyResponder = null
 
 /**
- * /config 的请求流水（断言「这个开关写的是本工作区还是全局」用）：
- * 每项 { method, cwd, body }；body 只在 POST 时有。
+ * /config 的请求流水（断言「面板与设置页写的是同一份全局值」用）：
+ * 每项 { method, body }；body 只在 POST 时有。
  */
 let configRequests = []
-
-/**
- * 模拟「某个工作区在项目策略文件里单独存过 prefs.autoOpenTimeline」（老形状，宿主仍在回执里照给
- * workspace 段但客户端不再据此判定）：cwd -> boolean。
- */
-let workspaceAutoOpen = {}
-
-/**
- * 模拟「某个**会话**在项目策略文件里单独存过 prefs.autoOpenTimelineSessions[sessionId]」：
- * sessionId -> boolean。/config 带 session 时据此给出 session 段（与宿主的 configSnapshot 同口径，
- * 2026-09-20 起自动打开时间线按会话区分）。
- */
-let sessionAutoOpen = {}
 
 /**
  * /config 回执里的 model 段（审查模型配置）：用例按需覆盖，默认都是「跟随当前会话 / 模型默认」。
@@ -229,32 +216,24 @@ let modelConfig = {
   maxOutputTokens: 2_048,
 }
 
-/** 观察器用例里那个当前会话的工作区（harness 的 sessions 快照里的 cwd）。 */
-const WORKSPACE_CWD = 'D:\\work\\github\\dsh-auto'
+/**
+ * /config 的回执替身：只有一份全局值（2026-10-09 起「自动打开审批时间线」也是全局开关，
+ * 回执里不再有 workspace / session 段；真宿主对多余的 cwd / session 参数就是照给这一份）。
+ * autoOpenTimeline 由 configAutoOpen 承载：POST 写它、GET 读它，模拟真实往返。
+ */
+let configAutoOpen = true
 
-/** /config 的回执替身：全局那份 + （带 cwd / session 时）本工作区、本会话的生效值。 */
-function configPayload(cwd, sessionId) {
-  const globalAuto = true
-  const scoped = cwd === undefined ? undefined : workspaceAutoOpen[cwd]
-  const sessionScoped = cwd === undefined || sessionId === undefined ? undefined : sessionAutoOpen[sessionId]
+function configPayload() {
   return {
     ok: true,
-    settings: { placement: 'all', notice: true, denyDirect: false, autoOpenTimeline: globalAuto, askRejectReason: true },
+    settings: {
+      placement: 'all',
+      notice: true,
+      denyDirect: false,
+      autoOpenTimeline: configAutoOpen,
+      askRejectReason: true,
+    },
     model: modelConfig,
-    ...(sessionId === undefined ? {} : {
-      session: {
-        sessionId,
-        autoOpenTimeline: typeof sessionScoped === 'boolean' ? sessionScoped : globalAuto,
-        scoped: typeof sessionScoped === 'boolean',
-      },
-    }),
-    ...(cwd === undefined ? {} : {
-      workspace: {
-        cwd,
-        autoOpenTimeline: typeof scoped === 'boolean' ? scoped : globalAuto,
-        scoped: typeof scoped === 'boolean',
-      },
-    }),
     writable: true,
   }
 }
@@ -353,8 +332,7 @@ function installBrowserStubs() {
   revertResponder = null
   policyResponder = null
   configRequests = []
-  workspaceAutoOpen = {}
-  sessionAutoOpen = {}
+  configAutoOpen = true
   const store = new Map()
   globalThis.localStorage = {
     getItem: key => (store.has(key) ? store.get(key) : null),
@@ -427,23 +405,11 @@ function installBrowserStubs() {
       const payload = typeof ruleResponder === 'function' ? ruleResponder(target) : { ok: true }
       return { json: async () => payload }
     }
-    // 界面偏好：placement + 四个行为开关。自动打开时间线按工作区区分——带 ?cwd= 或 body.cwd
-    // 的请求拿到 workspace 段；POST 带 cwd 就是「写这个工作区那份」（替身记下来供断言）
+    // 界面偏好：placement + 四个行为开关（都是一份全局值）。请求里即使带了 cwd / session 也照旧
+    // 只写全局（真宿主 2026-10-09 起就是这么做的），替身把请求记下来供断言
     if (target.includes('/config')) {
       const body = options?.body === undefined ? undefined : JSON.parse(String(options.body))
-      const fromQuery = target.includes('?cwd=')
-        ? decodeURIComponent(target.slice(target.indexOf('?cwd=') + 5).split('&')[0])
-        : undefined
-      const sessionFromQuery = target.includes('session=')
-        ? decodeURIComponent(target.slice(target.indexOf('session=') + 8).split('&')[0])
-        : undefined
-      const cwd = body?.cwd ?? fromQuery
-      const sessionId = body?.session ?? sessionFromQuery
-      if (body !== undefined && typeof body.autoOpenTimeline === 'boolean' && cwd !== undefined) {
-        // 带 session 的写的是「本会话」那份（宿主写进该工作区策略文件的 prefs.autoOpenTimelineSessions）
-        if (typeof body.session === 'string' && body.session !== '') sessionAutoOpen[body.session] = body.autoOpenTimeline
-        else workspaceAutoOpen[cwd] = body.autoOpenTimeline
-      }
+      if (body !== undefined && typeof body.autoOpenTimeline === 'boolean') configAutoOpen = body.autoOpenTimeline
       // 审查模型配置：真宿主把写入落进插件行 config 后回执就是新值（替身照做，便于断言「保存后面板立刻显示新值」）
       if (body !== undefined && (typeof body.reviewerProvider === 'string' || typeof body.reviewerModel === 'string'
         || Number.isSafeInteger(body.timeoutMs))) {
@@ -456,10 +422,10 @@ function installBrowserStubs() {
           ...(Number.isSafeInteger(body.maxOutputTokens) ? { maxOutputTokens: body.maxOutputTokens } : {}),
         }
       }
-      configRequests.push({ method: options?.method ?? 'GET', cwd, session: sessionId, body })
-      return { json: async () => configPayload(cwd, sessionId) }
+      configRequests.push({ method: options?.method ?? 'GET', body })
+      return { json: async () => configPayload() }
     }
-    return { json: async () => configPayload(undefined) }
+    return { json: async () => configPayload() }
   })
 }
 
@@ -2482,7 +2448,7 @@ describe('审批触发后自动打开右侧栏时间线', () => {
     }
   })
 
-  it('这个开关按会话取值：本会话单独关掉后，即使全局开着也不自动展开', async () => {
+  it('开关关掉后，任何一个会话都不再自动展开（全局值，2026-10-09 用户要求）', async () => {
     vi.useFakeTimers()
     waitTick = () => vi.advanceTimersByTimeAsync(0)
     try {
@@ -2493,8 +2459,8 @@ describe('审批触发后自动打开右侧栏时间线', () => {
         throw new Error('unexpected require: ' + specifier)
       })
       const { ctx, openTabs, sidebar } = harness()
-      // 该会话在策略文件里存过 prefs.autoOpenTimelineSessions[session]=false（全局那份仍是 true）
-      sessionAutoOpen = { [SESSION_KNOWN]: false }
+      // 宿主回执里这个开关是关的（真身就是插件行 config 里的 autoOpenTimeline: false）
+      configAutoOpen = false
       let records = [{ id: 'record-history', sessionId: SESSION_KNOWN, time: staleAt() }]
       logResponder = () => records
       moduleExports.apply(ctx)
@@ -2503,12 +2469,11 @@ describe('审批触发后自动打开右侧栏时间线', () => {
         for (let index = 0; index < 12; index += 1) await Promise.resolve()
       }
 
-      // 观察器读的是**带 cwd + session** 的那一份（不是全局那份）
+      // 观察器每轮都读一次 /config（不带 cwd / session：这个开关没有按会话那一层）
       await tick(POLL)
-      expect(configRequests.some(item => item.method === 'GET' && item.cwd === WORKSPACE_CWD
-        && item.session === SESSION_KNOWN)).toBe(true)
+      expect(configRequests.some(item => item.method === 'GET' && item.body === undefined)).toBe(true)
       expect(sidebar.expanded).toBe(false)
-      // 新审批来了：全局开着、本工作区关着 → 不动用户的侧栏
+      // 新审批来了：开关关着 → 不动用户的侧栏
       records = [{ id: 'record-fresh', sessionId: SESSION_KNOWN, time: freshAt() }, ...records]
       await tick(POLL)
       expect(openTabs).toEqual([])
@@ -2926,8 +2891,8 @@ describe('审批触发后自动打开右侧栏时间线', () => {
   })
 })
 
-describe('「自动打开审批时间线」按会话区分（2026-09-20 用户要求，此前按工作区）', () => {
-  it('面板读写的是本会话（带 cwd + session），设置页卡片读写的是全局默认（都不带）', async () => {
+describe('「自动打开审批时间线」是全局开关（2026-10-09 用户要求：关一次所有会话都不再打开）', () => {
+  it('面板与设置页卡片写的是同一个值：都不带 cwd / session，拨一次即全局生效', async () => {
     const registration = await loadClient()
     const react = fakeReact()
     const moduleExports = registration.factory(specifier => {
@@ -2937,28 +2902,23 @@ describe('「自动打开审批时间线」按会话区分（2026-09-20 用户�
     const { ctx, slotRegistrations } = harness()
     moduleExports.apply(ctx)
 
-    // 「审批设置」面板：知道当前工作区与会话 → 读数带 ?cwd= + ?session=，写数带 cwd + session
-    // （落进该项目策略文件的 prefs.autoOpenTimelineSessions[sessionId]）
+    // 「审批设置」面板：拨关闭 → 只写全局那一份（历史版本会带 cwd + session 写项目策略文件）
     const view = slot(slotRegistrations, 'conversation.view', 'dsh-auto-pass')
     const panel = await renderStable(react, view.component, { sessionId: SESSION_KNOWN }, steps(toggleSwitch(2, false)))
     for (const cleanup of panel.cleanups) cleanup()
-    expect(configRequests.some(item => item.method === 'GET' && item.cwd === WORKSPACE_CWD
-      && item.session === SESSION_KNOWN)).toBe(true)
-    const scopedWrite = configRequests.filter(item => item.method === 'POST').pop()
-    expect(scopedWrite.cwd).toBe(WORKSPACE_CWD)
-    expect(scopedWrite.body).toEqual({ autoOpenTimeline: false, cwd: WORKSPACE_CWD, session: SESSION_KNOWN })
-    // 面板里那句说明是「本会话」版（设置页那份是所有会话的默认值）
-    expect(JSON.stringify(panel.tree)).toContain('本会话：有刚发生的审批时会自动展开时间线')
+    expect(configRequests.some(item => item.method === 'GET' && item.body === undefined)).toBe(true)
+    const panelWrite = configRequests.filter(item => item.method === 'POST').pop()
+    expect(panelWrite.body).toEqual({ autoOpenTimeline: false })
+    // 说明文案收敛成一句（不再分「本会话」与「所有会话的默认值」两套）
+    expect(JSON.stringify(panel.tree)).toContain('这是**全局开关**（关一次即所有会话都不再自动展开，包括以后新建的）')
 
-    // 设置页卡片：没有会话上下文 → 读写全局那份（所有会话的默认值）
+    // 设置页卡片：同一份全局值，写出来的请求体一模一样
     const card = slot(slotRegistrations, 'settings.plugin.item', 'dsh-auto-pass')
     const settings = await renderStable(react, card.component, {}, steps(toggleSwitch(2, false)))
     for (const cleanup of settings.cleanups) cleanup()
-    const globalWrite = configRequests.filter(item => item.method === 'POST').pop()
-    expect(globalWrite.cwd).toBeUndefined()
-    expect(globalWrite.session).toBeUndefined()
-    expect(globalWrite.body).toEqual({ autoOpenTimeline: false })
-    expect(JSON.stringify(settings.tree)).toContain('这里是所有会话的默认值')
+    const settingsWrite = configRequests.filter(item => item.method === 'POST').pop()
+    expect(settingsWrite.body).toEqual({ autoOpenTimeline: false })
+    expect(configAutoOpen).toBe(false)
   })
 })
 

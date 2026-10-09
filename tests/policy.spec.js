@@ -845,45 +845,25 @@ describe('policy store', () => {
     expect(createPolicyStore({ globalFile: file, counterDir, warn: () => {} }).threshold()).toBe(7)
   })
 
-  it('工作区偏好 prefs 落进项目策略文件：没 cwd 写不进去，重启读得回来', () => {
+  it('「自动打开审批时间线」不再落项目策略文件：prefs 读写入口已下线，历史 prefs 会被丢掉并写掉', () => {
     const instance = store()
-    expect(instance.pref(cwd, 'autoOpenTimeline')).toBeUndefined()
-    expect(instance.setPref(cwd, 'autoOpenTimeline', false)).toBe(true)
-    expect(instance.pref(cwd, 'autoOpenTimeline')).toBe(false)
-    // 与项目规则同一份文件；全局策略文件不该因为写工作区偏好而被创建
-    expect(JSON.parse(readFileSync(projectPolicyFile(cwd), 'utf8')).prefs).toEqual({ autoOpenTimeline: false })
-    expect(existsSync(globalFile)).toBe(false)
-    // 别的工作区读不到这份；没有 cwd 时写失败（调用方据此回落全局设置）
-    expect(instance.pref(join(root, 'another'), 'autoOpenTimeline')).toBeUndefined()
-    expect(instance.setPref(undefined, 'autoOpenTimeline', true)).toBe(false)
-    // 重启后从项目文件读回
-    expect(store().pref(cwd, 'autoOpenTimeline')).toBe(false)
-  })
-
-  it('会话偏好 prefs.<key>Sessions 落进同一份项目文件：按会话各存一份，删掉即回落全局', () => {
-    const instance = store()
-    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-a')).toBeUndefined()
-    expect(instance.setSessionPref(cwd, 'autoOpenTimeline', 'session-a', false)).toBe(true)
-    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-a')).toBe(false)
-    // 同一个工作区里的另一个会话不受影响（2026-09-20：按会话隔离）
-    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-b')).toBeUndefined()
-    expect(instance.setSessionPref(cwd, 'autoOpenTimeline', 'session-b', true)).toBe(true)
-    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-a')).toBe(false)
-    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-b')).toBe(true)
-    // 老的工作区那层与它并存（不再参与判定，但不会被踩掉）
-    expect(instance.setPref(cwd, 'autoOpenTimeline', true)).toBe(true)
-    expect(instance.pref(cwd, 'autoOpenTimeline')).toBe(true)
-    expect(JSON.parse(readFileSync(projectPolicyFile(cwd), 'utf8')).prefs)
-      .toEqual({ autoOpenTimeline: true, autoOpenTimelineSessions: { 'session-a': false, 'session-b': true } })
-    // 删掉某条会话的覆盖（undefined）→ 这个会话回到「没存过」，调用方据此回落全局
-    expect(instance.setSessionPref(cwd, 'autoOpenTimeline', 'session-a', undefined)).toBe(true)
-    expect(instance.sessionPref(cwd, 'autoOpenTimeline', 'session-a')).toBeUndefined()
-    // 没有 cwd / 空 sessionId：写失败（调用方如实报错，绝不把「本会话」静默写成全局）
-    expect(instance.setSessionPref(undefined, 'autoOpenTimeline', 'session-a', true)).toBe(false)
-    expect(instance.setSessionPref(cwd, 'autoOpenTimeline', '', true)).toBe(false)
-    expect(instance.sessionPref(undefined, 'autoOpenTimeline', 'session-a')).toBeUndefined()
-    // 重启后从项目文件读回
-    expect(store().sessionPref(cwd, 'autoOpenTimeline', 'session-b')).toBe(true)
+    // 三个旧入口全部移除：这个开关 2026-10-09 起只是插件行 config 里的一个全局值
+    expect(instance.pref).toBeUndefined()
+    expect(instance.setPref).toBeUndefined()
+    expect(instance.sessionPref).toBeUndefined()
+    expect(instance.setSessionPref).toBeUndefined()
+    // 历史文件里残留的 prefs（2026-09-18 的工作区级 + 2026-09-20 的会话级）不再读，也不该被原样写回
+    mkdirSync(dirname(projectPolicyFile(cwd)), { recursive: true })
+    writeFileSync(projectPolicyFile(cwd), JSON.stringify({
+      version: 1,
+      rules: { allow: [], deny: [] },
+      prefs: { autoOpenTimeline: true, autoOpenTimelineSessions: { 'session-a': false } },
+    }), 'utf8')
+    const reopened = store()
+    reopened.addRule(signatureRule('project', 'allow', pwshSignature('git status')), cwd)
+    const doc = JSON.parse(readFileSync(projectPolicyFile(cwd), 'utf8'))
+    expect(doc.prefs).toBeUndefined()
+    expect(doc.rules.allow).toHaveLength(1)
   })
 })
 

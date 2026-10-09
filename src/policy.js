@@ -19,6 +19,9 @@
  *   新增 pref / setPref：跟项目规则同一份文件，所以「这个工作区要不要自动开时间线」跟着项目走
  * @modify 2026-09-20 同一段再加一层会话级映射 prefs.<key>Sessions[sessionId]（sessionPref /
  *   setSessionPref）：自动打开时间线改成**按会话**区分（用户要求），工作区那层保留在文件里但不再参与判定
+ * @modify 2026-10-09 「自动打开审批时间线」改回**一个全局开关**（用户要求，现象是「关掉后老是自己打开」）：
+ *   删掉 prefs 整段与 pref / setPref / sessionPref / setSessionPref——那个开关就是插件 config 里的一个值，
+ *   所有会话（含以后新建的）一律跟随；历史文件里残留的 prefs 不再读，下次写盘时自然消失
  */
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -726,8 +729,8 @@ export function projectPolicyFile(cwd) {
 
 /**
  * 空策略文档。`counters` 只在读老文件时出现（历史形态的计数全塞在全局文件里），迁走之后就不再写它。
- * `prefs` 放**工作区级**的界面偏好（目前只有 autoOpenTimeline）：与项目规则同一份文件，
- * 所以「这个工作区要不要自动打开审批时间线」跟着项目走，不污染全局设置（用户 2026-09-18 要求）。
+ * 曾经还有一段 `prefs`（工作区级 / 会话级的界面偏好，只放 autoOpenTimeline）：2026-10-09 用户要求把
+ * 那个开关改回「一个全局值」后整段删掉——历史文件里残留的 prefs 不再读取，下次写盘时自然消失。
  */
 function emptyDoc() {
   return {
@@ -735,7 +738,6 @@ function emptyDoc() {
     rules: { allow: [], deny: [] },
     counters: {},
     thresholds: {},
-    prefs: {},
   }
 }
 
@@ -753,8 +755,6 @@ export const noopPolicyStore = Object.freeze({
     global: Object.freeze({ allow: [], deny: [] }),
     project: undefined,
   }),
-  pref: () => undefined,
-  setPref: () => false,
   addRule: () => ({ ok: false, error: 'policy store disabled' }),
   updateRule: () => ({ ok: false, error: 'policy store disabled' }),
   removeRule: () => false,
@@ -845,10 +845,8 @@ export function createPolicyStore(options = {}) {
         if (Number.isSafeInteger(parsed.thresholds?.allow) && parsed.thresholds.allow >= 1) doc.thresholds.allow = parsed.thresholds.allow
         if (Number.isSafeInteger(parsed.thresholds?.deny) && parsed.thresholds.deny >= 1) doc.thresholds.deny = parsed.thresholds.deny
         if (Number.isSafeInteger(parsed.threshold) && parsed.threshold >= 1) doc.thresholds.allow = parsed.threshold
-        // 工作区级界面偏好：只透传 JSON 里的原始值，键的合法性由调用方（pref / setPref）约束
-        if (parsed.prefs !== null && typeof parsed.prefs === 'object' && !Array.isArray(parsed.prefs)) {
-          doc.prefs = { ...parsed.prefs }
-        }
+        // 老文件里的 prefs（已下线的工作区/会话级界面偏好）刻意不透传：读的时候丢掉，
+        // 下一次写盘就把它从文件里抹掉，不留一份没人再读的隐形状态（2026-10-09）
       }
       return doc
     } catch (error) {
@@ -997,75 +995,6 @@ export function createPolicyStore(options = {}) {
   function projectDoc(cwd) {
     const file = projectPolicyFile(cwd)
     return file === undefined ? undefined : { file, doc: docFor(file) }
-  }
-
-  /**
-   * 读一个工作区的界面偏好（存在该项目策略文件的 prefs 里）。
-   * 没有 cwd、或这个工作区没写过 → undefined，调用方回落到全局设置页那份值。
-   * @param cwd 工作区目录
-   * @param key 偏好键（目前只有 autoOpenTimeline）
-   * @returns {*} 存下来的值；没有时 undefined
-   */
-  function pref(cwd, key) {
-    const project = projectDoc(cwd)
-    const value = project?.doc?.prefs?.[key]
-    return value === undefined ? undefined : value
-  }
-
-  /**
-   * 写一个工作区的界面偏好（与项目规则同一份文件，第一次写会创建 <cwd>/.dsh-auto-pass/policy.json）。
-   * **没有 cwd 时返回 false**：调用方要么回落到全局设置，要么如实报错，绝不静默丢掉用户的选择。
-   * @returns {boolean} 是否落盘成功
-   */
-  function setPref(cwd, key, value) {
-    const project = projectDoc(cwd)
-    if (project === undefined) return false
-    project.doc.prefs = { ...project.doc.prefs, [key]: value }
-    return write(project.file, project.doc) === true
-  }
-
-  /** 会话级偏好存在 prefs 里的映射键：autoOpenTimeline → autoOpenTimelineSessions。 */
-  function sessionMapKey(key) {
-    return key + 'Sessions'
-  }
-
-  /** 取 prefs.<key>Sessions 这张表（形状不对就当没有）。 */
-  function sessionPrefMap(cwd, key) {
-    const map = projectDoc(cwd)?.doc?.prefs?.[sessionMapKey(key)]
-    return map !== null && typeof map === 'object' && !Array.isArray(map) ? map : undefined
-  }
-
-  /**
-   * 读一个**会话**的界面偏好（存在该项目策略文件 prefs.<key>Sessions[sessionId] 里）。
-   * 会话属于某个工作区，所以仍然要 cwd 才能定位文件；没 cwd、没存过、sessionId 为空 → undefined，
-   * 调用方回落到全局设置页那份值（2026-09-20 用户要求：原先按工作区区分的那份改按会话区分）。
-   * @param cwd 工作区目录
-   * @param key 偏好键（目前只有 autoOpenTimeline）
-   * @param sessionId 会话 id
-   * @returns {*} 存下来的值；没有时 undefined
-   */
-  function sessionPref(cwd, key, sessionId) {
-    if (typeof sessionId !== 'string' || sessionId === '') return undefined
-    const value = sessionPrefMap(cwd, key)?.[sessionId]
-    return value === undefined ? undefined : value
-  }
-
-  /**
-   * 写一个**会话**的界面偏好；`value === undefined` 表示删掉这条会话的覆盖（回到全局默认）。
-   * 与项目规则同一份文件；**没有 cwd 或 sessionId 时返回 false**——调用方如实报错，
-   * 绝不把「这个会话的开关」静默写成全局默认（那会改掉所有会话）。
-   * @returns {boolean} 是否落盘成功
-   */
-  function setSessionPref(cwd, key, sessionId, value) {
-    if (typeof sessionId !== 'string' || sessionId === '') return false
-    const project = projectDoc(cwd)
-    if (project === undefined) return false
-    const mapKey = sessionMapKey(key)
-    const next = { ...(sessionPrefMap(cwd, key) ?? {}) }
-    if (value === undefined) delete next[sessionId]
-    else next[sessionId] = value
-    project.doc.prefs = { ...project.doc.prefs, [mapKey]: next }
-    return write(project.file, project.doc) === true
   }
 
   function view(doc) {
@@ -1317,12 +1246,6 @@ export function createPolicyStore(options = {}) {
       }
     },
     /** 命中查询：黑名单优先（deny 永远压过 allow），其次项目、最后全局。 */
-    /** 工作区级界面偏好：读 / 写该工作区项目策略文件里的 prefs（见上面那两个函数）。 */
-    pref,
-    setPref,
-    /** 会话级界面偏好：读 / 写同一份文件里 prefs.<key>Sessions[sessionId]（2026-09-20 起自动打开时间线按会话区分）。 */
-    sessionPref,
-    setSessionPref,
     /** 落一条白/黑名单规则（时间线升级/降级与记忆自动升级都走这里）。 */
     addRule,
     /** 改一条已有规则（面板里微调匹配条件/标签，按 id 原地更新）。 */

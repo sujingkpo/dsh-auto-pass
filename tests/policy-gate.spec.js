@@ -5,9 +5,9 @@
  * @author simon300000
  * @date 2026-09-15
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   apply,
@@ -957,7 +957,7 @@ describe('策略 HTTP 入口', () => {
     expect(JSON.parse(afterRemove.state.body).project.deny).toEqual([])
   })
 
-  it('/config 的「自动打开审批时间线」按工作区区分：带 cwd 读写该项目文件，不带 cwd 写全局', async () => {
+  it('/config 的「自动打开审批时间线」只有一个全局值：带 cwd / session 也照旧写全局，什么都不落项目文件', async () => {
     const root = tempDir()
     const projectDir = join(root, 'project')
     const otherDir = join(root, 'other')
@@ -965,85 +965,52 @@ describe('策略 HTTP 入口', () => {
     apply(ctx, { policyFile: join(root, 'home', 'policy.json') })
     const handler = routes[0].handler
 
-    // 不带 cwd：只有全局那份，没有 workspace 段
-    const global = fakeHttp('GET', RECORD_CONFIG_PATH)
+    // GET：回执只有一份全局值，没有 workspace / session 段（2026-10-09 起不再按会话区分）
+    const global = fakeHttp('GET', RECORD_CONFIG_PATH + '?cwd=' + encodeURIComponent(projectDir) + '&session=session-aaaa')
     await handler(global.req, global.res)
     const globalBody = JSON.parse(global.state.body)
     expect(globalBody.settings.autoOpenTimeline).toBe(true)
     expect(globalBody.workspace).toBeUndefined()
+    expect(globalBody.session).toBeUndefined()
 
-    // 带 cwd：workspace 段给出本工作区的生效值（还没存过 → 跟随全局，scoped=false）
-    const read = fakeHttp('GET', RECORD_CONFIG_PATH + '?cwd=' + encodeURIComponent(projectDir))
-    await handler(read.req, read.res)
-    expect(JSON.parse(read.state.body).workspace).toEqual({ cwd: projectDir, autoOpenTimeline: true, scoped: false })
-
-    // 只改本工作区：落进 <cwd>/.dsh-auto-pass/policy.json 的 prefs，不写设置命名空间
-    const write = fakeHttp('POST', RECORD_CONFIG_PATH, JSON.stringify({ autoOpenTimeline: false, cwd: projectDir }))
+    // POST：这个假宿主没有可写 settings，所以如实地 503（证明它走的是全局那条路），
+    // 而**不是**悄悄写进项目策略文件——哪怕请求里带了 cwd / session
+    const write = fakeHttp('POST', RECORD_CONFIG_PATH,
+      JSON.stringify({ autoOpenTimeline: false, cwd: projectDir, session: 'session-aaaa' }))
     await handler(write.req, write.res)
-    expect(write.state.code).toBe(200)
-    expect(JSON.parse(write.state.body).workspace).toEqual({ cwd: projectDir, autoOpenTimeline: false, scoped: true })
-    expect(JSON.parse(readFileSync(join(projectDir, '.dsh-auto-pass', 'policy.json'), 'utf8')).prefs)
-      .toEqual({ autoOpenTimeline: false })
+    expect(write.state.code).toBe(503)
+    expect(existsSync(join(projectDir, '.dsh-auto-pass', 'policy.json'))).toBe(false)
+    expect(existsSync(join(otherDir, '.dsh-auto-pass', 'policy.json'))).toBe(false)
 
-    // 另一个工作区不受影响（仍然跟随全局）
-    const other = fakeHttp('GET', RECORD_CONFIG_PATH + '?cwd=' + encodeURIComponent(otherDir))
-    await handler(other.req, other.res)
-    expect(JSON.parse(other.state.body).workspace).toEqual({ cwd: otherDir, autoOpenTimeline: true, scoped: false })
-
-    // 不带 cwd 的 POST 才是「改全局默认」：这个假宿主没有可写 settings，所以如实 503（证明它没走工作区那条路）
+    // 不带 cwd / session 的写同样只走全局
     const globalWrite = fakeHttp('POST', RECORD_CONFIG_PATH, JSON.stringify({ autoOpenTimeline: false }))
     await handler(globalWrite.req, globalWrite.res)
     expect(globalWrite.state.code).toBe(503)
-    expect(JSON.parse(readFileSync(join(projectDir, '.dsh-auto-pass', 'policy.json'), 'utf8')).prefs)
-      .toEqual({ autoOpenTimeline: false })
 
-    // 项目写盘失败（cwd 指向一个文件）：降级走全局设置那条路，不再抛错也不再写项目文件
-    const blocked = join(root, 'blocked-cwd')
-    writeFileSync(blocked, 'x', 'utf8')
-    const blockedWrite = fakeHttp('POST', RECORD_CONFIG_PATH, JSON.stringify({ autoOpenTimeline: true, cwd: blocked }))
-    await handler(blockedWrite.req, blockedWrite.res)
-    expect(blockedWrite.state.code).toBe(503)
-  })
-
-  it('/config 的「自动打开审批时间线」按会话区分：带 session + cwd 写该会话那份，缺 cwd 直接 400', async () => {
-    const root = tempDir()
-    const projectDir = join(root, 'project')
-    const { ctx, routes } = fakeContext()
-    apply(ctx, { policyFile: join(root, 'home', 'policy.json') })
-    const handler = routes[0].handler
-    const sessionA = 'session-aaaa'
-    const sessionB = 'session-bbbb'
-
-    // 带 session + cwd：这个会话还没存过 → 跟随全局，scoped=false
-    const read = fakeHttp('GET', RECORD_CONFIG_PATH + '?cwd=' + encodeURIComponent(projectDir) + '&session=' + sessionA)
-    await handler(read.req, read.res)
-    expect(JSON.parse(read.state.body).session).toEqual({ sessionId: sessionA, autoOpenTimeline: true, scoped: false })
-
-    // 只改这个会话：落进该项目策略文件的 prefs.autoOpenTimelineSessions，不写设置命名空间
-    const write = fakeHttp('POST', RECORD_CONFIG_PATH,
-      JSON.stringify({ autoOpenTimeline: false, cwd: projectDir, session: sessionA }))
-    await handler(write.req, write.res)
-    expect(write.state.code).toBe(200)
-    expect(JSON.parse(write.state.body).session).toEqual({ sessionId: sessionA, autoOpenTimeline: false, scoped: true })
-    expect(JSON.parse(readFileSync(join(projectDir, '.dsh-auto-pass', 'policy.json'), 'utf8')).prefs)
-      .toEqual({ autoOpenTimelineSessions: { [sessionA]: false } })
-
-    // 同一个工作区里的另一个会话不受影响（按会话隔离）
-    const other = fakeHttp('GET', RECORD_CONFIG_PATH + '?cwd=' + encodeURIComponent(projectDir) + '&session=' + sessionB)
-    await handler(other.req, other.res)
-    expect(JSON.parse(other.state.body).session).toEqual({ sessionId: sessionB, autoOpenTimeline: true, scoped: false })
-
-    // 带 session 却没有 cwd：直接 400——绝不静默写全局（那会改掉所有会话的默认值）
-    const noCwd = fakeHttp('POST', RECORD_CONFIG_PATH, JSON.stringify({ autoOpenTimeline: false, session: sessionA }))
-    await handler(noCwd.req, noCwd.res)
-    expect(noCwd.state.code).toBe(400)
-    expect(JSON.parse(noCwd.state.body).error).toContain('cwd required')
-    // 非法 session（空串 / 只有空白）同样 400
-    const badSession = fakeHttp('POST', RECORD_CONFIG_PATH,
-      JSON.stringify({ autoOpenTimeline: false, cwd: projectDir, session: '   ' }))
-    await handler(badSession.req, badSession.res)
-    expect(badSession.state.code).toBe(400)
-    expect(JSON.parse(badSession.state.body).error).toContain('invalid session')
+    // 历史残留：项目文件里那段 prefs（2026-09-18 工作区级 / 2026-09-20 会话级）不再读，
+    // 下一次写盘就把它抹掉——不会留下一个没人再看的隐形开关
+    const legacy = join(projectDir, '.dsh-auto-pass', 'policy.json')
+    mkdirSync(dirname(legacy), { recursive: true })
+    writeFileSync(legacy, JSON.stringify({
+      version: 1,
+      rules: { allow: [], deny: [] },
+      prefs: { autoOpenTimeline: false, autoOpenTimelineSessions: { 'session-aaaa': false } },
+    }), 'utf8')
+    const legacyRead = fakeHttp('GET', RECORD_CONFIG_PATH + '?cwd=' + encodeURIComponent(projectDir) + '&session=session-aaaa')
+    await handler(legacyRead.req, legacyRead.res)
+    expect(JSON.parse(legacyRead.state.body).settings.autoOpenTimeline).toBe(true)
+    const addRule = fakeHttp('POST', POLICY_PATH, JSON.stringify({
+      op: 'add',
+      scope: 'project',
+      list: 'allow',
+      cwd: projectDir,
+      rule: { tool: 'pwsh', match: { kind: 'command_prefix', value: 'git status' }, label: '只读查看 git 状态' },
+    }))
+    await handler(addRule.req, addRule.res)
+    expect(JSON.parse(addRule.state.body).ok).toBe(true)
+    const afterAdd = JSON.parse(readFileSync(legacy, 'utf8'))
+    expect(afterAdd.prefs).toBeUndefined()
+    expect(afterAdd.rules.allow).toHaveLength(1)
   })
 
   it('时间线上手填的匹配条件原样写入，不再让模型改写；不覆盖本次动作的手填条件当场拒绝', async () => {
